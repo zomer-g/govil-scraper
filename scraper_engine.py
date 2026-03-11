@@ -1,0 +1,746 @@
+"""
+Gov.il Scraper Engine
+Handles session management (cloudscraper + Playwright fallback),
+URL parsing, API discovery, pagination, and data extraction.
+"""
+
+import re
+import time
+import logging
+import html as html_mod
+from enum import Enum
+from dataclasses import dataclass, field
+from typing import Optional, Callable, List
+from urllib.parse import urlparse, parse_qs
+
+import cloudscraper
+import requests
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
+class PageType(Enum):
+    DYNAMIC_COLLECTOR = "dynamic_collector"
+    TRADITIONAL_COLLECTOR = "traditional_collector"
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class ParsedURL:
+    page_type: PageType
+    collector_name: str
+    office_id: Optional[str] = None
+    original_url: str = ""
+    query_params: dict = field(default_factory=dict)
+    api_endpoint: str = ""
+    api_method: str = "GET"
+
+
+@dataclass
+class FileAttachment:
+    url: str
+    filename: str
+    item_index: int = 0
+    file_type: str = ""
+
+
+@dataclass
+class ScrapeResult:
+    items: List[dict] = field(default_factory=list)
+    total_count: int = 0
+    file_attachments: List[FileAttachment] = field(default_factory=list)
+    collector_name: str = ""
+    page_type: PageType = PageType.UNKNOWN
+    column_headers: List[str] = field(default_factory=list)
+    warning: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Custom exceptions
+# ---------------------------------------------------------------------------
+
+class GovILScraperError(Exception):
+    pass
+
+class CloudflareBlockError(GovILScraperError):
+    pass
+
+class InvalidURLError(GovILScraperError):
+    pass
+
+class APIEndpointError(GovILScraperError):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Session management
+# ---------------------------------------------------------------------------
+
+BASE_URL = "https://www.gov.il"
+
+COMMON_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://www.gov.il/",
+    "Origin": "https://www.gov.il",
+}
+
+
+class GovILSession:
+    """HTTP session that handles Cloudflare challenges via cloudscraper,
+    with automatic Playwright fallback."""
+
+    def __init__(self, use_playwright_fallback: bool = True):
+        self._use_playwright_fallback = use_playwright_fallback
+        self._playwright_active = False
+        self._browser = None
+        self._pw_context = None
+        self._session = self._init_cloudscraper()
+        self._warmed = False
+
+    def _init_cloudscraper(self) -> cloudscraper.CloudScraper:
+        scraper = cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False},
+            delay=10,
+        )
+        scraper.headers.update(COMMON_HEADERS)
+        return scraper
+
+    # ---- Playwright fallback ------------------------------------------------
+
+    def _init_playwright(self):
+        """Lazy-init Playwright and extract cookies into the requests session."""
+        if self._playwright_active:
+            return
+        try:
+            from playwright.sync_api import sync_playwright
+            self._pw = sync_playwright().start()
+            self._browser = self._pw.chromium.launch(headless=True)
+            self._pw_context = self._browser.new_context(
+                locale="he-IL",
+                extra_http_headers=COMMON_HEADERS,
+            )
+            page = self._pw_context.new_page()
+            page.goto(f"{BASE_URL}/he", wait_until="networkidle", timeout=30000)
+            # Extract cookies and inject into cloudscraper session
+            for cookie in self._pw_context.cookies():
+                self._session.cookies.set(
+                    cookie["name"], cookie["value"],
+                    domain=cookie.get("domain", ".gov.il"),
+                    path=cookie.get("path", "/"),
+                )
+            page.close()
+            self._playwright_active = True
+            self._warmed = True
+            logger.info("Playwright fallback session established")
+        except Exception as e:
+            logger.error("Playwright fallback failed: %s", e)
+            raise CloudflareBlockError(
+                "לא ניתן להתחבר לאתר gov.il — גם cloudscraper וגם Playwright נכשלו."
+            ) from e
+
+    # ---- Session warm-up ----------------------------------------------------
+
+    def warm(self) -> bool:
+        """Visit the main gov.il page to obtain Cloudflare cookies."""
+        if self._warmed:
+            return True
+        try:
+            resp = self._session.get(f"{BASE_URL}/he", timeout=20)
+            if resp.status_code == 200 and len(resp.text) > 1000:
+                self._warmed = True
+                logger.info("cloudscraper session warmed successfully")
+                return True
+        except Exception as e:
+            logger.warning("cloudscraper warm-up failed: %s", e)
+
+        # Fallback to Playwright
+        if self._use_playwright_fallback:
+            logger.info("Switching to Playwright fallback")
+            self._init_playwright()
+            return True
+
+        raise CloudflareBlockError("לא ניתן לעבור את הגנת Cloudflare של gov.il")
+
+    # ---- HTTP methods with retry --------------------------------------------
+
+    def get(self, url: str, params: dict = None, retries: int = 3,
+            stream: bool = False) -> requests.Response:
+        return self._request("GET", url, params=params, retries=retries,
+                             stream=stream)
+
+    def post(self, url: str, json_data: dict = None,
+             retries: int = 3, extra_headers: dict = None) -> requests.Response:
+        return self._request("POST", url, json_data=json_data, retries=retries,
+                             extra_headers=extra_headers)
+
+    def _request(self, method: str, url: str, params: dict = None,
+                 json_data: dict = None, retries: int = 3,
+                 stream: bool = False, extra_headers: dict = None) -> requests.Response:
+        if not self._warmed:
+            self.warm()
+
+        last_error = None
+        for attempt in range(retries):
+            try:
+                headers = {**extra_headers} if extra_headers else None
+                if method == "GET":
+                    resp = self._session.get(url, params=params, timeout=30,
+                                             stream=stream, headers=headers)
+                else:
+                    resp = self._session.post(url, json=json_data, timeout=30,
+                                              headers=headers)
+
+                if resp.status_code == 403:
+                    logger.warning("403 on attempt %d for %s", attempt + 1, url)
+                    self._warmed = False
+                    if attempt < retries - 1:
+                        self.warm()
+                    continue
+
+                if resp.status_code == 429:
+                    wait = 2 ** (attempt + 1)
+                    logger.warning("Rate limited, waiting %ds", wait)
+                    time.sleep(wait)
+                    continue
+
+                resp.raise_for_status()
+                return resp
+
+            except requests.RequestException as e:
+                last_error = e
+                logger.warning("Request error attempt %d: %s", attempt + 1, e)
+                if attempt < retries - 1:
+                    time.sleep(1)
+
+        # All retries exhausted — try Playwright if not already active
+        if self._use_playwright_fallback and not self._playwright_active:
+            logger.info("All cloudscraper retries failed, trying Playwright")
+            self._warmed = False
+            self._init_playwright()
+            return self._request(method, url, params=params,
+                                 json_data=json_data, retries=1, stream=stream,
+                                 extra_headers=extra_headers)
+
+        raise APIEndpointError(
+            f"כל הניסיונות נכשלו עבור {url}: {last_error}"
+        )
+
+    def close(self):
+        if self._browser:
+            self._browser.close()
+        if hasattr(self, "_pw") and self._pw:
+            self._pw.stop()
+
+
+# ---------------------------------------------------------------------------
+# URL Parsing
+# ---------------------------------------------------------------------------
+
+# Regex for /he/departments/dynamiccollectors/{name} (case-insensitive)
+RE_DYNAMIC = re.compile(
+    r"/he/departments?/dynamiccollectors?/([^/?#]+)", re.IGNORECASE
+)
+# Regex for /he/collectors/{name}
+RE_TRADITIONAL = re.compile(
+    r"/he/collectors?/([^/?#]+)", re.IGNORECASE
+)
+
+
+def parse_gov_url(url: str) -> ParsedURL:
+    """Parse a gov.il page URL and determine the page type and parameters."""
+    parsed = urlparse(url)
+    path = parsed.path.rstrip("/")
+    params = parse_qs(parsed.query)
+
+    # DynamicCollector
+    m = RE_DYNAMIC.search(path)
+    if m:
+        collector_name = m.group(1)
+        office_id = params.get("officeId", [None])[0] or params.get("OfficeId", [None])[0]
+        return ParsedURL(
+            page_type=PageType.DYNAMIC_COLLECTOR,
+            collector_name=collector_name,
+            office_id=office_id,
+            original_url=url,
+            query_params={k: v[0] for k, v in params.items()},
+        )
+
+    # Traditional Collector
+    m = RE_TRADITIONAL.search(path)
+    if m:
+        collector_name = m.group(1)
+        office_id = params.get("officeId", [None])[0] or params.get("OfficeId", [None])[0]
+        return ParsedURL(
+            page_type=PageType.TRADITIONAL_COLLECTOR,
+            collector_name=collector_name,
+            office_id=office_id,
+            original_url=url,
+            query_params={k: v[0] for k, v in params.items()},
+        )
+
+    raise InvalidURLError(
+        f"לא ניתן לזהות את סוג הדף עבור הכתובת: {url}\n"
+        "נתמכים: DynamicCollectors ו-Collectors (Publications)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# GUID extraction from page HTML
+# ---------------------------------------------------------------------------
+
+# DynamicCollector API endpoint (always POST)
+DYNAMIC_API_URL = f"{BASE_URL}/he/api/DynamicCollector"
+
+# Traditional collector API (GET)
+TRADITIONAL_ENDPOINT = f"{BASE_URL}/CollectorsWebApi/api/DataCollector/GetResults"
+TRADITIONAL_LAYOUT_ENDPOINT = f"{BASE_URL}/CollectorsWebApi/api/DataCollector/GetLayoutCollectorModel"
+
+# Regex to extract the GUID from the ng-init attribute
+# In raw HTML the quotes are entity-encoded: &#39; for ' and &quot; for "
+# Pattern matches GUID anywhere after initCtrl( in the ng-init value
+RE_GUID_HTML = re.compile(
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+    re.IGNORECASE,
+)
+
+
+@dataclass
+class DynamicPageConfig:
+    """Configuration extracted from a DynamicCollector HTML page."""
+    template_id: str = ""
+    results_api_url: str = ""      # Custom API URL (empty = use standard)
+    x_client_id: str = ""          # x-client-id header for custom APIs
+    items_per_page: int = 20
+
+
+def extract_dynamic_page_config(session: GovILSession, page_url: str) -> DynamicPageConfig:
+    """Fetch the DynamicCollector HTML page and extract configuration from ng-init.
+
+    Standard DynamicCollectors use POST /he/api/DynamicCollector with a GUID.
+    Custom DynamicCollectors provide a resultsApiURL (e.g. menifa, legal-advisor-guidelines).
+    """
+    resp = session.get(page_url)
+    page_html = resp.text
+    config = DynamicPageConfig()
+
+    m_init = re.search(r'ng-init="(dynamicCtrl\.Events\.initCtrl\([^"]*)"', page_html)
+    if not m_init:
+        # Fallback: search near 'initCtrl'
+        idx = page_html.find("initCtrl")
+        if idx >= 0:
+            chunk = html_mod.unescape(page_html[idx:idx + 2000])
+            guids = RE_GUID_HTML.findall(chunk)
+            if guids:
+                config.template_id = guids[0]
+                return config
+        raise APIEndpointError(
+            "לא ניתן לחלץ הגדרות מדף ה-HTML.\n"
+            f"כתובת: {page_url}"
+        )
+
+    init_text = html_mod.unescape(m_init.group(1))
+
+    # Extract all GUIDs
+    guids = RE_GUID_HTML.findall(init_text)
+
+    # Extract custom API URL (https://...)
+    url_match = re.search(r"'(https?://[^']+)'", init_text)
+    if url_match:
+        config.results_api_url = url_match.group(1)
+        logger.info("Found custom resultsApiURL: %s", config.results_api_url)
+
+    if guids:
+        config.template_id = guids[0]
+        # If there's a custom API URL, the second GUID is typically the x-client-id
+        if config.results_api_url and len(guids) >= 2:
+            config.x_client_id = guids[1]
+        logger.info("Extracted DynamicTemplateID: %s", config.template_id)
+
+    # Extract items per page (number after the URL in ng-init args)
+    ipp_match = re.search(r"',\s*(\d+)\s*,", init_text)
+    if ipp_match:
+        config.items_per_page = int(ipp_match.group(1))
+
+    if not config.template_id:
+        raise APIEndpointError(
+            "לא ניתן לחלץ את מזהה התבנית (DynamicTemplateID) מדף ה-HTML.\n"
+            f"כתובת: {page_url}"
+        )
+
+    return config
+
+
+def _extract_total(data: dict) -> Optional[int]:
+    """Try to extract total result count from various JSON structures."""
+    for key in ("TotalResults", "totalResults", "total", "Total", "count"):
+        if key in data:
+            try:
+                return int(data[key])
+            except (ValueError, TypeError):
+                continue
+    # Check nested
+    if isinstance(data.get("result"), dict):
+        return _extract_total(data["result"])
+    if isinstance(data.get("Result"), dict):
+        return _extract_total(data["Result"])
+    return None
+
+
+def _extract_items(data: dict) -> List[dict]:
+    """Extract the results array from various JSON structures."""
+    for key in ("Results", "results", "Items", "items", "data", "Data"):
+        if key in data and isinstance(data[key], list):
+            return data[key]
+    # Check nested
+    if isinstance(data.get("result"), dict):
+        return _extract_items(data["result"])
+    if isinstance(data.get("Result"), dict):
+        return _extract_items(data["Result"])
+    # Maybe the response itself is a list
+    if isinstance(data, list):
+        return data
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Main Scraper
+# ---------------------------------------------------------------------------
+
+class GovILScraper:
+    """Scrapes gov.il collector pages via their internal APIs."""
+
+    def __init__(self, session: GovILSession,
+                 progress_callback: Optional[Callable] = None,
+                 page_size: int = 20):
+        self.session = session
+        self.progress = progress_callback or (lambda **kw: None)
+        self.page_size = page_size
+
+    def scrape(self, url: str) -> ScrapeResult:
+        parsed = parse_gov_url(url)
+
+        if parsed.page_type == PageType.DYNAMIC_COLLECTOR:
+            return self._scrape_dynamic(parsed)
+        elif parsed.page_type == PageType.TRADITIONAL_COLLECTOR:
+            return self._scrape_traditional(parsed)
+        else:
+            raise InvalidURLError(f"סוג דף לא נתמך: {parsed.page_type}")
+
+    # ---- DynamicCollector ---------------------------------------------------
+
+    def _scrape_dynamic(self, parsed: ParsedURL) -> ScrapeResult:
+        # Step 1: Fetch the HTML page to extract config (GUID, custom API URL, etc.)
+        config = extract_dynamic_page_config(self.session, parsed.original_url)
+        parsed.api_method = "POST"
+
+        use_custom_api = bool(config.results_api_url)
+        api_url = config.results_api_url or DYNAMIC_API_URL
+        parsed.api_endpoint = api_url
+        page_size = config.items_per_page or self.page_size
+
+        if use_custom_api:
+            logger.info("Using custom API: %s (x-client-id: %s)",
+                        api_url, config.x_client_id or "none")
+
+        all_items = []
+        total_count = 0
+        skip = 0
+        warning = None
+
+        while True:
+            try:
+                if use_custom_api:
+                    # Custom API: POST {"skip": N} with x-client-id header
+                    extra_headers = {}
+                    if config.x_client_id:
+                        extra_headers["x-client-id"] = config.x_client_id
+                    resp = self.session.post(api_url, json_data={"skip": skip},
+                                             extra_headers=extra_headers)
+                else:
+                    # Standard DynamicCollector API
+                    resp = self.session.post(DYNAMIC_API_URL, json_data={
+                        "DynamicTemplateID": config.template_id,
+                        "QueryFilters": {"skip": {"Query": skip}},
+                        "From": skip,
+                    })
+
+                data = resp.json()
+                items = _extract_items(data)
+
+                if skip == 0:
+                    total_count = _extract_total(data) or len(items)
+
+                all_items.extend(items)
+                self.progress(
+                    current=len(all_items),
+                    total=total_count,
+                    message=f"נאספו {len(all_items)} מתוך {total_count} רשומות",
+                )
+
+                if not items or len(all_items) >= total_count:
+                    break
+
+                skip += page_size
+                delay = 1.0 if total_count > 500 else 0.5
+                time.sleep(delay)
+
+            except GovILScraperError:
+                raise
+            except Exception as e:
+                logger.error("Pagination error at skip=%d: %s", skip, e)
+                warning = f"חלק מהנתונים עלולים להיות חסרים (שגיאה בעמוד {skip})"
+                break
+
+        return self._build_result(all_items, total_count, parsed, warning)
+
+    # ---- Traditional Collector ----------------------------------------------
+
+    def _scrape_traditional(self, parsed: ParsedURL) -> ScrapeResult:
+        parsed.api_endpoint = TRADITIONAL_ENDPOINT
+
+        # Dynamically discover CollectorType values from the layout model API.
+        # The layout model's filter URLs contain the actual collectionTypes params.
+        collector_types = self._discover_collector_types(parsed.collector_name)
+        logger.info("Collector types for '%s': %s", parsed.collector_name, collector_types)
+
+        all_items = []
+        total_count = 0
+        skip = 0
+        warning = None
+
+        while True:
+            try:
+                # Build URL with repeated CollectorType params
+                # e.g., CollectorType=reports&CollectorType=rfp&...
+                query_parts = [f"CollectorType={ct}" for ct in collector_types]
+                query_parts.append("culture=he")
+                query_parts.append(f"skip={skip}")
+                query_parts.append(f"limit={self.page_size}")
+                if parsed.office_id:
+                    query_parts.append(f"officeId={parsed.office_id}")
+
+                url = f"{TRADITIONAL_ENDPOINT}?{'&'.join(query_parts)}"
+                resp = self.session.get(url)
+                data = resp.json()
+                # Response: { total: N, results: [...] } (lowercase)
+                items = _extract_items(data)
+
+                if skip == 0:
+                    total_count = _extract_total(data) or len(items)
+
+                all_items.extend(items)
+                self.progress(
+                    current=len(all_items),
+                    total=total_count,
+                    message=f"נאספו {len(all_items)} מתוך {total_count} רשומות",
+                )
+
+                if not items or len(all_items) >= total_count:
+                    break
+
+                skip += self.page_size
+                delay = 1.0 if total_count > 500 else 0.5
+                time.sleep(delay)
+
+            except GovILScraperError:
+                raise
+            except Exception as e:
+                logger.error("Pagination error at skip=%d: %s", skip, e)
+                warning = f"חלק מהנתונים עלולים להיות חסרים (שגיאה בעמוד {skip})"
+                break
+
+        return self._build_result(all_items, total_count, parsed, warning)
+
+    # ---- Traditional collector type discovery --------------------------------
+
+    def _discover_collector_types(self, collector_name: str) -> List[str]:
+        """Discover CollectorType values by querying GetLayoutCollectorModel.
+
+        The layout model's filter URLs contain collectionTypes params
+        (e.g. collectionTypes=policy&collectionTypes=pmopolicy) which map
+        to the CollectorType values needed for GetResults.
+        """
+        try:
+            url = f"{TRADITIONAL_LAYOUT_ENDPOINT}?collectorId={collector_name}&culture=he"
+            resp = self.session.get(url)
+            text = resp.text
+            # Extract collectionTypes values from the JSON text
+            matches = re.findall(r"collectionTypes?=([^&\"]+)", text)
+            if matches:
+                # Deduplicate while preserving order
+                seen = set()
+                types = []
+                for t in matches:
+                    if t not in seen:
+                        seen.add(t)
+                        types.append(t)
+                return types
+        except Exception as e:
+            logger.warning("Failed to discover collector types for '%s': %s",
+                           collector_name, e)
+
+        # Fallback: use the collector name itself
+        return [collector_name]
+
+    # ---- Result building ----------------------------------------------------
+
+    def _build_result(self, items: List[dict], total_count: int,
+                      parsed: ParsedURL, warning: Optional[str]) -> ScrapeResult:
+        # Flatten items and extract file attachments
+        flat_items = []
+        attachments = []
+
+        for idx, item in enumerate(items):
+            flat = self._flatten_item(item)
+            flat_items.append(flat)
+
+            # Extract file attachments
+            for att in self._extract_attachments(item, idx):
+                attachments.append(att)
+
+        # Build column headers from all items
+        headers = []
+        seen = set()
+        for item in flat_items:
+            for key in item.keys():
+                if key not in seen:
+                    headers.append(key)
+                    seen.add(key)
+
+        return ScrapeResult(
+            items=flat_items,
+            total_count=total_count,
+            file_attachments=attachments,
+            collector_name=parsed.collector_name,
+            page_type=parsed.page_type,
+            column_headers=headers,
+            warning=warning,
+        )
+
+    def _flatten_item(self, item: dict, prefix: str = "") -> dict:
+        """Flatten nested dicts/items based on the page type structure.
+
+        DynamicCollector items: { Data: { field: val, file: [...] }, Description, UrlName }
+        Traditional items: { title, description, url, tags: { metaData: {...} } }
+        """
+        flat = {}
+        for key, value in item.items():
+            full_key = f"{prefix}.{key}" if prefix else key
+
+            # Skip Angular hash keys
+            if key == "$$hashKey":
+                continue
+
+            # Skip file arrays — handled by _extract_attachments
+            if key.lower() in ("file", "files", "attachments", "fileattachments",
+                                "filedata", "document"):
+                if isinstance(value, list):
+                    flat[full_key] = f"[{len(value)} קבצים]"
+                continue
+
+            # Handle tags.metaData (Traditional Collector) — flatten to readable values
+            if key == "tags" and isinstance(value, dict):
+                for section_name, section in value.items():
+                    if isinstance(section, dict):
+                        for field_name, field_vals in section.items():
+                            if isinstance(field_vals, list):
+                                titles = [
+                                    v.get("title", "") for v in field_vals
+                                    if isinstance(v, dict)
+                                ]
+                                flat[field_name] = ", ".join(t for t in titles if t)
+                continue
+
+            if isinstance(value, dict):
+                flat.update(self._flatten_item(value, full_key))
+            elif isinstance(value, list):
+                if value and isinstance(value[0], dict):
+                    # List of objects (not files) — show count
+                    flat[full_key] = f"[{len(value)} פריטים]"
+                else:
+                    flat[full_key] = ", ".join(str(v) for v in value)
+            else:
+                flat[full_key] = value
+
+        return flat
+
+    def _extract_attachments(self, item: dict, item_index: int) -> List[FileAttachment]:
+        """Extract file attachment info from an item.
+
+        DynamicCollector: item.Data.file = [{ FileName, FileMime, FileSize, Extension, DisplayName }]
+        Traditional: typically no direct file attachments (links are in url field)
+        """
+        attachments = []
+
+        # DynamicCollector: files in item["Data"]["file"], "fileData", or "Document"
+        url_name = item.get("UrlName") or ""
+        data = item.get("Data", {})
+        if isinstance(data, dict):
+            files = (data.get("file") or data.get("File") or data.get("files")
+                     or data.get("Files") or data.get("fileData")
+                     or data.get("Document") or data.get("document"))
+            if isinstance(files, list):
+                for f in files:
+                    if not isinstance(f, dict):
+                        continue
+                    filename = f.get("FileName") or f.get("fileName") or ""
+                    display = f.get("DisplayName") or f.get("displayName") or ""
+                    ext = f.get("Extension") or f.get("extension") or ""
+
+                    if not filename:
+                        continue
+
+                    # Determine download URL
+                    if filename.startswith("http"):
+                        # Custom API: FileName is already a full URL
+                        file_url = filename
+                    elif url_name:
+                        # Standard DynamicCollector: build BlobFolder URL
+                        file_url = f"{BASE_URL}/BlobFolder/dynamiccollectorresultitem/{url_name}/he/{filename}"
+                    else:
+                        continue
+
+                    nice_name = display or filename.split("/")[-1]
+                    if ext and not nice_name.lower().endswith(f".{ext.lower()}"):
+                        nice_name = f"{nice_name}.{ext}"
+
+                    attachments.append(FileAttachment(
+                        url=file_url,
+                        filename=nice_name,
+                        item_index=item_index,
+                        file_type=ext.lower(),
+                    ))
+
+        # Also look for top-level file keys
+        for key in ("Files", "files", "Attachments", "attachments"):
+            files = item.get(key)
+            if not isinstance(files, list):
+                continue
+            for f in files:
+                url = ""
+                filename = ""
+                if isinstance(f, dict):
+                    url = f.get("Url") or f.get("url") or f.get("FilePath") or ""
+                    filename = f.get("FileName") or f.get("fileName") or f.get("Title") or ""
+                elif isinstance(f, str):
+                    url = f
+                    filename = url.split("/")[-1] if "/" in url else url
+
+                if url:
+                    if url.startswith("/"):
+                        url = BASE_URL + url
+                    elif not url.startswith("http"):
+                        url = BASE_URL + "/" + url
+                    ext = url.rsplit(".", 1)[-1].lower() if "." in url else ""
+                    if not filename:
+                        filename = url.split("/")[-1]
+                    attachments.append(FileAttachment(
+                        url=url, filename=filename,
+                        item_index=item_index, file_type=ext,
+                    ))
+
+        return attachments

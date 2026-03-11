@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: govil-scraper
+    runtime: docker
+    plan: starter
+    healthCheckPath: /
+    envVars:
+      - key: PORT
+        value: "5000"
+      - key: TEMP_DIR
+        value: /tmp/govil_scraper
+    disk:
+      name: scraper-data
+      mountPath: /tmp/govil_scraper
+      sizeGB: 1
