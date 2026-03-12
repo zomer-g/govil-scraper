@@ -103,8 +103,13 @@ class FileHandler:
         self,
         attachments: List[FileAttachment],
         progress_callback: Optional[Callable] = None,
+        skip_existing: bool = False,
     ) -> List[str]:
-        """Download all file attachments. Returns list of local file paths."""
+        """Download all file attachments. Returns list of local file paths.
+
+        If skip_existing=True, files that already exist on disk (with size > 0)
+        are skipped — useful for local scraping to avoid re-downloading.
+        """
         if not attachments:
             return []
 
@@ -113,11 +118,26 @@ class FileHandler:
 
         paths = []
         used_names = set()
+        skipped = 0
 
         for idx, att in enumerate(attachments):
             try:
-                local_path = self._download_single(att, att_dir, used_names)
-                paths.append(local_path)
+                # Determine the canonical filename first
+                filename = sanitize_filename(att.filename)
+                if not filename or filename == "unnamed":
+                    filename = att.url.split("/")[-1].split("?")[0] or "file"
+                    filename = sanitize_filename(filename)
+
+                dest_path = os.path.join(att_dir, filename)
+
+                # Skip if file already exists and has content
+                if skip_existing and os.path.exists(dest_path) and os.path.getsize(dest_path) > 0:
+                    paths.append(dest_path)
+                    used_names.add(filename.lower())
+                    skipped += 1
+                else:
+                    local_path = self._download_single(att, att_dir, used_names)
+                    paths.append(local_path)
             except Exception as e:
                 logger.warning("Failed to download %s: %s", att.url, e)
 
@@ -128,7 +148,10 @@ class FileHandler:
                     message=f"הורדו {idx + 1} מתוך {len(attachments)} קבצים",
                 )
 
-        logger.info("Downloaded %d / %d attachments", len(paths), len(attachments))
+        if skipped:
+            logger.info("Skipped %d existing files", skipped)
+        logger.info("Downloaded %d / %d attachments (%d skipped)",
+                     len(paths) - skipped, len(attachments), skipped)
         return paths
 
     def _download_single(
@@ -192,3 +215,33 @@ class FileHandler:
 
         logger.info("ZIP created: %s", zip_path)
         return zip_path
+
+    def get_all_file_records(self, base_dir: str) -> List[dict]:
+        """Scan output_dir and return metadata for all files.
+
+        Returns list of dicts with: filename, file_type, category,
+        size_bytes, rel_path (relative to base_dir).
+        Used to populate the files table in the database.
+        """
+        records = []
+        for root, _dirs, files in os.walk(self.output_dir):
+            for fname in files:
+                full = os.path.join(root, fname)
+                rel = os.path.relpath(full, base_dir).replace("\\", "/")
+                ext = os.path.splitext(fname)[1].lower().lstrip(".")
+
+                if ext == "csv":
+                    category = "csv"
+                elif ext == "xlsx":
+                    category = "excel"
+                else:
+                    category = "attachment"
+
+                records.append({
+                    "filename": fname,
+                    "file_type": ext,
+                    "category": category,
+                    "size_bytes": os.path.getsize(full),
+                    "rel_path": rel,
+                })
+        return records

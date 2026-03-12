@@ -43,6 +43,17 @@
         .api-method.delete { background: #fee2e2; color: #991b1b; }
         .api-path { font-family: monospace; font-size: 0.9rem; direction: ltr; }
         .empty-state { padding: 40px; text-align: center; color: #999; }
+        /* File list */
+        .file-item { padding: 8px 12px; border-bottom: 1px solid #f0f0f0; display: flex; justify-content: space-between; align-items: center; }
+        .file-item:last-child { border-bottom: none; }
+        .file-item .file-name { font-size: 0.85rem; direction: ltr; unicode-bidi: embed; word-break: break-all; }
+        .file-item .file-meta { font-size: 0.75rem; color: #999; white-space: nowrap; }
+        .file-category-badge { font-size: 0.7rem; padding: 2px 6px; border-radius: 4px; }
+        .file-category-badge.csv { background: #d1fae5; color: #065f46; }
+        .file-category-badge.excel { background: #dbeafe; color: #1e40af; }
+        .file-category-badge.attachment { background: #fef3c7; color: #92400e; }
+        /* Search */
+        #fileSearchInput { direction: ltr; text-align: left; font-family: monospace; font-size: 0.85rem; }
     </style>
 </head>
 <body>
@@ -175,35 +186,6 @@
             </div>
         </div>
 
-        <!-- Upload ZIP -->
-        <div class="card mb-3">
-            <div class="card-body p-4">
-                <h6 class="fw-bold mb-3">
-                    <i class="bi bi-cloud-upload"></i>
-                    העלאת סריקה מקומית
-                </h6>
-                <form id="uploadForm">
-                    <div class="row g-3">
-                        <div class="col-md-6">
-                            <label class="form-label small">קובץ ZIP</label>
-                            <input type="file" class="form-control" id="uploadFile" accept=".zip" required>
-                        </div>
-                        <div class="col-md-6">
-                            <label class="form-label small">כתובת מקור (gov.il)</label>
-                            <input type="url" class="form-control" id="uploadUrl" dir="ltr"
-                                   placeholder="https://www.gov.il/he/..." required>
-                        </div>
-                    </div>
-                    <div class="d-flex align-items-center justify-content-between mt-3">
-                        <small class="text-muted" id="uploadStatus"></small>
-                        <button type="submit" class="btn btn-outline-primary" id="uploadBtn">
-                            <i class="bi bi-upload"></i> העלה
-                        </button>
-                    </div>
-                </form>
-            </div>
-        </div>
-
         <!-- Progress -->
         <div class="card mb-3 d-none" id="progressCard">
             <div class="card-body p-4">
@@ -294,6 +276,21 @@
 
         <!-- ============ COLLECTIONS TAB ============ -->
         <div class="tab-pane fade {% if not is_admin %}show active{% endif %}" id="collectionsTab">
+
+            <!-- File Search -->
+            <div class="card mb-3">
+                <div class="card-body p-3">
+                    <div class="input-group">
+                        <span class="input-group-text"><i class="bi bi-search"></i></span>
+                        <input type="text" class="form-control" id="fileSearchInput"
+                               placeholder="Search files across all collections (min 2 chars)...">
+                        <button class="btn btn-outline-primary" id="fileSearchBtn" type="button">חפש קבצים</button>
+                    </div>
+                    <div id="fileSearchResults" class="mt-2 d-none"></div>
+                </div>
+            </div>
+
+            <!-- Collections List -->
             <div class="card">
                 <div class="card-header d-flex justify-content-between align-items-center p-3">
                     <span><i class="bi bi-collection"></i> אוספים שנשמרו</span>
@@ -309,7 +306,7 @@
                 </div>
             </div>
 
-            <!-- Collection Detail Modal -->
+            <!-- Collection Detail -->
             <div class="card mt-3 d-none" id="collectionDetail">
                 <div class="card-header d-flex justify-content-between align-items-center p-3">
                     <span>
@@ -337,9 +334,19 @@
                         <div class="collection-meta mt-1">
                             <span id="detailDate"></span> &middot;
                             <span id="detailRecords"></span> רשומות &middot;
-                            <span id="detailFiles"></span> קבצים
+                            <span id="detailFileCount"></span> קבצים
                         </div>
                     </div>
+
+                    <!-- Files List -->
+                    <div class="p-3 border-bottom" id="detailFilesSection">
+                        <h6 class="fw-bold mb-2">
+                            <i class="bi bi-folder2-open"></i> קבצים באוסף
+                        </h6>
+                        <div id="detailFilesList"></div>
+                    </div>
+
+                    <!-- Data Preview -->
                     <div class="table-responsive">
                         <table class="table table-striped table-hover mb-0">
                             <thead class="table-light" id="detailHead"></thead>
@@ -358,7 +365,7 @@
                 </div>
                 <div class="card-body p-4">
                     <p class="text-muted mb-4">
-                        כל נקודות הקצה של האוספים הן ציבוריות ולא דורשות הזדהות.
+                        כל נקודות הקצה של האוספים והקבצים הן ציבוריות ולא דורשות הזדהות.
                         סריקה חדשה דורשת התחברות כמנהל (Google SSO).
                     </p>
 
@@ -385,7 +392,7 @@
                             <span class="api-method get">GET</span>
                             <span class="api-path">/api/collections/{id}/download</span>
                         </div>
-                        <small class="text-muted">הורדת קובץ ZIP (CSV + Excel + קבצים מצורפים)</small>
+                        <small class="text-muted">הורדת קובץ ZIP (נוצר דינמית מקבצים בודדים)</small>
                     </div>
 
                     <div class="api-endpoint">
@@ -404,19 +411,30 @@
                         <small class="text-muted">הורדת קובץ Excel בלבד</small>
                     </div>
 
-                    <h6 class="fw-bold mb-3 mt-4">העלאה (מנהל בלבד)</h6>
+                    <h6 class="fw-bold mb-3 mt-4">קבצים בודדים (ציבורי)</h6>
 
                     <div class="api-endpoint">
                         <div class="d-flex align-items-center gap-2 mb-1">
-                            <span class="api-method post">POST</span>
-                            <span class="api-path">/api/collections/upload</span>
+                            <span class="api-method get">GET</span>
+                            <span class="api-path">/api/collections/{id}/files</span>
                         </div>
-                        <small class="text-muted d-block">העלאת ZIP של סריקה מקומית. מוגבל ל-10 בקשות בדקה.</small>
-                        <pre class="mt-2 mb-0 small" style="background:#f0f0f0;padding:8px;border-radius:6px;direction:ltr;text-align:left;">Content-Type: multipart/form-data
-Fields:
-  file:           ZIP file (required)
-  source_url:     original gov.il URL (required)
-  collector_name: display name (optional)</pre>
+                        <small class="text-muted">רשימת כל הקבצים באוסף — כולל שם, סוג, גודל וקישור הורדה</small>
+                    </div>
+
+                    <div class="api-endpoint">
+                        <div class="d-flex align-items-center gap-2 mb-1">
+                            <span class="api-method get">GET</span>
+                            <span class="api-path">/api/collections/{id}/files/{filename}</span>
+                        </div>
+                        <small class="text-muted">הורדת קובץ בודד מאוסף</small>
+                    </div>
+
+                    <div class="api-endpoint">
+                        <div class="d-flex align-items-center gap-2 mb-1">
+                            <span class="api-method get">GET</span>
+                            <span class="api-path">/api/files?q={search}</span>
+                        </div>
+                        <small class="text-muted">חיפוש קבצים לפי שם בכל האוספים (מינימום 2 תווים)</small>
                     </div>
 
                     <h6 class="fw-bold mb-3 mt-4">סריקה (מנהל בלבד — דורש Google SSO)</h6>
@@ -495,7 +513,7 @@ Fields:
         scraping: 'סורק נתונים...',
         downloading_files: 'מוריד קבצים מצורפים...',
         exporting: 'מייצא נתונים...',
-        zipping: 'אורז קבצים...',
+        registering_files: 'רושם קבצים...',
         complete: 'הושלם!',
         error: 'שגיאה',
     };
@@ -503,7 +521,7 @@ Fields:
     let currentJobId = null;
     let eventSource = null;
 
-    // Elements
+    // Elements (null-safe for non-admin views)
     const form = document.getElementById('scrapeForm');
     const urlInput = document.getElementById('urlInput');
     const startBtn = document.getElementById('startBtn');
@@ -585,7 +603,6 @@ Fields:
         };
         eventSource.onerror = () => {
             eventSource.close();
-            // Fall back to polling
             pollStatus(jobId);
         };
     }
@@ -625,7 +642,6 @@ Fields:
             progressCard.classList.add('d-none');
             showError(data.message);
             if (startBtn) startBtn.disabled = false;
-            // Fetch full error log from status endpoint
             if (currentJobId) fetchErrorLog(currentJobId);
         }
     }
@@ -635,28 +651,23 @@ Fields:
             const resp = await fetch('/api/preview/' + jobId);
             const data = await resp.json();
 
-            // Stats
             document.getElementById('statRecords').textContent = data.total || 0;
             document.getElementById('statFiles').textContent = data.attachments_count || 0;
             document.getElementById('statDownloaded').textContent = data.downloaded_count || 0;
 
-            // Warning
             if (data.warning) {
                 warningMessage.textContent = data.warning;
                 warningAlert.classList.remove('d-none');
             }
 
-            // Download link
             downloadBtn.href = '/api/download/' + jobId;
 
-            // Table
             const thead = document.getElementById('previewHead');
             const tbody = document.getElementById('previewBody');
             thead.innerHTML = '';
             tbody.innerHTML = '';
 
             if (data.columns && data.columns.length > 0) {
-                // Show max 8 columns in preview
                 const cols = data.columns.slice(0, 8);
 
                 const headerRow = document.createElement('tr');
@@ -716,55 +727,60 @@ Fields:
         } catch { /* ignore */ }
     }
 
-    // ===================== UPLOAD =====================
+    // ===================== FILE SEARCH =====================
 
-    const uploadForm = document.getElementById('uploadForm');
-    if (uploadForm) uploadForm.addEventListener('submit', async e => {
-        e.preventDefault();
-        const fileInput = document.getElementById('uploadFile');
-        const urlInput2 = document.getElementById('uploadUrl');
-        const statusEl = document.getElementById('uploadStatus');
-        const btn = document.getElementById('uploadBtn');
+    const fileSearchInput = document.getElementById('fileSearchInput');
+    const fileSearchBtn = document.getElementById('fileSearchBtn');
+    const fileSearchResults = document.getElementById('fileSearchResults');
 
-        if (!fileInput.files.length || !urlInput2.value.trim()) return;
+    fileSearchBtn.addEventListener('click', () => searchFiles());
+    fileSearchInput.addEventListener('keydown', e => {
+        if (e.key === 'Enter') searchFiles();
+    });
 
-        const formData = new FormData();
-        formData.append('file', fileInput.files[0]);
-        formData.append('source_url', urlInput2.value.trim());
+    async function searchFiles() {
+        const q = fileSearchInput.value.trim();
+        if (q.length < 2) {
+            fileSearchResults.innerHTML = '<small class="text-danger">נדרשים לפחות 2 תווים לחיפוש</small>';
+            fileSearchResults.classList.remove('d-none');
+            return;
+        }
 
-        btn.disabled = true;
-        statusEl.textContent = 'מעלה...';
+        fileSearchResults.innerHTML = '<div class="text-center py-2"><div class="spinner-border spinner-border-sm"></div> מחפש...</div>';
+        fileSearchResults.classList.remove('d-none');
 
         try {
-            const resp = await fetch('/api/collections/upload', {
-                method: 'POST',
-                body: formData,
-            });
+            const resp = await fetch('/api/files?q=' + encodeURIComponent(q));
             const data = await resp.json();
 
             if (!resp.ok) {
-                statusEl.textContent = data.error || 'שגיאה';
-                statusEl.classList.add('text-danger');
+                fileSearchResults.innerHTML = `<small class="text-danger">${escapeHtml(data.error)}</small>`;
                 return;
             }
 
-            statusEl.classList.remove('text-danger');
-            statusEl.textContent = `הועלה בהצלחה! ${data.record_count} רשומות, ${data.attachment_count} קבצים`;
-            uploadForm.reset();
-
-            // Switch to collections tab and reload
-            const collectionsTabBtn = document.querySelector('[data-bs-target="#collectionsTab"]');
-            if (collectionsTabBtn) {
-                new bootstrap.Tab(collectionsTabBtn).show();
-                loadCollections();
+            if (data.count === 0) {
+                fileSearchResults.innerHTML = '<small class="text-muted">לא נמצאו קבצים תואמים</small>';
+                return;
             }
+
+            let html = `<small class="text-muted d-block mb-2">נמצאו ${data.count} קבצים:</small>`;
+            for (const f of data.files) {
+                const sizeMB = (f.size_bytes / 1e6).toFixed(2);
+                html += `
+                    <div class="file-item">
+                        <div>
+                            <span class="file-category-badge ${f.category}">${f.category}</span>
+                            <a href="${f.download_url}" class="file-name ms-2">${escapeHtml(f.filename)}</a>
+                            <small class="text-muted ms-2">${escapeHtml(f.collector_name || '')}</small>
+                        </div>
+                        <span class="file-meta">${sizeMB} MB</span>
+                    </div>`;
+            }
+            fileSearchResults.innerHTML = html;
         } catch (err) {
-            statusEl.textContent = 'שגיאת חיבור: ' + err.message;
-            statusEl.classList.add('text-danger');
-        } finally {
-            btn.disabled = false;
+            fileSearchResults.innerHTML = `<small class="text-danger">שגיאה: ${escapeHtml(err.message)}</small>`;
         }
-    });
+    }
 
     // ===================== COLLECTIONS =====================
 
@@ -824,15 +840,43 @@ Fields:
         document.getElementById('detailDownloadExcel').href = '/api/collections/' + id + '/excel';
 
         try {
-            const resp = await fetch('/api/collections/' + id);
-            const data = await resp.json();
+            // Load collection details and files in parallel
+            const [collResp, filesResp] = await Promise.all([
+                fetch('/api/collections/' + id),
+                fetch('/api/collections/' + id + '/files'),
+            ]);
+            const data = await collResp.json();
+            const filesData = await filesResp.json();
 
             document.getElementById('detailName').textContent = data.collector_name;
             document.getElementById('detailUrl').textContent = data.source_url;
             document.getElementById('detailDate').textContent = new Date(data.scrape_date).toLocaleDateString('he-IL');
             document.getElementById('detailRecords').textContent = data.record_count;
-            document.getElementById('detailFiles').textContent = data.attachment_count;
+            document.getElementById('detailFileCount').textContent = data.file_count || 0;
 
+            // Render files list
+            const filesList = document.getElementById('detailFilesList');
+            const files = filesData.files || [];
+            if (files.length > 0) {
+                let filesHtml = '';
+                for (const f of files) {
+                    const sizeMB = (f.size_bytes / 1e6).toFixed(2);
+                    filesHtml += `
+                        <div class="file-item">
+                            <div>
+                                <span class="file-category-badge ${f.category}">${f.category}</span>
+                                <a href="${f.download_url}" class="file-name ms-2">${escapeHtml(f.filename)}</a>
+                            </div>
+                            <span class="file-meta">${sizeMB} MB</span>
+                        </div>`;
+                }
+                filesList.innerHTML = filesHtml;
+                document.getElementById('detailFilesSection').classList.remove('d-none');
+            } else {
+                document.getElementById('detailFilesSection').classList.add('d-none');
+            }
+
+            // Render data preview
             const thead = document.getElementById('detailHead');
             const tbody = document.getElementById('detailBody');
             thead.innerHTML = '';

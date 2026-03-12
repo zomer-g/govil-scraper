@@ -3,12 +3,14 @@ Gov.il Scraper — Flask Application
 Routes, background job management, SSE progress streaming.
 """
 
+import io
 import os
 import json
 import uuid
 import time
 import logging
 import threading
+import zipfile
 from queue import Queue, Empty
 from datetime import datetime
 from enum import Enum
@@ -44,8 +46,7 @@ MAX_CONCURRENT_JOBS = 2
 DISABLE_PLAYWRIGHT = os.environ.get("DISABLE_PLAYWRIGHT", "0") == "1"
 
 app = Flask(__name__)
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)  # Trust Render's proxy headers
-app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB max upload
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY") or os.urandom(32).hex()
 store = CollectionStore(TEMP_DIR)
 
@@ -73,7 +74,7 @@ class Phase(str, Enum):
     SCRAPING = "scraping"
     DOWNLOADING_FILES = "downloading_files"
     EXPORTING = "exporting"
-    ZIPPING = "zipping"
+    REGISTERING_FILES = "registering_files"
     COMPLETE = "complete"
     ERROR = "error"
 
@@ -179,16 +180,18 @@ def _run_scrape_job(job_id: str, url: str, download_files: bool):
                 result.file_attachments, progress_callback=dl_progress
             )
 
-        # Create ZIP
-        _update_progress(job_id, Phase.ZIPPING, 0, 1, "אורז קבצים...")
-        zip_path = handler.create_zip(csv_path, excel_path, attachment_paths)
+        # Register individual files in the database (no ZIP creation)
+        _update_progress(job_id, Phase.REGISTERING_FILES, 0, 1, "רושם קבצים...")
+        file_records = handler.get_all_file_records(TEMP_DIR)
+        if file_records:
+            store.save_files_bulk(job_id, file_records)
+        _update_progress(job_id, Phase.REGISTERING_FILES, 1, 1, "הקבצים נרשמו!")
 
         # Store result for download/preview
         with jobs_lock:
             job = jobs.get(job_id)
             if job:
                 job["result_paths"] = {
-                    "zip": zip_path,
                     "csv": csv_path,
                     "excel": excel_path,
                 }
@@ -213,7 +216,7 @@ def _run_scrape_job(job_id: str, url: str, download_files: bool):
                 attachment_count=len(result.file_attachments),
                 downloaded_count=len(attachment_paths),
                 column_headers=result.column_headers,
-                zip_path=os.path.relpath(zip_path, TEMP_DIR),
+                zip_path="",
                 csv_path=os.path.relpath(csv_path, TEMP_DIR),
                 excel_path=os.path.relpath(excel_path, TEMP_DIR),
                 warning=result.warning or "",
@@ -356,24 +359,43 @@ def preview_data(job_id):
 
 @app.route("/api/download/<job_id>")
 def download_result(job_id):
-    """Download the result ZIP file."""
+    """Download the result as an on-the-fly ZIP file."""
     with jobs_lock:
         job = jobs.get(job_id)
     if not job:
         return jsonify({"error": "משימה לא נמצאה"}), 404
 
-    zip_path = job.get("result_paths", {}).get("zip")
-    if not zip_path or not os.path.exists(zip_path):
+    # Build ZIP on the fly from job result paths
+    result_paths = job.get("result_paths", {})
+    csv_path = result_paths.get("csv")
+    excel_path = result_paths.get("excel")
+
+    if not csv_path or not os.path.exists(csv_path):
         return jsonify({"error": "קובץ ההורדה לא נמצא"}), 404
 
     collector = job.get("result_data", {}).get("collector_name", "data")
     date_str = datetime.now().strftime("%Y%m%d")
-    download_name = f"{collector}_{date_str}.zip"
+
+    buf = io.BytesIO()
+    folder_name = collector
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(csv_path, f"{folder_name}/{os.path.basename(csv_path)}")
+        if excel_path and os.path.exists(excel_path):
+            zf.write(excel_path, f"{folder_name}/{os.path.basename(excel_path)}")
+        # Include attachments if they exist
+        att_dir = os.path.dirname(csv_path)
+        att_subdir = os.path.join(att_dir, "attachments")
+        if os.path.isdir(att_subdir):
+            for fname in os.listdir(att_subdir):
+                fpath = os.path.join(att_subdir, fname)
+                if os.path.isfile(fpath):
+                    zf.write(fpath, f"{folder_name}/attachments/{fname}")
+    buf.seek(0)
 
     return send_file(
-        zip_path,
+        buf,
         as_attachment=True,
-        download_name=download_name,
+        download_name=f"{collector}_{date_str}.zip",
         mimetype="application/zip",
     )
 
@@ -419,6 +441,9 @@ def get_collection(cid):
             except Exception:
                 pass
 
+    # Include file count from files table
+    files = store.list_files(cid)
+
     resp = {
         "id": coll["id"],
         "source_url": coll["source_url"],
@@ -431,6 +456,7 @@ def get_collection(cid):
         "column_headers": coll["column_headers"],
         "warning": coll["warning"],
         "size_bytes": coll["size_bytes"],
+        "file_count": len(files),
         "rows": preview_rows,
     }
     return jsonify(resp)
@@ -438,11 +464,32 @@ def get_collection(cid):
 
 @app.route("/api/collections/<cid>/download")
 def download_collection_zip(cid):
-    """Download the ZIP file for a collection."""
+    """Download a ZIP file for a collection — generated on the fly."""
     coll = store.get_collection(cid)
     if not coll:
         return jsonify({"error": "אוסף לא נמצא"}), 404
 
+    # Try new per-file approach first
+    files = store.list_files(cid)
+    if files:
+        buf = io.BytesIO()
+        folder = coll["collector_name"]
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in files:
+                abs_path = os.path.join(TEMP_DIR, f["rel_path"])
+                if os.path.exists(abs_path):
+                    if f["category"] == "attachment":
+                        arc_name = f"{folder}/attachments/{f['filename']}"
+                    else:
+                        arc_name = f"{folder}/{f['filename']}"
+                    zf.write(abs_path, arc_name)
+        buf.seek(0)
+        date_str = coll["scrape_date"][:10].replace("-", "")
+        name = f"{coll['collector_name']}_{date_str}.zip"
+        return send_file(buf, as_attachment=True, download_name=name,
+                         mimetype="application/zip")
+
+    # Legacy fallback: use old zip_path if no files in new table
     zip_rel = coll.get("zip_path", "")
     zip_abs = os.path.join(TEMP_DIR, zip_rel) if zip_rel else ""
     if not zip_abs or not os.path.exists(zip_abs):
@@ -488,123 +535,51 @@ def download_collection_excel(cid):
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
-@app.route("/api/collections/upload", methods=["POST"])
-@limiter.limit("10 per minute")
-@admin_required
-def upload_collection():
-    """Upload a locally-scraped ZIP to persist as a collection.
+# ---------------------------------------------------------------------------
+# Individual Files API
+# ---------------------------------------------------------------------------
 
-    Accepts multipart form with:
-      - file: ZIP file (required)
-      - source_url: original gov.il URL (required)
-      - collector_name: display name (optional, derived from ZIP)
-    """
-    import csv as csv_mod
-    import zipfile
+@app.route("/api/collections/<cid>/files")
+def list_collection_files(cid):
+    """List all individual files in a collection."""
+    coll = store.get_collection(cid)
+    if not coll:
+        return jsonify({"error": "אוסף לא נמצא"}), 404
 
-    f = request.files.get("file")
-    if not f or not f.filename:
-        return jsonify({"error": "חסר קובץ ZIP"}), 400
-    if not f.filename.lower().endswith(".zip"):
-        return jsonify({"error": "הקובץ חייב להיות ZIP"}), 400
+    files = store.list_files(cid)
+    # Add download URL for each file
+    for f in files:
+        f["download_url"] = f"/api/collections/{cid}/files/{f['filename']}"
+    return jsonify({"collection_id": cid, "files": files})
 
-    source_url = (request.form.get("source_url") or "").strip()
-    if not source_url:
-        return jsonify({"error": "חסרה כתובת מקור (source_url)"}), 400
 
-    collector_name = (request.form.get("collector_name") or "").strip()
+@app.route("/api/collections/<cid>/files/<filename>")
+def download_collection_file(cid, filename):
+    """Download a single file from a collection."""
+    file_rec = store.get_file(cid, filename)
+    if not file_rec:
+        return jsonify({"error": "קובץ לא נמצא"}), 404
 
-    # Save ZIP to a temp location first for validation
-    collection_id = uuid.uuid4().hex[:12]
-    job_dir = os.path.join(TEMP_DIR, collection_id)
-    os.makedirs(job_dir, exist_ok=True)
+    abs_path = os.path.join(TEMP_DIR, file_rec["rel_path"])
+    if not os.path.exists(abs_path):
+        return jsonify({"error": "קובץ לא נמצא על הדיסק"}), 404
 
-    zip_path = os.path.join(job_dir, "data.zip")
-    f.save(zip_path)
+    return send_file(abs_path, as_attachment=True, download_name=filename)
 
-    # Validate it's a real ZIP
-    if not zipfile.is_zipfile(zip_path):
-        import shutil
-        shutil.rmtree(job_dir, ignore_errors=True)
-        return jsonify({"error": "הקובץ אינו ZIP תקין"}), 400
 
-    # Extract contents
-    csv_path = ""
-    excel_path = ""
-    record_count = 0
-    column_headers = []
-    attachment_count = 0
+@app.route("/api/files")
+@limiter.limit("60 per minute")
+def search_files():
+    """Search files by name across all collections."""
+    q = request.args.get("q", "").strip()
+    if not q or len(q) < 2:
+        return jsonify({"error": "נדרשת מילת חיפוש (לפחות 2 תווים)"}), 400
 
-    try:
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(job_dir)
-            names = zf.namelist()
-
-        # Find CSV and Excel files
-        for name in names:
-            full = os.path.join(job_dir, name)
-            if name.lower().endswith(".csv") and not csv_path:
-                csv_path = full
-            elif name.lower().endswith(".xlsx") and not excel_path:
-                excel_path = full
-
-        # Count attachments (anything that's not csv/xlsx/zip)
-        for name in names:
-            low = name.lower()
-            if not low.endswith((".csv", ".xlsx", ".zip")) and not name.endswith("/"):
-                attachment_count += 1
-
-        # Read CSV to get row count and column headers
-        if csv_path and os.path.exists(csv_path):
-            try:
-                with open(csv_path, encoding="utf-8-sig") as cf:
-                    reader = csv_mod.DictReader(cf)
-                    column_headers = reader.fieldnames or []
-                    for i, _ in enumerate(reader):
-                        pass
-                    record_count = i + 1 if reader.line_num > 1 else 0
-            except Exception:
-                pass
-
-        # Derive collector_name from CSV filename if not provided
-        if not collector_name:
-            if csv_path:
-                collector_name = os.path.splitext(os.path.basename(csv_path))[0]
-            else:
-                collector_name = os.path.splitext(f.filename)[0]
-
-        # Persist to SQLite
-        store.save_collection(
-            collection_id=collection_id,
-            source_url=source_url,
-            collector_name=collector_name,
-            page_type="upload",
-            record_count=record_count,
-            attachment_count=attachment_count,
-            downloaded_count=attachment_count,
-            column_headers=list(column_headers),
-            zip_path=os.path.relpath(zip_path, TEMP_DIR),
-            csv_path=os.path.relpath(csv_path, TEMP_DIR) if csv_path else "",
-            excel_path=os.path.relpath(excel_path, TEMP_DIR) if excel_path else "",
-            warning="",
-        )
-        store.cleanup_oldest(max_bytes=800_000_000)
-
-        logger.info("Uploaded collection %s (%s, %d records)",
-                     collection_id, collector_name, record_count)
-
-        return jsonify({
-            "id": collection_id,
-            "collector_name": collector_name,
-            "record_count": record_count,
-            "attachment_count": attachment_count,
-        }), 201
-
-    except Exception as e:
-        import shutil
-        shutil.rmtree(job_dir, ignore_errors=True)
-        logger.exception("Upload failed for %s", f.filename)
-        return jsonify({"error": f"שגיאה בעיבוד הקובץ: {e}"}), 500
+    results = store.search_files(q)
+    # Add download URL for each file
+    for f in results:
+        f["download_url"] = f"/api/collections/{f['collection_id']}/files/{f['filename']}"
+    return jsonify({"query": q, "count": len(results), "files": results})
 
 
 @app.route("/api/collections/<cid>", methods=["DELETE"])

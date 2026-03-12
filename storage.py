@@ -1,7 +1,7 @@
 """
 Collection Store — SQLite-backed persistence for completed scrapes.
-Stores metadata (source URL, scrape date, counts) and references
-to data files (CSV, Excel, ZIP) on disk.
+Stores metadata (source URL, scrape date, counts) and individual file
+records (attachments, CSV, Excel) for per-file API access.
 """
 
 import json
@@ -35,6 +35,21 @@ CREATE TABLE IF NOT EXISTS collections (
 );
 """
 
+FILES_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS files (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    collection_id TEXT NOT NULL,
+    filename      TEXT NOT NULL,
+    file_type     TEXT NOT NULL DEFAULT '',
+    category      TEXT NOT NULL DEFAULT 'attachment',
+    size_bytes    INTEGER DEFAULT 0,
+    rel_path      TEXT NOT NULL,
+    created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_files_collection ON files(collection_id);
+CREATE INDEX IF NOT EXISTS idx_files_filename ON files(filename);
+"""
+
 
 class CollectionStore:
     """Multi-process-safe SQLite store for completed scrape collections.
@@ -52,7 +67,8 @@ class CollectionStore:
         for attempt in range(5):
             try:
                 with self._connect() as conn:
-                    conn.execute(SCHEMA_SQL)
+                    conn.executescript(SCHEMA_SQL)
+                    conn.executescript(FILES_SCHEMA_SQL)
                     conn.commit()
                 break
             except sqlite3.OperationalError as e:
@@ -72,12 +88,13 @@ class CollectionStore:
             conn.execute("PRAGMA journal_mode=WAL")
         except sqlite3.OperationalError:
             pass  # WAL already set by another worker, safe to continue
+        conn.execute("PRAGMA foreign_keys=ON")
         try:
             yield conn
         finally:
             conn.close()
 
-    # ---- Write ---------------------------------------------------------------
+    # ---- Collection Write ----------------------------------------------------
 
     def save_collection(
         self,
@@ -98,20 +115,21 @@ class CollectionStore:
         now = datetime.now().isoformat(timespec="seconds")
         headers_json = json.dumps(column_headers or [], ensure_ascii=False)
 
-        # Calculate total size of files on disk
-        size = 0
-        for rel in (zip_path, csv_path, excel_path):
-            if rel:
-                abs_path = os.path.join(self.base_dir, rel)
-                if os.path.exists(abs_path):
-                    size += os.path.getsize(abs_path)
-        # Also count attachments dir
-        att_dir = os.path.join(self.base_dir, collection_id, "attachments")
-        if os.path.isdir(att_dir):
-            for f in os.listdir(att_dir):
-                fp = os.path.join(att_dir, f)
-                if os.path.isfile(fp):
-                    size += os.path.getsize(fp)
+        # Calculate total size from files table if available, else from disk
+        size = self._calc_files_size(collection_id)
+        if size == 0:
+            # Fallback: scan disk directly
+            for rel in (zip_path, csv_path, excel_path):
+                if rel:
+                    abs_path = os.path.join(self.base_dir, rel)
+                    if os.path.exists(abs_path):
+                        size += os.path.getsize(abs_path)
+            att_dir = os.path.join(self.base_dir, collection_id, "attachments")
+            if os.path.isdir(att_dir):
+                for f in os.listdir(att_dir):
+                    fp = os.path.join(att_dir, f)
+                    if os.path.isfile(fp):
+                        size += os.path.getsize(fp)
 
         with self._lock, self._connect() as conn:
             conn.execute(
@@ -130,7 +148,7 @@ class CollectionStore:
                      collection_id, collector_name, record_count, size / 1e6)
         return self.get_collection(collection_id)
 
-    # ---- Read ----------------------------------------------------------------
+    # ---- Collection Read -----------------------------------------------------
 
     def list_collections(self) -> List[dict]:
         """Return all collections, newest first."""
@@ -148,10 +166,10 @@ class CollectionStore:
             ).fetchone()
         return self._row_to_dict(row) if row else None
 
-    # ---- Delete --------------------------------------------------------------
+    # ---- Collection Delete ---------------------------------------------------
 
     def delete_collection(self, collection_id: str) -> bool:
-        """Delete a collection record and its files from disk."""
+        """Delete a collection record, its files records, and disk files."""
         coll = self.get_collection(collection_id)
         if not coll:
             return False
@@ -163,9 +181,93 @@ class CollectionStore:
             logger.info("Deleted files for collection %s", collection_id)
 
         with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM files WHERE collection_id = ?", (collection_id,))
             conn.execute("DELETE FROM collections WHERE id = ?", (collection_id,))
             conn.commit()
         return True
+
+    # ---- File Write ----------------------------------------------------------
+
+    def save_file(
+        self,
+        collection_id: str,
+        filename: str,
+        file_type: str = "",
+        category: str = "attachment",
+        size_bytes: int = 0,
+        rel_path: str = "",
+    ) -> None:
+        """Register an individual file belonging to a collection."""
+        now = datetime.now().isoformat(timespec="seconds")
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """INSERT INTO files
+                   (collection_id, filename, file_type, category,
+                    size_bytes, rel_path, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (collection_id, filename, file_type, category,
+                 size_bytes, rel_path, now),
+            )
+            conn.commit()
+
+    def save_files_bulk(
+        self,
+        collection_id: str,
+        file_records: List[dict],
+    ) -> None:
+        """Register multiple files at once for a collection."""
+        now = datetime.now().isoformat(timespec="seconds")
+        rows = [
+            (collection_id, r["filename"], r.get("file_type", ""),
+             r.get("category", "attachment"), r.get("size_bytes", 0),
+             r["rel_path"], now)
+            for r in file_records
+        ]
+        with self._lock, self._connect() as conn:
+            conn.executemany(
+                """INSERT INTO files
+                   (collection_id, filename, file_type, category,
+                    size_bytes, rel_path, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                rows,
+            )
+            conn.commit()
+        logger.info("Saved %d file records for collection %s",
+                     len(rows), collection_id)
+
+    # ---- File Read -----------------------------------------------------------
+
+    def list_files(self, collection_id: str) -> List[dict]:
+        """Return all files for a collection."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM files WHERE collection_id = ? ORDER BY category, filename",
+                (collection_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_file(self, collection_id: str, filename: str) -> Optional[dict]:
+        """Return a single file record by collection + filename."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM files WHERE collection_id = ? AND filename = ?",
+                (collection_id, filename),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def search_files(self, query: str, limit: int = 100) -> List[dict]:
+        """Search files by filename across all collections."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """SELECT f.*, c.collector_name, c.source_url, c.scrape_date
+                   FROM files f
+                   JOIN collections c ON f.collection_id = c.id
+                   WHERE f.filename LIKE ?
+                   ORDER BY f.created_at DESC
+                   LIMIT ?""",
+                (f"%{query}%", limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     # ---- Storage management --------------------------------------------------
 
@@ -190,6 +292,15 @@ class CollectionStore:
             self.delete_collection(oldest["id"])
 
     # ---- Helpers -------------------------------------------------------------
+
+    def _calc_files_size(self, collection_id: str) -> int:
+        """Sum size_bytes from the files table for a collection."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(size_bytes), 0) as total FROM files WHERE collection_id = ?",
+                (collection_id,),
+            ).fetchone()
+        return row["total"] if row else 0
 
     @staticmethod
     def _row_to_dict(row: sqlite3.Row) -> dict:
