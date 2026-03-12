@@ -9,6 +9,8 @@ services:
         value: "5000"
       - key: TEMP_DIR
         value: /tmp/govil_scraper
+      - key: DISABLE_PLAYWRIGHT
+        value: "1"
     disk:
       name: scraper-data
       mountPath: /tmp/govil_scraper

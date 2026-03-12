@@ -20,6 +20,7 @@ COPY . .
 RUN mkdir -p /tmp/govil_scraper
 
 ENV TEMP_DIR=/tmp/govil_scraper
+ENV PYTHONUNBUFFERED=1
 
 EXPOSE 5000
 

@@ -20,6 +20,7 @@ from scraper_engine import (
     InvalidURLError, CloudflareBlockError,
 )
 from file_handler import FileHandler
+from storage import CollectionStore
 
 # ---------------------------------------------------------------------------
 # Config
@@ -36,8 +37,10 @@ TEMP_DIR = os.environ.get("TEMP_DIR", os.path.join(tempfile.gettempdir(), "govil
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 MAX_CONCURRENT_JOBS = 2
+DISABLE_PLAYWRIGHT = os.environ.get("DISABLE_PLAYWRIGHT", "0") == "1"
 
 app = Flask(__name__)
+store = CollectionStore(TEMP_DIR)
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +124,7 @@ def _run_scrape_job(job_id: str, url: str, download_files: bool):
 
         # Create session and warm it
         _update_progress(job_id, Phase.WARMING_SESSION, 0, 1, "מתחבר לאתר gov.il...")
-        session = GovILSession(use_playwright_fallback=True)
+        session = GovILSession(use_playwright_fallback=not DISABLE_PLAYWRIGHT)
         session.warm()
         _update_progress(job_id, Phase.WARMING_SESSION, 1, 1, "החיבור הצליח!")
 
@@ -179,6 +182,26 @@ def _run_scrape_job(job_id: str, url: str, download_files: bool):
                     "collector_name": result.collector_name,
                     "warning": result.warning,
                 }
+
+        # Persist to SQLite for the collections API
+        try:
+            store.save_collection(
+                collection_id=job_id,
+                source_url=url,
+                collector_name=result.collector_name,
+                page_type=result.page_type.value if result.page_type else "",
+                record_count=result.total_count,
+                attachment_count=len(result.file_attachments),
+                downloaded_count=len(attachment_paths),
+                column_headers=result.column_headers,
+                zip_path=os.path.relpath(zip_path, TEMP_DIR),
+                csv_path=os.path.relpath(csv_path, TEMP_DIR),
+                excel_path=os.path.relpath(excel_path, TEMP_DIR),
+                warning=result.warning or "",
+            )
+            store.cleanup_oldest(max_bytes=800_000_000)
+        except Exception as e:
+            logger.warning("Failed to persist collection: %s", e)
 
         _update_progress(
             job_id, Phase.COMPLETE, 1, 1,
@@ -331,6 +354,123 @@ def download_result(job_id):
         download_name=download_name,
         mimetype="application/zip",
     )
+
+
+# ---------------------------------------------------------------------------
+# Collections API — persistent access to completed scrapes
+# ---------------------------------------------------------------------------
+
+@app.route("/api/collections")
+def list_collections():
+    """List all persisted collections with metadata."""
+    collections = store.list_collections()
+    # Strip internal paths from response
+    for c in collections:
+        c.pop("zip_path", None)
+        c.pop("csv_path", None)
+        c.pop("excel_path", None)
+    return jsonify({"collections": collections})
+
+
+@app.route("/api/collections/<cid>")
+def get_collection(cid):
+    """Get details of a specific collection, including preview rows."""
+    coll = store.get_collection(cid)
+    if not coll:
+        return jsonify({"error": "אוסף לא נמצא"}), 404
+
+    # Try to load preview rows from the CSV
+    preview_rows = []
+    csv_rel = coll.get("csv_path", "")
+    if csv_rel:
+        csv_abs = os.path.join(TEMP_DIR, csv_rel)
+        if os.path.exists(csv_abs):
+            import csv
+            try:
+                with open(csv_abs, encoding="utf-8-sig") as f:
+                    reader = csv.DictReader(f)
+                    for i, row in enumerate(reader):
+                        if i >= 50:
+                            break
+                        preview_rows.append(dict(row))
+            except Exception:
+                pass
+
+    resp = {
+        "id": coll["id"],
+        "source_url": coll["source_url"],
+        "collector_name": coll["collector_name"],
+        "page_type": coll["page_type"],
+        "scrape_date": coll["scrape_date"],
+        "record_count": coll["record_count"],
+        "attachment_count": coll["attachment_count"],
+        "downloaded_count": coll["downloaded_count"],
+        "column_headers": coll["column_headers"],
+        "warning": coll["warning"],
+        "size_bytes": coll["size_bytes"],
+        "rows": preview_rows,
+    }
+    return jsonify(resp)
+
+
+@app.route("/api/collections/<cid>/download")
+def download_collection_zip(cid):
+    """Download the ZIP file for a collection."""
+    coll = store.get_collection(cid)
+    if not coll:
+        return jsonify({"error": "אוסף לא נמצא"}), 404
+
+    zip_rel = coll.get("zip_path", "")
+    zip_abs = os.path.join(TEMP_DIR, zip_rel) if zip_rel else ""
+    if not zip_abs or not os.path.exists(zip_abs):
+        return jsonify({"error": "קובץ ZIP לא נמצא"}), 404
+
+    date_str = coll["scrape_date"][:10].replace("-", "")
+    name = f"{coll['collector_name']}_{date_str}.zip"
+    return send_file(zip_abs, as_attachment=True, download_name=name,
+                     mimetype="application/zip")
+
+
+@app.route("/api/collections/<cid>/csv")
+def download_collection_csv(cid):
+    """Download just the CSV file for a collection."""
+    coll = store.get_collection(cid)
+    if not coll:
+        return jsonify({"error": "אוסף לא נמצא"}), 404
+
+    csv_rel = coll.get("csv_path", "")
+    csv_abs = os.path.join(TEMP_DIR, csv_rel) if csv_rel else ""
+    if not csv_abs or not os.path.exists(csv_abs):
+        return jsonify({"error": "קובץ CSV לא נמצא"}), 404
+
+    name = f"{coll['collector_name']}.csv"
+    return send_file(csv_abs, as_attachment=True, download_name=name,
+                     mimetype="text/csv; charset=utf-8")
+
+
+@app.route("/api/collections/<cid>/excel")
+def download_collection_excel(cid):
+    """Download just the Excel file for a collection."""
+    coll = store.get_collection(cid)
+    if not coll:
+        return jsonify({"error": "אוסף לא נמצא"}), 404
+
+    excel_rel = coll.get("excel_path", "")
+    excel_abs = os.path.join(TEMP_DIR, excel_rel) if excel_rel else ""
+    if not excel_abs or not os.path.exists(excel_abs):
+        return jsonify({"error": "קובץ Excel לא נמצא"}), 404
+
+    name = f"{coll['collector_name']}.xlsx"
+    return send_file(excel_abs, as_attachment=True, download_name=name,
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+@app.route("/api/collections/<cid>", methods=["DELETE"])
+def delete_collection(cid):
+    """Delete a collection and its files."""
+    if store.delete_collection(cid):
+        return "", 204
+    return jsonify({"error": "אוסף לא נמצא"}), 404
 
 
 # ---------------------------------------------------------------------------
