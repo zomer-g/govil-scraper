@@ -101,11 +101,17 @@ class GovILSession:
         self._session = self._init_cloudscraper()
         self._warmed = False
 
-    def _init_cloudscraper(self) -> cloudscraper.CloudScraper:
-        scraper = cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "windows", "mobile": False},
-            delay=10,
-        )
+    # Browser configs to rotate on retry — different fingerprints
+    _BROWSER_CONFIGS = [
+        {"browser": "chrome", "platform": "windows", "mobile": False},
+        {"browser": "chrome", "platform": "linux", "mobile": False},
+        {"browser": "firefox", "platform": "windows", "mobile": False},
+        {"browser": "chrome", "platform": "darwin", "mobile": False},
+    ]
+
+    def _init_cloudscraper(self, config_index: int = 0) -> cloudscraper.CloudScraper:
+        cfg = self._BROWSER_CONFIGS[config_index % len(self._BROWSER_CONFIGS)]
+        scraper = cloudscraper.create_scraper(browser=cfg, delay=10)
         scraper.headers.update(COMMON_HEADERS)
         return scraper
 
@@ -144,26 +150,48 @@ class GovILSession:
 
     # ---- Session warm-up ----------------------------------------------------
 
-    def warm(self) -> bool:
-        """Visit the main gov.il page to obtain Cloudflare cookies."""
+    def warm(self, max_retries: int = 5) -> bool:
+        """Visit the main gov.il page to obtain Cloudflare cookies.
+        Recreates cloudscraper with a different browser fingerprint on each retry."""
         if self._warmed:
             return True
-        try:
-            resp = self._session.get(f"{BASE_URL}/he", timeout=20)
-            if resp.status_code == 200 and len(resp.text) > 1000:
-                self._warmed = True
-                logger.info("cloudscraper session warmed successfully")
-                return True
-        except Exception as e:
-            logger.warning("cloudscraper warm-up failed: %s", e)
 
-        # Fallback to Playwright
+        for attempt in range(max_retries):
+            # Recreate cloudscraper with a rotated browser config on each retry
+            if attempt > 0:
+                logger.info("Rotating browser fingerprint (attempt %d)...", attempt + 1)
+                self._session = self._init_cloudscraper(config_index=attempt)
+
+            try:
+                resp = self._session.get(f"{BASE_URL}/he", timeout=25)
+                if resp.status_code == 200 and len(resp.text) > 1000:
+                    self._warmed = True
+                    logger.info("cloudscraper session warmed (attempt %d)", attempt + 1)
+                    return True
+                logger.warning("Warm-up attempt %d: status=%d len=%d",
+                               attempt + 1, resp.status_code, len(resp.text))
+            except Exception as e:
+                logger.warning("Warm-up attempt %d failed: %s", attempt + 1, e)
+
+            if attempt < max_retries - 1:
+                wait = 2 + attempt * 2  # 2s, 4s, 6s, 8s
+                logger.info("Retrying warm-up in %ds...", wait)
+                time.sleep(wait)
+
+        # All cloudscraper retries failed — try Playwright
         if self._use_playwright_fallback:
             logger.info("Switching to Playwright fallback")
-            self._init_playwright()
-            return True
+            try:
+                self._init_playwright()
+                return True
+            except CloudflareBlockError:
+                raise
+            except Exception as e:
+                logger.error("Playwright fallback also failed: %s", e)
 
-        raise CloudflareBlockError("לא ניתן לעבור את הגנת Cloudflare של gov.il")
+        raise CloudflareBlockError(
+            "לא ניתן להתחבר לאתר gov.il — cloudscraper נכשל לאחר מספר ניסיונות"
+        )
 
     # ---- HTTP methods with retry --------------------------------------------
 

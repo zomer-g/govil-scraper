@@ -82,6 +82,23 @@ def _update_progress(job_id: str, phase: Phase, current: int = 0,
         pass
 
 
+def _set_error(job_id: str, message: str, error_type: str = ""):
+    """Store error details on the job and send error progress."""
+    import traceback
+    tb = traceback.format_exc()
+    with jobs_lock:
+        job = jobs.get(job_id)
+        if job:
+            job["error_log"] = (
+                f"Error Type: {error_type}\n"
+                f"Message: {message}\n"
+                f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"Job ID: {job_id}\n\n"
+                f"Traceback:\n{tb}"
+            )
+    _update_progress(job_id, Phase.ERROR, 0, 0, message)
+
+
 def _cleanup_old_jobs():
     """Remove jobs older than 1 hour."""
     cutoff = time.time() - 3600
@@ -169,14 +186,14 @@ def _run_scrape_job(job_id: str, url: str, download_files: bool):
         )
 
     except InvalidURLError as e:
-        _update_progress(job_id, Phase.ERROR, 0, 0, str(e))
+        _set_error(job_id, str(e), "InvalidURLError")
     except CloudflareBlockError as e:
-        _update_progress(job_id, Phase.ERROR, 0, 0, str(e))
+        _set_error(job_id, str(e), "CloudflareBlockError")
     except GovILScraperError as e:
-        _update_progress(job_id, Phase.ERROR, 0, 0, f"שגיאת סריקה: {e}")
+        _set_error(job_id, f"שגיאת סריקה: {e}", type(e).__name__)
     except Exception as e:
         logger.exception("Unexpected error in job %s", job_id)
-        _update_progress(job_id, Phase.ERROR, 0, 0, f"שגיאה לא צפויה: {e}")
+        _set_error(job_id, f"שגיאה לא צפויה: {e}", type(e).__name__)
     finally:
         if session:
             try:
@@ -223,6 +240,7 @@ def start_scrape():
             "status": {"phase": Phase.INITIALIZING.value},
             "result_paths": {},
             "result_data": None,
+            "error_log": None,
             "created": time.time(),
         }
 
@@ -273,7 +291,10 @@ def get_status(job_id):
         job = jobs.get(job_id)
     if not job:
         return jsonify({"error": "משימה לא נמצאה"}), 404
-    return jsonify(job["status"])
+    resp = {**job["status"]}
+    if job.get("error_log"):
+        resp["error_log"] = job["error_log"]
+    return jsonify(resp)
 
 
 @app.route("/api/preview/<job_id>")
