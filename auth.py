@@ -93,11 +93,7 @@ def login():
         return oauth.google.authorize_redirect(redirect_uri)
     except Exception as e:
         logger.exception("OAuth login redirect failed")
-        return jsonify({
-            "error": str(e),
-            "type": type(e).__name__,
-            "redirect_uri": url_for("auth.callback", _external=True),
-        }), 500
+        return redirect("/?auth_error=callback_failed")
 
 
 @auth_bp.route("/auth/callback")
