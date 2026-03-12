@@ -200,6 +200,34 @@ class GovILSession:
         return self._request("GET", url, params=params, retries=retries,
                              stream=stream)
 
+    def download_file(self, url: str, retries: int = 3) -> requests.Response:
+        """Download a file, stripping API-specific headers for external domains.
+
+        The Origin/Referer/Accept headers set for gov.il API calls cause
+        external servers (e.g. police.gov.il) to reject requests with 404.
+        This method temporarily removes those headers for the download.
+        """
+        if not self._warmed:
+            self.warm()
+
+        from urllib.parse import urlparse
+        host = urlparse(url).netloc.lower()
+        is_external = host != "www.gov.il"
+
+        if is_external:
+            # Save and temporarily remove API-specific headers
+            saved = {}
+            for h in ("Accept", "Origin", "Referer"):
+                if h in self._session.headers:
+                    saved[h] = self._session.headers.pop(h)
+            try:
+                return self._request("GET", url, retries=retries, stream=False)
+            finally:
+                # Restore headers
+                self._session.headers.update(saved)
+        else:
+            return self._request("GET", url, retries=retries, stream=False)
+
     def post(self, url: str, json_data: dict = None,
              retries: int = 3, extra_headers: dict = None) -> requests.Response:
         return self._request("POST", url, json_data=json_data, retries=retries,

@@ -136,10 +136,11 @@ class FileHandler:
     ) -> str:
         """Download a single file attachment.
 
-        Uses non-streaming mode so cloudscraper can properly handle
-        Cloudflare challenges (stream=True skips challenge solving).
+        Uses download_file() which strips API-specific headers (Origin,
+        Referer, Accept) for external domains — those headers cause servers
+        like police.gov.il to reject requests.
         """
-        resp = self.session.get(att.url, stream=False)
+        resp = self.session.download_file(att.url)
 
         if not resp.content:
             raise RuntimeError(f"Empty response for {att.url}")
