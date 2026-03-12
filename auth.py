@@ -30,7 +30,9 @@ def _get_admin_emails() -> set:
 
 def init_oauth(app):
     """Register Google OAuth with the Flask app. Call once at startup."""
-    app.secret_key = os.environ.get("FLASK_SECRET_KEY", os.urandom(32).hex())
+    # secret_key should already be set in app.py; fallback just in case
+    if not app.secret_key:
+        app.secret_key = os.environ.get("FLASK_SECRET_KEY") or os.urandom(32).hex()
 
     oauth = OAuth(app)
     oauth.register(

@@ -46,6 +46,7 @@ DISABLE_PLAYWRIGHT = os.environ.get("DISABLE_PLAYWRIGHT", "0") == "1"
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)  # Trust Render's proxy headers
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB max upload
+app.secret_key = os.environ.get("FLASK_SECRET_KEY") or os.urandom(32).hex()
 store = CollectionStore(TEMP_DIR)
 
 # --- Auth (Google OAuth2 SSO) ---
