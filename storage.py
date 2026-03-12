@@ -9,6 +9,8 @@ import os
 import shutil
 import sqlite3
 import logging
+import threading
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Optional, List
 
@@ -35,17 +37,32 @@ CREATE TABLE IF NOT EXISTS collections (
 
 
 class CollectionStore:
-    """Thread-safe SQLite store for completed scrape collections."""
+    """Multi-process-safe SQLite store for completed scrape collections.
+
+    Uses per-request connections (not persistent) so multiple gunicorn
+    workers can access the DB without locking issues.
+    """
 
     def __init__(self, base_dir: str):
         self.base_dir = base_dir
         os.makedirs(base_dir, exist_ok=True)
-        db_path = os.path.join(base_dir, "collections.db")
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute(SCHEMA_SQL)
-        self.conn.commit()
+        self._db_path = os.path.join(base_dir, "collections.db")
+        self._lock = threading.Lock()
+        # Initialize schema
+        with self._connect() as conn:
+            conn.execute(SCHEMA_SQL)
+            conn.commit()
+
+    @contextmanager
+    def _connect(self):
+        """Open a short-lived connection with WAL mode and a 10s busy timeout."""
+        conn = sqlite3.connect(self._db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     # ---- Write ---------------------------------------------------------------
 
@@ -83,18 +100,19 @@ class CollectionStore:
                 if os.path.isfile(fp):
                     size += os.path.getsize(fp)
 
-        self.conn.execute(
-            """INSERT OR REPLACE INTO collections
-               (id, source_url, collector_name, page_type, scrape_date,
-                record_count, attachment_count, downloaded_count,
-                column_headers, zip_path, csv_path, excel_path,
-                size_bytes, warning)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (collection_id, source_url, collector_name, page_type, now,
-             record_count, attachment_count, downloaded_count,
-             headers_json, zip_path, csv_path, excel_path, size, warning),
-        )
-        self.conn.commit()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO collections
+                   (id, source_url, collector_name, page_type, scrape_date,
+                    record_count, attachment_count, downloaded_count,
+                    column_headers, zip_path, csv_path, excel_path,
+                    size_bytes, warning)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (collection_id, source_url, collector_name, page_type, now,
+                 record_count, attachment_count, downloaded_count,
+                 headers_json, zip_path, csv_path, excel_path, size, warning),
+            )
+            conn.commit()
         logger.info("Saved collection %s (%s, %d records, %.1f MB)",
                      collection_id, collector_name, record_count, size / 1e6)
         return self.get_collection(collection_id)
@@ -103,16 +121,18 @@ class CollectionStore:
 
     def list_collections(self) -> List[dict]:
         """Return all collections, newest first."""
-        rows = self.conn.execute(
-            "SELECT * FROM collections ORDER BY scrape_date DESC"
-        ).fetchall()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM collections ORDER BY scrape_date DESC"
+            ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
     def get_collection(self, collection_id: str) -> Optional[dict]:
         """Return a single collection by ID, or None."""
-        row = self.conn.execute(
-            "SELECT * FROM collections WHERE id = ?", (collection_id,)
-        ).fetchone()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM collections WHERE id = ?", (collection_id,)
+            ).fetchone()
         return self._row_to_dict(row) if row else None
 
     # ---- Delete --------------------------------------------------------------
@@ -129,17 +149,19 @@ class CollectionStore:
             shutil.rmtree(job_dir, ignore_errors=True)
             logger.info("Deleted files for collection %s", collection_id)
 
-        self.conn.execute("DELETE FROM collections WHERE id = ?", (collection_id,))
-        self.conn.commit()
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM collections WHERE id = ?", (collection_id,))
+            conn.commit()
         return True
 
     # ---- Storage management --------------------------------------------------
 
     def get_total_size(self) -> int:
         """Total size in bytes of all stored collections."""
-        row = self.conn.execute(
-            "SELECT COALESCE(SUM(size_bytes), 0) as total FROM collections"
-        ).fetchone()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(size_bytes), 0) as total FROM collections"
+            ).fetchone()
         return row["total"]
 
     def cleanup_oldest(self, max_bytes: int = 800_000_000):
