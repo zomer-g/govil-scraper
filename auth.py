@@ -85,8 +85,17 @@ def login():
     client_id = os.environ.get("GOOGLE_CLIENT_ID", "")
     if not client_id:
         return redirect("/?auth_error=not_configured")
-    redirect_uri = url_for("auth.callback", _external=True)
-    return oauth.google.authorize_redirect(redirect_uri)
+    try:
+        redirect_uri = url_for("auth.callback", _external=True)
+        logger.info("OAuth login redirect_uri=%s", redirect_uri)
+        return oauth.google.authorize_redirect(redirect_uri)
+    except Exception as e:
+        logger.exception("OAuth login redirect failed")
+        return jsonify({
+            "error": str(e),
+            "type": type(e).__name__,
+            "redirect_uri": url_for("auth.callback", _external=True),
+        }), 500
 
 
 @auth_bp.route("/auth/callback")
