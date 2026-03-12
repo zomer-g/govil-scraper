@@ -621,14 +621,28 @@ class GovILScraper:
         # Flatten items and extract file attachments
         flat_items = []
         attachments = []
+        is_traditional = (parsed.page_type == PageType.TRADITIONAL_COLLECTOR)
 
         for idx, item in enumerate(items):
             flat = self._flatten_item(item)
             flat_items.append(flat)
 
-            # Extract file attachments
-            for att in self._extract_attachments(item, idx):
-                attachments.append(att)
+            # Extract file attachments from item data
+            item_atts = self._extract_attachments(item, idx)
+
+            # For traditional collectors: also fetch PDFs from item content pages
+            if is_traditional and not item_atts:
+                page_atts = self._fetch_content_page_files(item, idx)
+                item_atts.extend(page_atts)
+                if idx % 10 == 0 and idx > 0:
+                    self.progress(
+                        current=idx,
+                        total=len(items),
+                        message=f"מחפש קבצים מצורפים בדפי תוכן ({idx}/{len(items)})",
+                    )
+                    time.sleep(0.3)  # Be gentle on the API
+
+            attachments.extend(item_atts)
 
         # Build column headers from all items
         headers = []
@@ -648,6 +662,75 @@ class GovILScraper:
             column_headers=headers,
             warning=warning,
         )
+
+    # ---- Traditional: content page file extraction -------------------------
+
+    CONTENT_PAGE_API = f"{BASE_URL}/ContentPageWebApi/api/content-pages"
+
+    def _fetch_content_page_files(
+        self, item: dict, item_index: int
+    ) -> List[FileAttachment]:
+        """For traditional collector items, fetch the item's content page to
+        find downloadable files (PDFs etc.).
+
+        Each item has a ``url`` like ``/he/pages/news11326``.  The content
+        page API at ``/ContentPageWebApi/api/content-pages/<pageName>?culture=he``
+        returns JSON with ``contentSub.filesToDownload.filesGroupItems[].items[]``
+        containing the actual file URLs.
+        """
+        item_url = item.get("url") or ""
+        if not item_url:
+            return []
+
+        # Extract page name (last segment)
+        page_name = item_url.rstrip("/").rsplit("/", 1)[-1]
+        if not page_name:
+            return []
+
+        try:
+            resp = self.session.get(
+                f"{self.CONTENT_PAGE_API}/{page_name}",
+                params={"culture": "he"},
+                retries=2,
+            )
+            data = resp.json()
+        except Exception as e:
+            logger.debug("Content page fetch failed for %s: %s", page_name, e)
+            return []
+
+        attachments = []
+        content_sub = data.get("contentSub") or {}
+        files_to_download = content_sub.get("filesToDownload") or {}
+        groups = files_to_download.get("filesGroupItems") or []
+
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            for f in (group.get("items") or []):
+                if not isinstance(f, dict):
+                    continue
+                file_url = f.get("url") or ""
+                filename = f.get("fileName") or f.get("displayName") or ""
+                ext = f.get("extension") or ""
+
+                if not file_url:
+                    continue
+                if file_url.startswith("/"):
+                    file_url = BASE_URL + file_url
+
+                if not filename:
+                    filename = file_url.rsplit("/", 1)[-1]
+                if ext and not filename.lower().endswith(f".{ext.lower()}"):
+                    filename = f"{filename}.{ext}"
+
+                attachments.append(FileAttachment(
+                    url=file_url,
+                    filename=filename,
+                    item_index=item_index,
+                    file_type=ext.lower(),
+                ))
+
+        return attachments
 
     def _flatten_item(self, item: dict, prefix: str = "") -> dict:
         """Flatten nested dicts/items based on the page type structure.
