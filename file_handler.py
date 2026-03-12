@@ -134,8 +134,15 @@ class FileHandler:
     def _download_single(
         self, att: FileAttachment, dest_dir: str, used_names: set
     ) -> str:
-        """Download a single file attachment."""
-        resp = self.session.get(att.url, stream=True)
+        """Download a single file attachment.
+
+        Uses non-streaming mode so cloudscraper can properly handle
+        Cloudflare challenges (stream=True skips challenge solving).
+        """
+        resp = self.session.get(att.url, stream=False)
+
+        if not resp.content:
+            raise RuntimeError(f"Empty response for {att.url}")
 
         filename = sanitize_filename(att.filename)
         if not filename or filename == "unnamed":
@@ -153,11 +160,9 @@ class FileHandler:
 
         filepath = os.path.join(dest_dir, candidate)
         with open(filepath, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
+            f.write(resp.content)
 
-        logger.debug("Downloaded: %s", filepath)
+        logger.debug("Downloaded: %s (%d bytes)", filepath, len(resp.content))
         return filepath
 
     def create_zip(
