@@ -186,6 +186,35 @@
             </div>
         </div>
 
+        <!-- Upload ZIP -->
+        <div class="card mb-3">
+            <div class="card-body p-4">
+                <h6 class="fw-bold mb-3">
+                    <i class="bi bi-cloud-upload"></i>
+                    העלאת סריקה מקומית
+                </h6>
+                <form id="uploadForm">
+                    <div class="row g-3">
+                        <div class="col-md-6">
+                            <label class="form-label small">קובץ ZIP</label>
+                            <input type="file" class="form-control" id="uploadFile" accept=".zip" required>
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label small">כתובת מקור (gov.il)</label>
+                            <input type="url" class="form-control" id="uploadUrl" dir="ltr"
+                                   placeholder="https://www.gov.il/he/..." required>
+                        </div>
+                    </div>
+                    <div class="d-flex align-items-center justify-content-between mt-3">
+                        <small class="text-muted" id="uploadStatus"></small>
+                        <button type="submit" class="btn btn-outline-primary" id="uploadBtn">
+                            <i class="bi bi-upload"></i> העלה
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
         <!-- Progress -->
         <div class="card mb-3 d-none" id="progressCard">
             <div class="card-body p-4">
@@ -437,7 +466,7 @@
                         <small class="text-muted">חיפוש קבצים לפי שם בכל האוספים (מינימום 2 תווים)</small>
                     </div>
 
-                    <h6 class="fw-bold mb-3 mt-4">סריקה (מנהל בלבד — דורש Google SSO)</h6>
+                    <h6 class="fw-bold mb-3 mt-4">סריקה והעלאה (מנהל בלבד — דורש Google SSO)</h6>
 
                     <div class="api-endpoint">
                         <div class="d-flex align-items-center gap-2 mb-1">
@@ -446,6 +475,19 @@
                         </div>
                         <small class="text-muted d-block">התחלת סריקה חדשה. מוגבל ל-5 בקשות בדקה.</small>
                         <pre class="mt-2 mb-0 small" style="background:#f0f0f0;padding:8px;border-radius:6px;direction:ltr;text-align:left;">Body: { "url": "https://www.gov.il/he/...", "download_files": true }</pre>
+                    </div>
+
+                    <div class="api-endpoint">
+                        <div class="d-flex align-items-center gap-2 mb-1">
+                            <span class="api-method post">POST</span>
+                            <span class="api-path">/api/collections/upload</span>
+                        </div>
+                        <small class="text-muted d-block">העלאת סריקה מקומית (ZIP). קבצים נשמרים בנפרד. מוגבל ל-10 בקשות בדקה, עד 200MB.</small>
+                        <pre class="mt-2 mb-0 small" style="background:#f0f0f0;padding:8px;border-radius:6px;direction:ltr;text-align:left;">Content-Type: multipart/form-data
+Fields:
+  file:           ZIP file (required)
+  source_url:     original gov.il URL (required)
+  collector_name: display name (optional)</pre>
                     </div>
 
                     <div class="api-endpoint">
@@ -701,6 +743,57 @@
             }
         } catch { /* ignore */ }
     }
+
+    // ===================== UPLOAD =====================
+
+    const uploadForm = document.getElementById('uploadForm');
+    if (uploadForm) uploadForm.addEventListener('submit', async e => {
+        e.preventDefault();
+        const fileInput = document.getElementById('uploadFile');
+        const urlInput2 = document.getElementById('uploadUrl');
+        const statusEl = document.getElementById('uploadStatus');
+        const btn = document.getElementById('uploadBtn');
+
+        if (!fileInput.files.length || !urlInput2.value.trim()) return;
+
+        const formData = new FormData();
+        formData.append('file', fileInput.files[0]);
+        formData.append('source_url', urlInput2.value.trim());
+
+        btn.disabled = true;
+        statusEl.textContent = 'מעלה...';
+        statusEl.classList.remove('text-danger');
+
+        try {
+            const resp = await fetch('/api/collections/upload', {
+                method: 'POST',
+                body: formData,
+            });
+            const data = await resp.json();
+
+            if (!resp.ok) {
+                statusEl.textContent = data.error || 'שגיאה';
+                statusEl.classList.add('text-danger');
+                return;
+            }
+
+            statusEl.classList.remove('text-danger');
+            statusEl.textContent = `הועלה בהצלחה! ${data.record_count} רשומות, ${data.file_count} קבצים`;
+            uploadForm.reset();
+
+            // Switch to collections tab and reload
+            const collectionsTabBtn = document.querySelector('[data-bs-target="#collectionsTab"]');
+            if (collectionsTabBtn) {
+                new bootstrap.Tab(collectionsTabBtn).show();
+                loadCollections();
+            }
+        } catch (err) {
+            statusEl.textContent = 'שגיאת חיבור: ' + err.message;
+            statusEl.classList.add('text-danger');
+        } finally {
+            btn.disabled = false;
+        }
+    });
 
     // ===================== FILE SEARCH =====================
 

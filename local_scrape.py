@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
 """
-Local Gov.il Scraper CLI — scrape data and files to a local folder.
+Local Gov.il Scraper CLI — scrape data and files to a local folder,
+optionally upload to a remote server.
 
 Usage:
     python local_scrape.py --url <GOV_IL_URL> [--dest ./scraped_data] [--no-files]
+    python local_scrape.py --url <URL> --upload --server https://govil-scraper.onrender.com --token <ADMIN_TOKEN>
 
 Features:
     - Saves to dest/{collector_name}/ subfolder
     - Skips files that already exist (won't re-download)
     - Exports CSV + Excel
-    - No server, no database — standalone operation
+    - Optional --upload to push scraped data to remote server
 """
 
 import argparse
 import logging
 import os
 import sys
-
-from scraper_engine import (
-    GovILSession, GovILScraper, GovILScraperError,
-    InvalidURLError, CloudflareBlockError,
-)
-from file_handler import FileHandler
+import zipfile
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,19 +27,88 @@ logging.basicConfig(
 logger = logging.getLogger("local_scrape")
 
 
+def create_upload_zip(collector_dir: str) -> str:
+    """Create a ZIP from a scraped collector directory for upload."""
+    zip_path = collector_dir.rstrip("/\\") + "_upload.zip"
+    folder_name = os.path.basename(collector_dir)
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, _dirs, files in os.walk(collector_dir):
+            for fname in files:
+                full = os.path.join(root, fname)
+                arc_name = os.path.relpath(full, os.path.dirname(collector_dir))
+                zf.write(full, arc_name)
+
+    size_mb = os.path.getsize(zip_path) / 1e6
+    logger.info("Upload ZIP created: %s (%.1f MB)", zip_path, size_mb)
+    return zip_path
+
+
+def upload_to_server(zip_path: str, source_url: str, server: str,
+                     collector_name: str = "", cookie: str = ""):
+    """Upload a ZIP file to the remote server's upload endpoint."""
+    import requests
+
+    upload_url = server.rstrip("/") + "/api/collections/upload"
+    logger.info("Uploading to %s ...", upload_url)
+
+    with open(zip_path, "rb") as f:
+        files = {"file": (os.path.basename(zip_path), f, "application/zip")}
+        data = {"source_url": source_url}
+        if collector_name:
+            data["collector_name"] = collector_name
+
+        headers = {}
+        if cookie:
+            headers["Cookie"] = cookie
+
+        resp = requests.post(upload_url, files=files, data=data,
+                             headers=headers, timeout=120)
+
+    if resp.status_code == 201:
+        result = resp.json()
+        logger.info("Upload successful!")
+        logger.info("  Collection ID: %s", result.get("id"))
+        logger.info("  Records: %s", result.get("record_count"))
+        logger.info("  Files: %s", result.get("file_count"))
+        return result
+    elif resp.status_code == 403:
+        logger.error("Upload denied — admin authentication required.")
+        logger.error("Use --cookie with your session cookie, or log in via browser first.")
+        sys.exit(1)
+    else:
+        logger.error("Upload failed: %s %s", resp.status_code, resp.text[:500])
+        sys.exit(1)
+
+
 def main():
+    from scraper_engine import (
+        GovILSession, GovILScraper, GovILScraperError,
+        InvalidURLError, CloudflareBlockError,
+    )
+    from file_handler import FileHandler
+
     parser = argparse.ArgumentParser(
         description="Scrape gov.il collector pages to local files.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Scrape locally only:
   python local_scrape.py --url https://www.gov.il/he/departments/dynamiccollectors/ministers_conflict
-  python local_scrape.py --url https://www.gov.il/he/collectors/publications --dest ./data --no-files
+
+  # Scrape and upload to server:
+  python local_scrape.py --url https://www.gov.il/he/departments/dynamiccollectors/ministers_conflict \\
+      --upload --server https://govil-scraper.onrender.com --cookie "session=abc123"
+
+  # Upload an existing folder (no scraping):
+  python local_scrape.py --upload-only ./scraped_data/ministers_conflict \\
+      --source-url https://www.gov.il/he/departments/dynamiccollectors/ministers_conflict \\
+      --server https://govil-scraper.onrender.com --cookie "session=abc123"
         """,
     )
     parser.add_argument(
-        "--url", required=True,
-        help="Gov.il collector page URL",
+        "--url",
+        help="Gov.il collector page URL (required unless --upload-only)",
     )
     parser.add_argument(
         "--dest", default="./scraped_data",
@@ -56,7 +122,55 @@ Examples:
         "--no-skip", action="store_true",
         help="Re-download files even if they already exist",
     )
+
+    # Upload flags
+    parser.add_argument(
+        "--upload", action="store_true",
+        help="Upload scraped data to the remote server after scraping",
+    )
+    parser.add_argument(
+        "--upload-only",
+        help="Upload an existing local folder (skip scraping). Provide folder path.",
+    )
+    parser.add_argument(
+        "--source-url",
+        help="Source URL for --upload-only (required with --upload-only)",
+    )
+    parser.add_argument(
+        "--server", default="https://govil-scraper.onrender.com",
+        help="Server URL for upload (default: https://govil-scraper.onrender.com)",
+    )
+    parser.add_argument(
+        "--cookie",
+        help="Session cookie for admin auth (e.g. 'session=abc123')",
+    )
+
     args = parser.parse_args()
+
+    # --- Upload-only mode (no scraping) ---
+    if args.upload_only:
+        folder = args.upload_only
+        if not os.path.isdir(folder):
+            logger.error("Folder not found: %s", folder)
+            sys.exit(1)
+        source_url = args.source_url
+        if not source_url:
+            logger.error("--source-url is required with --upload-only")
+            sys.exit(1)
+
+        zip_path = create_upload_zip(folder)
+        upload_to_server(
+            zip_path, source_url, args.server,
+            collector_name=os.path.basename(folder),
+            cookie=args.cookie or "",
+        )
+        os.remove(zip_path)
+        logger.info("Temp ZIP removed")
+        return
+
+    # --- Normal scrape mode ---
+    if not args.url:
+        parser.error("--url is required (unless using --upload-only)")
 
     url = args.url.strip()
     if "gov.il" not in url.lower():
@@ -64,6 +178,7 @@ Examples:
         sys.exit(1)
 
     session = None
+    collector_dir = None
     try:
         # Warm session
         logger.info("Connecting to gov.il...")
@@ -128,6 +243,17 @@ Examples:
         logger.info("Done! %d records scraped", result.total_count)
         logger.info("Output: %s", os.path.abspath(collector_dir))
         logger.info("=" * 50)
+
+        # Upload if requested
+        if args.upload:
+            zip_path = create_upload_zip(collector_dir)
+            upload_to_server(
+                zip_path, url, args.server,
+                collector_name=result.collector_name,
+                cookie=args.cookie or "",
+            )
+            os.remove(zip_path)
+            logger.info("Temp upload ZIP removed")
 
     except InvalidURLError as e:
         logger.error("Invalid URL: %s", e)

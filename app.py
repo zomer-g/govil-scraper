@@ -47,6 +47,7 @@ DISABLE_PLAYWRIGHT = os.environ.get("DISABLE_PLAYWRIGHT", "0") == "1"
 
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB max upload
 app.secret_key = os.environ.get("FLASK_SECRET_KEY") or os.urandom(32).hex()
 store = CollectionStore(TEMP_DIR)
 
@@ -580,6 +581,147 @@ def search_files():
     for f in results:
         f["download_url"] = f"/api/collections/{f['collection_id']}/files/{f['filename']}"
     return jsonify({"query": q, "count": len(results), "files": results})
+
+
+# ---------------------------------------------------------------------------
+# Upload API — upload locally-scraped data to the server
+# ---------------------------------------------------------------------------
+
+@app.route("/api/collections/upload", methods=["POST"])
+@limiter.limit("10 per minute")
+@admin_required
+def upload_collection():
+    """Upload a locally-scraped ZIP. Files are stored individually.
+
+    Accepts multipart form with:
+      - file: ZIP file (required)
+      - source_url: original gov.il URL (required)
+      - collector_name: display name (optional, derived from CSV filename)
+    """
+    import csv as csv_mod
+    import shutil
+
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return jsonify({"error": "חסר קובץ ZIP"}), 400
+    if not f.filename.lower().endswith(".zip"):
+        return jsonify({"error": "הקובץ חייב להיות ZIP"}), 400
+
+    source_url = (request.form.get("source_url") or "").strip()
+    if not source_url:
+        return jsonify({"error": "חסרה כתובת מקור (source_url)"}), 400
+
+    collector_name = (request.form.get("collector_name") or "").strip()
+
+    # Save ZIP to temp location for validation
+    collection_id = uuid.uuid4().hex[:12]
+    job_dir = os.path.join(TEMP_DIR, collection_id)
+    os.makedirs(job_dir, exist_ok=True)
+
+    zip_tmp = os.path.join(job_dir, "_upload.zip")
+    f.save(zip_tmp)
+
+    # Validate it's a real ZIP
+    if not zipfile.is_zipfile(zip_tmp):
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return jsonify({"error": "הקובץ אינו ZIP תקין"}), 400
+
+    try:
+        # Extract contents
+        with zipfile.ZipFile(zip_tmp, "r") as zf:
+            zf.extractall(job_dir)
+        # Remove the upload ZIP itself — we store files individually
+        os.remove(zip_tmp)
+
+        # Scan extracted files and register them
+        csv_path = ""
+        excel_path = ""
+        record_count = 0
+        column_headers = []
+        file_records = []
+
+        for root, _dirs, filenames in os.walk(job_dir):
+            for fname in filenames:
+                full = os.path.join(root, fname)
+                rel = os.path.relpath(full, TEMP_DIR).replace("\\", "/")
+                ext = os.path.splitext(fname)[1].lower().lstrip(".")
+                size = os.path.getsize(full)
+
+                if ext == "csv":
+                    category = "csv"
+                    if not csv_path:
+                        csv_path = full
+                elif ext == "xlsx":
+                    category = "excel"
+                    if not excel_path:
+                        excel_path = full
+                else:
+                    category = "attachment"
+
+                file_records.append({
+                    "filename": fname,
+                    "file_type": ext,
+                    "category": category,
+                    "size_bytes": size,
+                    "rel_path": rel,
+                })
+
+        # Read CSV to get row count and column headers
+        if csv_path and os.path.exists(csv_path):
+            try:
+                with open(csv_path, encoding="utf-8-sig") as cf:
+                    reader = csv_mod.DictReader(cf)
+                    column_headers = list(reader.fieldnames or [])
+                    rows = list(reader)
+                    record_count = len(rows)
+            except Exception:
+                pass
+
+        # Derive collector_name
+        if not collector_name:
+            if csv_path:
+                collector_name = os.path.splitext(os.path.basename(csv_path))[0]
+            else:
+                collector_name = os.path.splitext(f.filename)[0]
+
+        attachment_count = sum(1 for r in file_records if r["category"] == "attachment")
+
+        # Register files in DB
+        if file_records:
+            store.save_files_bulk(collection_id, file_records)
+
+        # Save collection metadata
+        store.save_collection(
+            collection_id=collection_id,
+            source_url=source_url,
+            collector_name=collector_name,
+            page_type="upload",
+            record_count=record_count,
+            attachment_count=attachment_count,
+            downloaded_count=attachment_count,
+            column_headers=column_headers,
+            zip_path="",
+            csv_path=os.path.relpath(csv_path, TEMP_DIR).replace("\\", "/") if csv_path else "",
+            excel_path=os.path.relpath(excel_path, TEMP_DIR).replace("\\", "/") if excel_path else "",
+            warning="",
+        )
+        store.cleanup_oldest(max_bytes=800_000_000)
+
+        logger.info("Uploaded collection %s (%s, %d records, %d files)",
+                     collection_id, collector_name, record_count, len(file_records))
+
+        return jsonify({
+            "id": collection_id,
+            "collector_name": collector_name,
+            "record_count": record_count,
+            "file_count": len(file_records),
+            "attachment_count": attachment_count,
+        }), 201
+
+    except Exception as e:
+        shutil.rmtree(job_dir, ignore_errors=True)
+        logger.exception("Upload failed for %s", f.filename)
+        return jsonify({"error": f"שגיאה בעיבוד הקובץ: {e}"}), 500
 
 
 @app.route("/api/collections/<cid>", methods=["DELETE"])
