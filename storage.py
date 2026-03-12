@@ -48,17 +48,30 @@ class CollectionStore:
         os.makedirs(base_dir, exist_ok=True)
         self._db_path = os.path.join(base_dir, "collections.db")
         self._lock = threading.Lock()
-        # Initialize schema
-        with self._connect() as conn:
-            conn.execute(SCHEMA_SQL)
-            conn.commit()
+        # Initialize schema (with retry for multi-worker startup)
+        for attempt in range(5):
+            try:
+                with self._connect() as conn:
+                    conn.execute(SCHEMA_SQL)
+                    conn.commit()
+                break
+            except sqlite3.OperationalError as e:
+                if attempt < 4:
+                    import time
+                    time.sleep(0.5 * (attempt + 1))
+                    logger.warning("DB init retry %d: %s", attempt + 1, e)
+                else:
+                    raise
 
     @contextmanager
     def _connect(self):
-        """Open a short-lived connection with WAL mode and a 10s busy timeout."""
-        conn = sqlite3.connect(self._db_path, timeout=10)
+        """Open a short-lived connection with WAL mode and a 30s busy timeout."""
+        conn = sqlite3.connect(self._db_path, timeout=30)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError:
+            pass  # WAL already set by another worker, safe to continue
         try:
             yield conn
         finally:
