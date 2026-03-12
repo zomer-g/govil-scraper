@@ -16,6 +16,7 @@ from enum import Enum
 from flask import Flask, request, jsonify, Response, send_file, render_template
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from scraper_engine import (
     GovILSession, GovILScraper, GovILScraperError,
@@ -43,6 +44,7 @@ MAX_CONCURRENT_JOBS = 2
 DISABLE_PLAYWRIGHT = os.environ.get("DISABLE_PLAYWRIGHT", "0") == "1"
 
 app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)  # Trust Render's proxy headers
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB max upload
 store = CollectionStore(TEMP_DIR)
 
