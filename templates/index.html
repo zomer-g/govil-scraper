@@ -77,6 +77,11 @@
             <i class="bi bi-shield-exclamation"></i>
             החשבון שלך אינו מורשה כמנהל. פנה למנהל המערכת.
         </div>
+        {% elif request.args.get('auth_error') == 'not_configured' %}
+        <div class="alert alert-danger">
+            <i class="bi bi-gear"></i>
+            Google OAuth לא מוגדר. יש להגדיר GOOGLE_CLIENT_ID ו-GOOGLE_CLIENT_SECRET בהגדרות השרת.
+        </div>
         {% elif request.args.get('auth_error') == 'callback_failed' %}
         <div class="alert alert-danger">
             <i class="bi bi-exclamation-triangle"></i>

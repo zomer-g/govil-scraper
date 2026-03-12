@@ -82,6 +82,9 @@ def login():
     oauth = current_app.extensions.get("oauth")
     if not oauth:
         return jsonify({"error": "OAuth not configured"}), 500
+    client_id = os.environ.get("GOOGLE_CLIENT_ID", "")
+    if not client_id:
+        return redirect("/?auth_error=not_configured")
     redirect_uri = url_for("auth.callback", _external=True)
     return oauth.google.authorize_redirect(redirect_uri)
 
