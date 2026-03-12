@@ -11,6 +11,14 @@ services:
         value: /tmp/govil_scraper
       - key: DISABLE_PLAYWRIGHT
         value: "1"
+      - key: FLASK_SECRET_KEY
+        generateValue: true
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: ADMIN_EMAILS
+        sync: false
     disk:
       name: scraper-data
       mountPath: /tmp/govil_scraper

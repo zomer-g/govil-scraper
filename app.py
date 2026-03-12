@@ -14,6 +14,8 @@ from datetime import datetime
 from enum import Enum
 
 from flask import Flask, request, jsonify, Response, send_file, render_template
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 from scraper_engine import (
     GovILSession, GovILScraper, GovILScraperError,
@@ -21,6 +23,7 @@ from scraper_engine import (
 )
 from file_handler import FileHandler
 from storage import CollectionStore
+from auth import auth_bp, init_oauth, admin_required, get_current_user, is_admin
 
 # ---------------------------------------------------------------------------
 # Config
@@ -40,7 +43,20 @@ MAX_CONCURRENT_JOBS = 2
 DISABLE_PLAYWRIGHT = os.environ.get("DISABLE_PLAYWRIGHT", "0") == "1"
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB max upload
 store = CollectionStore(TEMP_DIR)
+
+# --- Auth (Google OAuth2 SSO) ---
+init_oauth(app)
+app.register_blueprint(auth_bp)
+
+# --- Rate limiting ---
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["200 per minute"],
+    storage_uri="memory://",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -231,10 +247,13 @@ def _run_scrape_job(job_id: str, url: str, download_files: bool):
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    user = get_current_user()
+    return render_template("index.html", user=user, is_admin=is_admin())
 
 
 @app.route("/api/scrape", methods=["POST"])
+@limiter.limit("5 per minute")
+@admin_required
 def start_scrape():
     """Start a scraping job. Body: {"url": "...", "download_files": true}"""
     data = request.get_json(force=True, silent=True) or {}
@@ -361,6 +380,7 @@ def download_result(job_id):
 # ---------------------------------------------------------------------------
 
 @app.route("/api/collections")
+@limiter.limit("60 per minute")
 def list_collections():
     """List all persisted collections with metadata."""
     collections = store.list_collections()
@@ -465,7 +485,127 @@ def download_collection_excel(cid):
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
+@app.route("/api/collections/upload", methods=["POST"])
+@limiter.limit("10 per minute")
+@admin_required
+def upload_collection():
+    """Upload a locally-scraped ZIP to persist as a collection.
+
+    Accepts multipart form with:
+      - file: ZIP file (required)
+      - source_url: original gov.il URL (required)
+      - collector_name: display name (optional, derived from ZIP)
+    """
+    import csv as csv_mod
+    import zipfile
+
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return jsonify({"error": "חסר קובץ ZIP"}), 400
+    if not f.filename.lower().endswith(".zip"):
+        return jsonify({"error": "הקובץ חייב להיות ZIP"}), 400
+
+    source_url = (request.form.get("source_url") or "").strip()
+    if not source_url:
+        return jsonify({"error": "חסרה כתובת מקור (source_url)"}), 400
+
+    collector_name = (request.form.get("collector_name") or "").strip()
+
+    # Save ZIP to a temp location first for validation
+    collection_id = uuid.uuid4().hex[:12]
+    job_dir = os.path.join(TEMP_DIR, collection_id)
+    os.makedirs(job_dir, exist_ok=True)
+
+    zip_path = os.path.join(job_dir, "data.zip")
+    f.save(zip_path)
+
+    # Validate it's a real ZIP
+    if not zipfile.is_zipfile(zip_path):
+        import shutil
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return jsonify({"error": "הקובץ אינו ZIP תקין"}), 400
+
+    # Extract contents
+    csv_path = ""
+    excel_path = ""
+    record_count = 0
+    column_headers = []
+    attachment_count = 0
+
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(job_dir)
+            names = zf.namelist()
+
+        # Find CSV and Excel files
+        for name in names:
+            full = os.path.join(job_dir, name)
+            if name.lower().endswith(".csv") and not csv_path:
+                csv_path = full
+            elif name.lower().endswith(".xlsx") and not excel_path:
+                excel_path = full
+
+        # Count attachments (anything that's not csv/xlsx/zip)
+        for name in names:
+            low = name.lower()
+            if not low.endswith((".csv", ".xlsx", ".zip")) and not name.endswith("/"):
+                attachment_count += 1
+
+        # Read CSV to get row count and column headers
+        if csv_path and os.path.exists(csv_path):
+            try:
+                with open(csv_path, encoding="utf-8-sig") as cf:
+                    reader = csv_mod.DictReader(cf)
+                    column_headers = reader.fieldnames or []
+                    for i, _ in enumerate(reader):
+                        pass
+                    record_count = i + 1 if reader.line_num > 1 else 0
+            except Exception:
+                pass
+
+        # Derive collector_name from CSV filename if not provided
+        if not collector_name:
+            if csv_path:
+                collector_name = os.path.splitext(os.path.basename(csv_path))[0]
+            else:
+                collector_name = os.path.splitext(f.filename)[0]
+
+        # Persist to SQLite
+        store.save_collection(
+            collection_id=collection_id,
+            source_url=source_url,
+            collector_name=collector_name,
+            page_type="upload",
+            record_count=record_count,
+            attachment_count=attachment_count,
+            downloaded_count=attachment_count,
+            column_headers=list(column_headers),
+            zip_path=os.path.relpath(zip_path, TEMP_DIR),
+            csv_path=os.path.relpath(csv_path, TEMP_DIR) if csv_path else "",
+            excel_path=os.path.relpath(excel_path, TEMP_DIR) if excel_path else "",
+            warning="",
+        )
+        store.cleanup_oldest(max_bytes=800_000_000)
+
+        logger.info("Uploaded collection %s (%s, %d records)",
+                     collection_id, collector_name, record_count)
+
+        return jsonify({
+            "id": collection_id,
+            "collector_name": collector_name,
+            "record_count": record_count,
+            "attachment_count": attachment_count,
+        }), 201
+
+    except Exception as e:
+        import shutil
+        shutil.rmtree(job_dir, ignore_errors=True)
+        logger.exception("Upload failed for %s", f.filename)
+        return jsonify({"error": f"שגיאה בעיבוד הקובץ: {e}"}), 500
+
+
 @app.route("/api/collections/<cid>", methods=["DELETE"])
+@admin_required
 def delete_collection(cid):
     """Delete a collection and its files."""
     if store.delete_collection(cid):

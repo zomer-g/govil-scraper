@@ -167,9 +167,10 @@ class CollectionStore:
     def cleanup_oldest(self, max_bytes: int = 800_000_000):
         """Delete oldest collections until total size is under max_bytes."""
         while self.get_total_size() > max_bytes:
-            oldest = self.conn.execute(
-                "SELECT id FROM collections ORDER BY scrape_date ASC LIMIT 1"
-            ).fetchone()
+            with self._connect() as conn:
+                oldest = conn.execute(
+                    "SELECT id FROM collections ORDER BY scrape_date ASC LIMIT 1"
+                ).fetchone()
             if not oldest:
                 break
             logger.info("Disk cleanup: removing oldest collection %s", oldest["id"])
