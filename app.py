@@ -3,6 +3,10 @@ Gov.il Scraper — Flask Application
 Routes, background job management, SSE progress streaming.
 """
 
+# Load .env file for local development
+from dotenv import load_dotenv
+load_dotenv()
+
 import io
 import os
 import json
