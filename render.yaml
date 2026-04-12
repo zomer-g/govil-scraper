@@ -19,6 +19,8 @@ services:
         sync: false
       - key: ADMIN_EMAILS
         sync: false
+      - key: WORKER_API_KEY
+        generateValue: true
     disk:
       name: scraper-data
       mountPath: /tmp/govil_scraper

@@ -74,6 +74,35 @@ def admin_required(f):
     return decorated
 
 
+def _check_worker_key() -> bool:
+    """Check if the request has a valid worker API key."""
+    expected = os.environ.get("WORKER_API_KEY", "")
+    if not expected:
+        return False
+    key = request.headers.get("X-Worker-Key", "")
+    return key == expected
+
+
+def worker_auth_required(f):
+    """Decorator: require valid worker API key (X-Worker-Key header)."""
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        if not _check_worker_key():
+            return jsonify({"error": "Invalid or missing worker key"}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+
+def admin_or_worker(f):
+    """Decorator: accept either admin OAuth session OR valid worker API key."""
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        if is_admin() or _check_worker_key():
+            return f(*args, **kwargs)
+        return jsonify({"error": "נדרשת הרשאת מנהל או מפתח עובד"}), 403
+    return decorated
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------

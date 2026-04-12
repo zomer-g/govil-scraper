@@ -1,7 +1,7 @@
 """
 Collection Store — SQLite-backed persistence for completed scrapes.
-Stores metadata (source URL, scrape date, counts) and individual file
-records (attachments, CSV, Excel) for per-file API access.
+Stores metadata (source URL, scrape date, counts), individual file
+records (attachments, CSV, Excel), and task queue for worker mode.
 """
 
 import json
@@ -11,7 +11,7 @@ import sqlite3
 import logging
 import threading
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List
 
 logger = logging.getLogger(__name__)
@@ -50,9 +50,27 @@ CREATE INDEX IF NOT EXISTS idx_files_collection ON files(collection_id);
 CREATE INDEX IF NOT EXISTS idx_files_filename ON files(filename);
 """
 
+TASKS_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS tasks (
+    id             TEXT PRIMARY KEY,
+    url            TEXT NOT NULL,
+    download_files INTEGER DEFAULT 1,
+    mode           TEXT DEFAULT 'server',
+    status         TEXT DEFAULT 'pending',
+    worker_id      TEXT DEFAULT '',
+    progress       TEXT DEFAULT '{}',
+    result         TEXT DEFAULT '{}',
+    error          TEXT DEFAULT '',
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    claimed_at     TEXT DEFAULT '',
+    completed_at   TEXT DEFAULT ''
+);
+"""
+
 
 class CollectionStore:
-    """Multi-process-safe SQLite store for completed scrape collections.
+    """Multi-process-safe SQLite store for collections, files, and tasks.
 
     Uses per-request connections (not persistent) so multiple gunicorn
     workers can access the DB without locking issues.
@@ -69,6 +87,7 @@ class CollectionStore:
                 with self._connect() as conn:
                     conn.executescript(SCHEMA_SQL)
                     conn.executescript(FILES_SCHEMA_SQL)
+                    conn.executescript(TASKS_SCHEMA_SQL)
                     conn.commit()
                 break
             except sqlite3.OperationalError as e:
@@ -269,6 +288,137 @@ class CollectionStore:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    # ---- Task Write ----------------------------------------------------------
+
+    def create_task(
+        self,
+        task_id: str,
+        url: str,
+        download_files: bool = True,
+        mode: str = "server",
+    ) -> dict:
+        """Create a new scrape task."""
+        now = datetime.now().isoformat(timespec="seconds")
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """INSERT INTO tasks
+                   (id, url, download_files, mode, status, progress,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, 'pending', '{}', ?, ?)""",
+                (task_id, url, 1 if download_files else 0, mode, now, now),
+            )
+            conn.commit()
+        return self.get_task(task_id)
+
+    def claim_task(self, worker_id: str) -> Optional[dict]:
+        """Atomically claim the oldest pending worker-mode task.
+
+        Returns the claimed task or None if no tasks available.
+        """
+        now = datetime.now().isoformat(timespec="seconds")
+        with self._lock, self._connect() as conn:
+            # Atomic: select + update in one transaction
+            row = conn.execute(
+                """SELECT id FROM tasks
+                   WHERE status = 'pending' AND mode = 'worker'
+                   ORDER BY created_at ASC LIMIT 1"""
+            ).fetchone()
+            if not row:
+                return None
+            task_id = row["id"]
+            conn.execute(
+                """UPDATE tasks
+                   SET status = 'claimed', worker_id = ?,
+                       claimed_at = ?, updated_at = ?
+                   WHERE id = ?""",
+                (worker_id, now, now, task_id),
+            )
+            conn.commit()
+        return self.get_task(task_id)
+
+    def update_task_progress(self, task_id: str, progress: dict) -> None:
+        """Update task progress (JSON dict with phase, current, total, etc.)."""
+        now = datetime.now().isoformat(timespec="seconds")
+        progress_json = json.dumps(progress, ensure_ascii=False)
+        # Also set status to 'running' if it was 'claimed'
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """UPDATE tasks
+                   SET progress = ?, updated_at = ?,
+                       status = CASE WHEN status = 'claimed' THEN 'running' ELSE status END
+                   WHERE id = ?""",
+                (progress_json, now, task_id),
+            )
+            conn.commit()
+
+    def update_task_status(
+        self,
+        task_id: str,
+        status: str,
+        error: str = "",
+        result: Optional[dict] = None,
+    ) -> None:
+        """Update task status. Set completed_at for terminal statuses."""
+        now = datetime.now().isoformat(timespec="seconds")
+        result_json = json.dumps(result or {}, ensure_ascii=False)
+        completed = now if status in ("completed", "failed") else ""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """UPDATE tasks
+                   SET status = ?, error = ?, result = ?,
+                       updated_at = ?, completed_at = ?
+                   WHERE id = ?""",
+                (status, error, result_json, now, completed, task_id),
+            )
+            conn.commit()
+
+    def delete_task(self, task_id: str) -> bool:
+        """Delete a task."""
+        with self._lock, self._connect() as conn:
+            cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+            conn.commit()
+        return cur.rowcount > 0
+
+    # ---- Task Read -----------------------------------------------------------
+
+    def list_tasks(self, status: Optional[str] = None, limit: int = 50) -> List[dict]:
+        """List tasks, newest first. Optionally filter by status."""
+        with self._connect() as conn:
+            if status:
+                rows = conn.execute(
+                    "SELECT * FROM tasks WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+                    (status, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        return [self._task_to_dict(r) for r in rows]
+
+    def get_task(self, task_id: str) -> Optional[dict]:
+        """Return a single task by ID."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+        return self._task_to_dict(row) if row else None
+
+    def reset_stale_tasks(self, timeout_minutes: int = 10) -> int:
+        """Reset tasks stuck in 'claimed' for too long back to 'pending'."""
+        cutoff = (datetime.now() - timedelta(minutes=timeout_minutes)).isoformat(timespec="seconds")
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                """UPDATE tasks
+                   SET status = 'pending', worker_id = '', claimed_at = ''
+                   WHERE status = 'claimed' AND claimed_at < ? AND claimed_at != ''""",
+                (cutoff,),
+            )
+            conn.commit()
+        if cur.rowcount > 0:
+            logger.info("Reset %d stale tasks back to pending", cur.rowcount)
+        return cur.rowcount
+
     # ---- Storage management --------------------------------------------------
 
     def get_total_size(self) -> int:
@@ -305,9 +455,19 @@ class CollectionStore:
     @staticmethod
     def _row_to_dict(row: sqlite3.Row) -> dict:
         d = dict(row)
-        # Parse column_headers from JSON string
         try:
             d["column_headers"] = json.loads(d.get("column_headers") or "[]")
         except (json.JSONDecodeError, TypeError):
             d["column_headers"] = []
+        return d
+
+    @staticmethod
+    def _task_to_dict(row: sqlite3.Row) -> dict:
+        d = dict(row)
+        d["download_files"] = bool(d.get("download_files", 1))
+        for field in ("progress", "result"):
+            try:
+                d[field] = json.loads(d.get(field) or "{}")
+            except (json.JSONDecodeError, TypeError):
+                d[field] = {}
         return d

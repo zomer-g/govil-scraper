@@ -62,6 +62,9 @@
             <span class="navbar-brand d-flex align-items-center gap-2">
                 <i class="bi bi-database-down fs-4"></i>
                 Gov.il Scraper
+                <span id="workerBadge" class="badge bg-secondary small d-none" style="font-size:0.65rem;">
+                    <i class="bi bi-circle-fill" id="workerDot"></i> <span id="workerLabel">Worker</span>
+                </span>
             </span>
             <div class="d-flex align-items-center gap-2">
                 {% if user %}
@@ -109,6 +112,13 @@
                 </button>
             </li>
             {% endif %}
+            {% if is_admin %}
+            <li class="nav-item">
+                <button class="nav-link" data-bs-toggle="tab" data-bs-target="#tasksTab" type="button">
+                    <i class="bi bi-list-task"></i> משימות
+                </button>
+            </li>
+            {% endif %}
             <li class="nav-item">
                 <button class="nav-link {% if not is_admin %}active{% endif %}" data-bs-toggle="tab" data-bs-target="#collectionsTab" type="button">
                     <i class="bi bi-collection"></i> אוספים
@@ -140,13 +150,29 @@
                                required>
                         <div class="form-text">הדבק כתובת של דף DynamicCollectors או Collectors מאתר gov.il</div>
                     </div>
-                    <div class="d-flex align-items-center justify-content-between">
-                        <div class="form-check">
-                            <input class="form-check-input" type="checkbox" id="downloadFiles" checked>
-                            <label class="form-check-label" for="downloadFiles">
-                                <i class="bi bi-paperclip"></i>
-                                הורד קבצים מצורפים
-                            </label>
+                    <div class="d-flex align-items-center justify-content-between flex-wrap gap-2">
+                        <div class="d-flex align-items-center gap-3">
+                            <div class="form-check">
+                                <input class="form-check-input" type="checkbox" id="downloadFiles" checked>
+                                <label class="form-check-label" for="downloadFiles">
+                                    <i class="bi bi-paperclip"></i>
+                                    הורד קבצים מצורפים
+                                </label>
+                            </div>
+                            <div class="btn-group btn-group-sm" role="group" id="modeSelector">
+                                <input type="radio" class="btn-check" name="scrapeMode" id="modeAuto" value="auto" checked>
+                                <label class="btn btn-outline-secondary" for="modeAuto">
+                                    <i class="bi bi-magic"></i> אוטומטי
+                                </label>
+                                <input type="radio" class="btn-check" name="scrapeMode" id="modeServer" value="server">
+                                <label class="btn btn-outline-secondary" for="modeServer">
+                                    <i class="bi bi-cloud"></i> שרת
+                                </label>
+                                <input type="radio" class="btn-check" name="scrapeMode" id="modeWorker" value="worker">
+                                <label class="btn btn-outline-secondary" for="modeWorker">
+                                    <i class="bi bi-pc-display"></i> עובד מרוחק
+                                </label>
+                            </div>
                         </div>
                         <button type="submit" class="btn btn-primary btn-lg px-4" id="startBtn">
                             <i class="bi bi-play-fill"></i>
@@ -386,6 +412,26 @@
             </div>
         </div>
 
+        <!-- ============ TASKS TAB ============ -->
+        {% if is_admin %}
+        <div class="tab-pane fade" id="tasksTab">
+            <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center p-3">
+                    <span><i class="bi bi-list-task"></i> משימות</span>
+                    <button class="btn btn-sm btn-outline-primary" onclick="loadTasks()">
+                        <i class="bi bi-arrow-clockwise"></i> רענן
+                    </button>
+                </div>
+                <div class="card-body p-3" id="tasksContainer">
+                    <div class="empty-state">
+                        <i class="bi bi-inbox fs-1"></i>
+                        <p class="mt-2">אין משימות</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+        {% endif %}
+
         <!-- ============ API DOCS TAB ============ -->
         <div class="tab-pane fade" id="apiDocsTab">
             <div class="card">
@@ -563,11 +609,13 @@ Fields:
         });
     });
 
-    // Form submit (only exists for admins)
+    // Form submit (only exists for admins) — uses /api/tasks
     if (form) form.addEventListener('submit', async e => {
         e.preventDefault();
         const url = urlInput.value.trim();
         if (!url) return;
+
+        const mode = document.querySelector('input[name="scrapeMode"]:checked')?.value || 'auto';
 
         // Reset UI
         errorAlert.classList.add('d-none');
@@ -576,18 +624,19 @@ Fields:
         progressCard.classList.remove('d-none');
         progressBar.style.width = '0%';
         progressPct.textContent = '0%';
-        progressPhase.textContent = 'מאתחל...';
+        progressPhase.textContent = mode === 'worker' ? 'ממתין לעובד מרוחק...' : 'מאתחל...';
         progressDetail.textContent = '';
         progressSpinner.classList.remove('d-none');
         startBtn.disabled = true;
 
         try {
-            const resp = await fetch('/api/scrape', {
+            const resp = await fetch('/api/tasks', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     url: url,
                     download_files: document.getElementById('downloadFiles').checked,
+                    mode: mode,
                 }),
             });
             const data = await resp.json();
@@ -603,8 +652,8 @@ Fields:
                 return;
             }
 
-            currentJobId = data.job_id;
-            connectSSE(data.job_id);
+            currentJobId = data.task_id;
+            connectSSE(data.task_id);
         } catch (err) {
             showError('שגיאת חיבור: ' + err.message);
         }
@@ -992,6 +1041,107 @@ Fields:
     {% if not is_admin %}
     document.addEventListener('DOMContentLoaded', loadCollections);
     {% endif %}
+
+    // ===================== WORKER STATUS =====================
+
+    async function checkWorkerStatus() {
+        try {
+            const resp = await fetch('/api/worker/status');
+            const data = await resp.json();
+            const badge = document.getElementById('workerBadge');
+            const dot = document.getElementById('workerDot');
+            const label = document.getElementById('workerLabel');
+            if (badge) {
+                badge.classList.remove('d-none');
+                if (data.online) {
+                    badge.className = 'badge bg-success small';
+                    badge.style.fontSize = '0.65rem';
+                    label.textContent = `Worker (${data.count})`;
+                } else {
+                    badge.className = 'badge bg-secondary small';
+                    badge.style.fontSize = '0.65rem';
+                    label.textContent = 'Worker offline';
+                }
+            }
+        } catch { /* ignore */ }
+    }
+    checkWorkerStatus();
+    setInterval(checkWorkerStatus, 30000);
+
+    // ===================== TASKS =====================
+
+    document.querySelector('[data-bs-target="#tasksTab"]')?.addEventListener('shown.bs.tab', loadTasks);
+
+    async function loadTasks() {
+        const container = document.getElementById('tasksContainer');
+        if (!container) return;
+        container.innerHTML = '<div class="empty-state"><div class="spinner-border text-primary mb-3"></div><p>טוען משימות...</p></div>';
+
+        try {
+            const resp = await fetch('/api/tasks');
+            const data = await resp.json();
+            const tasks = data.tasks || [];
+
+            if (tasks.length === 0) {
+                container.innerHTML = '<div class="empty-state"><i class="bi bi-inbox fs-1"></i><p class="mt-2">אין משימות</p></div>';
+                return;
+            }
+
+            const statusBadge = (s) => {
+                const map = {
+                    pending: ['bg-warning-subtle text-warning', 'ממתינה'],
+                    claimed: ['bg-info-subtle text-info', 'נתפסה'],
+                    running: ['bg-primary-subtle text-primary', 'רצה'],
+                    completed: ['bg-success-subtle text-success', 'הושלמה'],
+                    failed: ['bg-danger-subtle text-danger', 'נכשלה'],
+                };
+                const [cls, label] = map[s] || ['bg-secondary-subtle text-secondary', s];
+                return `<span class="badge ${cls}">${label}</span>`;
+            };
+            const modeBadge = (m) => {
+                if (m === 'server') return '<span class="badge bg-primary-subtle text-primary">שרת</span>';
+                if (m === 'worker') return '<span class="badge bg-warning-subtle text-dark">עובד</span>';
+                return `<span class="badge bg-secondary-subtle text-secondary">${m}</span>`;
+            };
+
+            let html = '<div class="table-responsive"><table class="table table-hover table-sm mb-0"><thead class="table-light"><tr>';
+            html += '<th>URL</th><th>מצב</th><th>מקום</th><th>התקדמות</th><th>עובד</th><th>זמן</th><th></th>';
+            html += '</tr></thead><tbody>';
+
+            for (const t of tasks) {
+                const shortUrl = (t.url || '').replace('https://www.gov.il/he/', '').substring(0, 50);
+                const progress = t.progress || {};
+                const pct = progress.percentage || 0;
+                const msg = progress.message || '';
+                const date = new Date(t.created_at).toLocaleString('he-IL', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+
+                html += `<tr>
+                    <td class="small" style="direction:ltr;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(t.url)}">${escapeHtml(shortUrl)}</td>
+                    <td>${statusBadge(t.status)}</td>
+                    <td>${modeBadge(t.mode)}</td>
+                    <td style="min-width:120px">
+                        ${t.status === 'running' ? `<div class="progress" style="height:16px"><div class="progress-bar bg-primary progress-bar-striped progress-bar-animated" style="width:${pct}%"></div></div><small class="text-muted">${escapeHtml(msg)}</small>` : (t.status === 'completed' ? '<small class="text-success">100%</small>' : (t.error ? `<small class="text-danger">${escapeHtml(t.error).substring(0,40)}</small>` : '-'))}
+                    </td>
+                    <td class="small">${escapeHtml(t.worker_id || '-')}</td>
+                    <td class="small text-nowrap">${date}</td>
+                    <td>
+                        ${t.status === 'pending' || t.status === 'failed' ? `<button class="btn btn-sm btn-outline-danger" onclick="deleteTask('${t.id}')" title="מחק"><i class="bi bi-trash"></i></button>` : ''}
+                    </td>
+                </tr>`;
+            }
+            html += '</tbody></table></div>';
+            container.innerHTML = html;
+        } catch (err) {
+            container.innerHTML = `<div class="empty-state text-danger">${escapeHtml(err.message)}</div>`;
+        }
+    }
+
+    async function deleteTask(taskId) {
+        try {
+            await fetch('/api/tasks/' + taskId, { method: 'DELETE' });
+            loadTasks();
+        } catch { /* ignore */ }
+    }
     </script>
 </body>
 </html>

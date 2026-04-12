@@ -30,7 +30,10 @@ from scraper_engine import (
 )
 from file_handler import FileHandler
 from storage import CollectionStore
-from auth import auth_bp, init_oauth, admin_required, get_current_user, is_admin
+from auth import (
+    auth_bp, init_oauth, admin_required, admin_or_worker,
+    worker_auth_required, get_current_user, is_admin,
+)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -87,6 +90,11 @@ class Phase(str, Enum):
 # job_id -> { "queue": Queue, "status": dict, "result_paths": dict, "created": float }
 jobs: dict = {}
 jobs_lock = threading.Lock()
+
+# Worker heartbeat tracking (in-memory, ephemeral)
+workers: dict = {}  # worker_id -> {"last_seen": float, "info": str}
+workers_lock = threading.Lock()
+WORKER_ONLINE_TIMEOUT = 60  # seconds
 
 
 def _update_progress(job_id: str, phase: Phase, current: int = 0,
@@ -309,31 +317,72 @@ def start_scrape():
 
 @app.route("/api/progress/<job_id>")
 def stream_progress(job_id):
-    """SSE endpoint for real-time progress updates."""
+    """SSE endpoint for real-time progress updates.
+
+    Works for both server-mode jobs (in-memory Queue) and worker-mode
+    tasks (polls the tasks table).
+    """
     with jobs_lock:
         job = jobs.get(job_id)
-    if not job:
+
+    if job:
+        # Server-mode: stream from in-memory Queue
+        def generate_server():
+            q = job["queue"]
+            while True:
+                try:
+                    status = q.get(timeout=30)
+                    yield f"data: {json.dumps(status, ensure_ascii=False)}\n\n"
+                    if status.get("phase") in (Phase.COMPLETE.value, Phase.ERROR.value):
+                        break
+                except Empty:
+                    yield ": keepalive\n\n"
+
+        return Response(
+            generate_server(),
+            mimetype="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # Worker-mode: poll the tasks table
+    task = store.get_task(job_id)
+    if not task:
         return jsonify({"error": "משימה לא נמצאה"}), 404
 
-    def generate():
-        q = job["queue"]
+    def generate_worker():
+        last_progress = ""
         while True:
-            try:
-                status = q.get(timeout=30)
-                yield f"data: {json.dumps(status, ensure_ascii=False)}\n\n"
-                if status.get("phase") in (Phase.COMPLETE.value, Phase.ERROR.value):
+            t = store.get_task(job_id)
+            if not t:
+                break
+            progress = t.get("progress", {})
+            status = t.get("status", "pending")
+
+            # Map task status to phase
+            if status == "completed":
+                progress["phase"] = "complete"
+            elif status == "failed":
+                progress["phase"] = "error"
+                progress["message"] = t.get("error", "שגיאה")
+            elif status == "pending":
+                progress["phase"] = "pending"
+                progress["message"] = "ממתין לעובד מרוחק..."
+
+            progress_json = json.dumps(progress, ensure_ascii=False)
+            if progress_json != last_progress:
+                yield f"data: {progress_json}\n\n"
+                last_progress = progress_json
+                if status in ("completed", "failed"):
                     break
-            except Empty:
-                # Send keepalive
+            else:
                 yield ": keepalive\n\n"
 
+            time.sleep(3)
+
     return Response(
-        generate(),
+        generate_worker(),
         mimetype="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
@@ -593,7 +642,7 @@ def search_files():
 
 @app.route("/api/collections/upload", methods=["POST"])
 @limiter.limit("10 per minute")
-@admin_required
+@admin_or_worker
 def upload_collection():
     """Upload a locally-scraped ZIP. Files are stored individually.
 
@@ -601,6 +650,7 @@ def upload_collection():
       - file: ZIP file (required)
       - source_url: original gov.il URL (required)
       - collector_name: display name (optional, derived from CSV filename)
+      - task_id: optional task ID to link upload to a worker task
     """
     import csv as csv_mod
     import shutil
@@ -714,6 +764,16 @@ def upload_collection():
         logger.info("Uploaded collection %s (%s, %d records, %d files)",
                      collection_id, collector_name, record_count, len(file_records))
 
+        # Link to worker task if task_id provided
+        task_id = (request.form.get("task_id") or "").strip()
+        if task_id:
+            store.update_task_status(task_id, "completed", result={
+                "collection_id": collection_id,
+                "collector_name": collector_name,
+                "record_count": record_count,
+                "file_count": len(file_records),
+            })
+
         return jsonify({
             "id": collection_id,
             "collector_name": collector_name,
@@ -735,6 +795,200 @@ def delete_collection(cid):
     if store.delete_collection(cid):
         return "", 204
     return jsonify({"error": "אוסף לא נמצא"}), 404
+
+
+# ---------------------------------------------------------------------------
+# Task Management API
+# ---------------------------------------------------------------------------
+
+def _is_worker_online() -> bool:
+    """Check if any worker has sent a heartbeat recently."""
+    cutoff = time.time() - WORKER_ONLINE_TIMEOUT
+    with workers_lock:
+        return any(w["last_seen"] > cutoff for w in workers.values())
+
+
+@app.route("/api/tasks", methods=["POST"])
+@limiter.limit("5 per minute")
+@admin_required
+def create_task():
+    """Create a new scrape task.
+
+    Body: {"url": "...", "download_files": true, "mode": "server|worker|auto"}
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    url = (data.get("url") or "").strip()
+
+    if not url:
+        return jsonify({"error": "חסרה כתובת URL"}), 400
+    if "gov.il" not in url.lower():
+        return jsonify({"error": "הכתובת חייבת להיות מאתר gov.il"}), 400
+
+    download_files = data.get("download_files", True)
+    mode = data.get("mode", "auto")
+
+    # Auto mode: prefer worker if online, else server
+    if mode == "auto":
+        mode = "worker" if _is_worker_online() else "server"
+
+    task_id = uuid.uuid4().hex[:12]
+    store.create_task(task_id, url, download_files, mode)
+
+    if mode == "server":
+        # Run immediately on server (same as /api/scrape)
+        _cleanup_old_jobs()
+        active = sum(
+            1 for j in jobs.values()
+            if j["status"].get("phase") not in (Phase.COMPLETE.value, Phase.ERROR.value, None)
+        )
+        if active >= MAX_CONCURRENT_JOBS:
+            store.update_task_status(task_id, "failed", error="יותר מדי משימות פעילות")
+            return jsonify({"error": "יותר מדי משימות פעילות. נסה שוב בעוד דקה."}), 429
+
+        with jobs_lock:
+            jobs[task_id] = {
+                "queue": Queue(maxsize=200),
+                "status": {"phase": Phase.INITIALIZING.value},
+                "result_paths": {},
+                "result_data": None,
+                "error_log": None,
+                "created": time.time(),
+            }
+
+        store.update_task_status(task_id, "running")
+
+        def server_job_wrapper():
+            _run_scrape_job(task_id, url, download_files)
+            # Update task status when done
+            with jobs_lock:
+                job = jobs.get(task_id)
+            if job:
+                phase = job["status"].get("phase", "")
+                if phase == Phase.COMPLETE.value:
+                    store.update_task_status(task_id, "completed", result={
+                        "collection_id": task_id,
+                    })
+                elif phase == Phase.ERROR.value:
+                    store.update_task_status(
+                        task_id, "failed",
+                        error=job["status"].get("message", "שגיאה"),
+                    )
+
+        thread = threading.Thread(target=server_job_wrapper, daemon=True)
+        thread.start()
+
+    return jsonify({"task_id": task_id, "mode": mode}), 202
+
+
+@app.route("/api/tasks")
+@admin_required
+def list_tasks():
+    """List all tasks."""
+    status_filter = request.args.get("status")
+    tasks = store.list_tasks(status=status_filter)
+    return jsonify({"tasks": tasks})
+
+
+@app.route("/api/tasks/<task_id>")
+@admin_required
+def get_task(task_id):
+    """Get task details."""
+    task = store.get_task(task_id)
+    if not task:
+        return jsonify({"error": "משימה לא נמצאה"}), 404
+    return jsonify(task)
+
+
+@app.route("/api/tasks/<task_id>", methods=["DELETE"])
+@admin_required
+def delete_task(task_id):
+    """Delete/cancel a task."""
+    if store.delete_task(task_id):
+        return "", 204
+    return jsonify({"error": "משימה לא נמצאה"}), 404
+
+
+# ---------------------------------------------------------------------------
+# Worker API
+# ---------------------------------------------------------------------------
+
+@app.route("/api/worker/poll")
+@worker_auth_required
+def worker_poll():
+    """Claim next pending worker-mode task.
+
+    Returns task details or 204 if no tasks available.
+    """
+    worker_id = request.headers.get("X-Worker-ID", "unknown")
+
+    # Reset stale tasks before polling
+    store.reset_stale_tasks(timeout_minutes=10)
+
+    task = store.claim_task(worker_id)
+    if not task:
+        return "", 204
+
+    logger.info("Worker %s claimed task %s (%s)", worker_id, task["id"], task["url"])
+    return jsonify(task)
+
+
+@app.route("/api/worker/progress/<task_id>", methods=["POST"])
+@worker_auth_required
+def worker_progress(task_id):
+    """Worker sends progress update for a task."""
+    data = request.get_json(force=True, silent=True) or {}
+    store.update_task_progress(task_id, data)
+    return "", 204
+
+
+@app.route("/api/worker/complete/<task_id>", methods=["POST"])
+@worker_auth_required
+def worker_complete(task_id):
+    """Worker marks a task as completed."""
+    data = request.get_json(force=True, silent=True) or {}
+    store.update_task_status(task_id, "completed", result=data)
+    logger.info("Worker completed task %s", task_id)
+    return "", 204
+
+
+@app.route("/api/worker/fail/<task_id>", methods=["POST"])
+@worker_auth_required
+def worker_fail(task_id):
+    """Worker marks a task as failed."""
+    data = request.get_json(force=True, silent=True) or {}
+    error = data.get("error", "שגיאה לא ידועה")
+    store.update_task_status(task_id, "failed", error=error)
+    logger.warning("Worker failed task %s: %s", task_id, error)
+    return "", 204
+
+
+@app.route("/api/worker/heartbeat", methods=["POST"])
+@worker_auth_required
+def worker_heartbeat():
+    """Worker reports it's alive."""
+    worker_id = request.headers.get("X-Worker-ID", "unknown")
+    info = (request.get_json(force=True, silent=True) or {}).get("info", "")
+    with workers_lock:
+        workers[worker_id] = {"last_seen": time.time(), "info": info}
+    return "", 204
+
+
+@app.route("/api/worker/status")
+def worker_status():
+    """Public endpoint: check if any worker is online."""
+    cutoff = time.time() - WORKER_ONLINE_TIMEOUT
+    with workers_lock:
+        online = [
+            {"worker_id": wid, "info": w.get("info", ""),
+             "last_seen": datetime.fromtimestamp(w["last_seen"]).isoformat()}
+            for wid, w in workers.items()
+            if w["last_seen"] > cutoff
+        ]
+    return jsonify({
+        "online": len(online) > 0,
+        "count": len(online),
+        "workers": online,
+    })
 
 
 # ---------------------------------------------------------------------------
