@@ -25,3 +25,15 @@ services:
       name: scraper-data
       mountPath: /tmp/govil_scraper
       sizeGB: 1
+
+  - type: worker
+    name: over-worker
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    dockerCommand: python over_worker.py
+    envVars:
+      - key: DISABLE_PLAYWRIGHT
+        value: "1"
+      - key: OVER_API_KEY
+        sync: false

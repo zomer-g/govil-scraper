@@ -29,6 +29,55 @@ logging.getLogger("cloudscraper").setLevel(logging.WARNING)
 
 SERVER = "https://www.over.org.il"
 
+# Max ZIP size before splitting — stays comfortably under Cloudflare's 100MB
+# edge limit that fronts Render (exceeding it returns 502 Bad Gateway).
+MAX_ZIP_SIZE = 80 * 1024 * 1024
+
+
+def split_attachments_into_zips(
+    attachment_paths: list,
+    csv_path: str,
+    output_dir: str,
+    base_name: str,
+) -> list[str]:
+    """Pack the CSV + all attachment files into one or more ZIPs, each under
+    MAX_ZIP_SIZE. First ZIP contains the CSV. Returns ZIP paths in order.
+
+    Size is tracked using uncompressed bytes of inputs as a proxy (deflate
+    usually shrinks further, so the actual ZIP is almost always smaller —
+    this is intentionally conservative so we never exceed the limit).
+    """
+    import zipfile
+
+    def _safe_name(base: str, idx: int) -> str:
+        return os.path.join(output_dir, f"{base}-part-{idx}.zip")
+
+    zips: list[str] = []
+    part_idx = 1
+    zip_path = _safe_name(base_name, part_idx)
+    current = zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED)
+    zips.append(zip_path)
+    current_bytes = 0
+
+    # CSV goes into the first part
+    current.write(csv_path, f"{base_name}/{os.path.basename(csv_path)}")
+    current_bytes += os.path.getsize(csv_path)
+
+    for path in attachment_paths:
+        size = os.path.getsize(path)
+        if current_bytes + size > MAX_ZIP_SIZE and current_bytes > 0:
+            current.close()
+            part_idx += 1
+            zip_path = _safe_name(base_name, part_idx)
+            current = zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED)
+            zips.append(zip_path)
+            current_bytes = 0
+        current.write(path, f"{base_name}/attachments/{os.path.basename(path)}")
+        current_bytes += size
+
+    current.close()
+    return zips
+
 
 class OverWorkerClient:
     """Worker that polls over.org.il and pushes scraped versions back."""
@@ -106,8 +155,10 @@ class OverWorkerClient:
         logger.error("All 3 attempts to report failure failed for task %s", task_id)
 
     def upload_zip(self, tracked_dataset_id: str, version_number: int,
-                   zip_path: str, attachment_count: int) -> str | None:
-        """Upload ZIP via multipart to /api/worker/upload-zip. Returns resource_id."""
+                   zip_path: str, attachment_count: int,
+                   part: int | None = None, total_parts: int | None = None) -> str | None:
+        """Upload ZIP via multipart to /api/worker/upload-zip. Returns resource_id.
+        If part/total_parts are given, the resource is named as a multi-part ZIP."""
         import os
         try:
             with open(zip_path, "rb") as f:
@@ -116,6 +167,9 @@ class OverWorkerClient:
                     "version_number": str(version_number),
                     "attachment_count": str(attachment_count),
                 }
+                if part is not None and total_parts is not None:
+                    data["part"] = str(part)
+                    data["total_parts"] = str(total_parts)
                 # Use a fresh session without Content-Type: application/json
                 import requests
                 resp = requests.post(
@@ -138,8 +192,10 @@ class OverWorkerClient:
     def push_version(self, tracked_dataset_id: str, source_url: str,
                      records: list, fields: list, attachments: list,
                      duration_seconds: float,
-                     zip_resource_id: str | None = None) -> dict:
-        """Push scraped data as a new version to over.org.il."""
+                     zip_resource_id: str | None = None,
+                     zip_resource_ids: list[str] | None = None) -> dict:
+        """Push scraped data as a new version to over.org.il.
+        zip_resource_id: single ZIP (legacy). zip_resource_ids: list of parts (preferred)."""
         payload = {
             "tracked_dataset_id": tracked_dataset_id,
             "metadata_modified": datetime.now().isoformat(),
@@ -161,14 +217,18 @@ class OverWorkerClient:
                 "scraper_version": "1.0.0",
             },
         }
-        if zip_resource_id:
+        if zip_resource_ids:
+            payload["zip_resource_ids"] = zip_resource_ids
+        elif zip_resource_id:
             payload["zip_resource_id"] = zip_resource_id
 
         import json as _json
         payload_size = len(_json.dumps(payload, ensure_ascii=False))
-        logger.info("Pushing version: %d records, %d fields, %d attachments, ZIP_ref=%s, payload ~%d KB",
+        zip_info = (f"{len(zip_resource_ids)} parts" if zip_resource_ids
+                    else (zip_resource_id or "none"))
+        logger.info("Pushing version: %d records, %d fields, %d attachments, ZIP=%s, payload ~%d KB",
                      len(records), len(fields), len(attachments),
-                     zip_resource_id or "none",
+                     zip_info,
                      payload_size // 1024)
         resp = self._session.post(
             self._url("/api/worker/push-version"),
@@ -247,8 +307,9 @@ class OverWorkerClient:
                 for f in result.file_attachments
             ]
 
-            # Download files, create ZIP, and upload via multipart if there are attachments
-            zip_resource_id = None
+            # Download files, create ZIPs (split into ≤80MB parts to fit under
+            # Cloudflare's 100MB edge limit), and upload each part via multipart.
+            zip_resource_ids: list[str] = []
             tmp_dir = None
             if result.file_attachments:
                 import tempfile
@@ -277,23 +338,38 @@ class OverWorkerClient:
                     )
 
                     if att_paths:
-                        # Create ZIP with CSV + attachments
-                        zip_path = handler.create_zip(csv_path, csv_path, att_paths)
-                        zip_size = os.path.getsize(zip_path)
-                        logger.info("ZIP created: %s (%d KB)", zip_path, zip_size // 1024)
-
-                        # Upload ZIP via multipart (avoids JSON 100MB limit)
-                        self.report_progress(task_id, "uploading", 0, 1,
-                                             f"מעלה ZIP ({zip_size // 1024 // 1024}MB)...")
-                        zip_resource_id = self.upload_zip(
-                            tracked_dataset_id=tracked_dataset_id,
-                            version_number=1,  # not yet known, but needed for resource name
-                            zip_path=zip_path,
-                            attachment_count=len(att_paths),
+                        # Pack into ≤80MB ZIPs (first contains the CSV too)
+                        zip_paths = split_attachments_into_zips(
+                            att_paths, csv_path, tmp_dir,
+                            base_name=result.collector_name or "attachments",
                         )
+                        total_parts = len(zip_paths)
+                        logger.info("Created %d ZIP part(s) for %d attachments",
+                                    total_parts, len(att_paths))
+
+                        # Upload each part via multipart
+                        for i, zp in enumerate(zip_paths, 1):
+                            zp_mb = os.path.getsize(zp) // 1024 // 1024
+                            self.report_progress(
+                                task_id, "uploading", i - 1, total_parts,
+                                f"מעלה ZIP {i}/{total_parts} ({zp_mb}MB)",
+                            )
+                            rid = self.upload_zip(
+                                tracked_dataset_id=tracked_dataset_id,
+                                version_number=1,
+                                zip_path=zp,
+                                attachment_count=len(att_paths),
+                                part=i if total_parts > 1 else None,
+                                total_parts=total_parts if total_parts > 1 else None,
+                            )
+                            if rid:
+                                zip_resource_ids.append(rid)
+                            else:
+                                logger.warning("Part %d/%d failed to upload — continuing",
+                                               i, total_parts)
 
                 except Exception as e:
-                    logger.warning("Failed to create/upload ZIP (continuing without): %s", e)
+                    logger.warning("Failed to create/upload ZIPs (continuing without): %s", e)
                 finally:
                     if tmp_dir:
                         import shutil
@@ -309,7 +385,7 @@ class OverWorkerClient:
                 fields=fields,
                 attachments=attachments,
                 duration_seconds=duration,
-                zip_resource_id=zip_resource_id,
+                zip_resource_ids=zip_resource_ids or None,
             )
             logger.info("Task %s completed: %s", task_id, push_result.get("message"))
 
