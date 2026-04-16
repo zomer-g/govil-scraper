@@ -85,15 +85,25 @@ class OverWorkerClient:
             logger.debug("Progress report failed: %s", e)
 
     def report_failure(self, task_id: str, error: str, phase: str = "scraping"):
-        """Report task failure to the server."""
-        try:
-            self._session.post(
-                self._url(f"/api/worker/fail/{task_id}"),
-                json={"error": error, "phase": phase},
-                timeout=10,
-            )
-        except Exception as e:
-            logger.warning("Failure report failed: %s", e)
+        """Report task failure to the server. Retry up to 3 times since it's
+        critical that the task gets marked failed (otherwise stays stuck forever)."""
+        for attempt in range(1, 4):
+            try:
+                resp = self._session.post(
+                    self._url(f"/api/worker/fail/{task_id}"),
+                    json={"error": error, "phase": phase},
+                    timeout=15,
+                )
+                if resp.status_code == 200:
+                    logger.info("Reported failure for task %s (attempt %d)", task_id, attempt)
+                    return
+                logger.warning("fail endpoint returned %d (attempt %d): %s",
+                               resp.status_code, attempt, resp.text[:200])
+            except Exception as e:
+                logger.warning("Failure report failed (attempt %d): %s", attempt, e)
+            if attempt < 3:
+                time.sleep(5)
+        logger.error("All 3 attempts to report failure failed for task %s", task_id)
 
     def upload_zip(self, tracked_dataset_id: str, version_number: int,
                    zip_path: str, attachment_count: int) -> str | None:
