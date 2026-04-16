@@ -95,10 +95,40 @@ class OverWorkerClient:
         except Exception as e:
             logger.warning("Failure report failed: %s", e)
 
+    def upload_zip(self, tracked_dataset_id: str, version_number: int,
+                   zip_path: str, attachment_count: int) -> str | None:
+        """Upload ZIP via multipart to /api/worker/upload-zip. Returns resource_id."""
+        import os
+        try:
+            with open(zip_path, "rb") as f:
+                files = {"file": (os.path.basename(zip_path), f, "application/zip")}
+                data = {
+                    "version_number": str(version_number),
+                    "attachment_count": str(attachment_count),
+                }
+                # Use a fresh session without Content-Type: application/json
+                import requests
+                resp = requests.post(
+                    self._url(f"/api/worker/upload-zip/{tracked_dataset_id}"),
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    files=files,
+                    data=data,
+                    timeout=600,  # 10 min for large uploads
+                )
+            if resp.status_code == 200:
+                result = resp.json()
+                logger.info("ZIP uploaded → resource_id=%s, size=%d KB",
+                            result.get("resource_id"), result.get("size", 0) // 1024)
+                return result.get("resource_id")
+            logger.error("ZIP upload failed: %d %s", resp.status_code, resp.text[:300])
+        except Exception as e:
+            logger.exception("ZIP upload error: %s", e)
+        return None
+
     def push_version(self, tracked_dataset_id: str, source_url: str,
                      records: list, fields: list, attachments: list,
                      duration_seconds: float,
-                     zip_file: dict | None = None) -> dict:
+                     zip_resource_id: str | None = None) -> dict:
         """Push scraped data as a new version to over.org.il."""
         payload = {
             "tracked_dataset_id": tracked_dataset_id,
@@ -121,14 +151,14 @@ class OverWorkerClient:
                 "scraper_version": "1.0.0",
             },
         }
-        if zip_file:
-            payload["zip_file"] = zip_file
+        if zip_resource_id:
+            payload["zip_resource_id"] = zip_resource_id
 
         import json as _json
         payload_size = len(_json.dumps(payload, ensure_ascii=False))
-        logger.info("Pushing version: %d records, %d fields, %d attachments, %s, payload ~%d KB",
+        logger.info("Pushing version: %d records, %d fields, %d attachments, ZIP_ref=%s, payload ~%d KB",
                      len(records), len(fields), len(attachments),
-                     f"ZIP {zip_file['size'] // 1024}KB" if zip_file else "no ZIP",
+                     zip_resource_id or "none",
                      payload_size // 1024)
         resp = self._session.post(
             self._url("/api/worker/push-version"),
@@ -207,11 +237,11 @@ class OverWorkerClient:
                 for f in result.file_attachments
             ]
 
-            # Download files and create ZIP if there are attachments
-            zip_data = None
+            # Download files, create ZIP, and upload via multipart if there are attachments
+            zip_resource_id = None
+            tmp_dir = None
             if result.file_attachments:
                 import tempfile
-                import base64
                 from file_handler import FileHandler
 
                 self.report_progress(task_id, "downloading", 0,
@@ -237,25 +267,27 @@ class OverWorkerClient:
                     )
 
                     if att_paths:
-                        # Create ZIP with CSV + attachments (skip excel to save size)
+                        # Create ZIP with CSV + attachments
                         zip_path = handler.create_zip(csv_path, csv_path, att_paths)
                         zip_size = os.path.getsize(zip_path)
                         logger.info("ZIP created: %s (%d KB)", zip_path, zip_size // 1024)
 
-                        with open(zip_path, "rb") as f:
-                            zip_bytes = f.read()
-                        zip_data = {
-                            "filename": os.path.basename(zip_path),
-                            "content_base64": base64.b64encode(zip_bytes).decode(),
-                            "size": zip_size,
-                        }
-
-                    # Cleanup temp dir
-                    import shutil
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                        # Upload ZIP via multipart (avoids JSON 100MB limit)
+                        self.report_progress(task_id, "uploading", 0, 1,
+                                             f"מעלה ZIP ({zip_size // 1024 // 1024}MB)...")
+                        zip_resource_id = self.upload_zip(
+                            tracked_dataset_id=tracked_dataset_id,
+                            version_number=1,  # not yet known, but needed for resource name
+                            zip_path=zip_path,
+                            attachment_count=len(att_paths),
+                        )
 
                 except Exception as e:
-                    logger.warning("Failed to create ZIP (continuing without): %s", e)
+                    logger.warning("Failed to create/upload ZIP (continuing without): %s", e)
+                finally:
+                    if tmp_dir:
+                        import shutil
+                        shutil.rmtree(tmp_dir, ignore_errors=True)
 
             self.report_progress(task_id, "exporting", 1, 1, "שולח נתונים לשרת...")
 
@@ -267,7 +299,7 @@ class OverWorkerClient:
                 fields=fields,
                 attachments=attachments,
                 duration_seconds=duration,
-                zip_file=zip_data,
+                zip_resource_id=zip_resource_id,
             )
             logger.info("Task %s completed: %s", task_id, push_result.get("message"))
 
