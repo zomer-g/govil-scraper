@@ -759,6 +759,40 @@ class GovILScraper:
         all_attachments: List[FileAttachment] = []
         doc_exts = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx")
 
+        def _extract_links_from_html(html: str, chapter_title: str, category: str):
+            """Parse one HTML blob and append rows + attachments for each <a>."""
+            if not html:
+                return
+            soup = BeautifulSoup(html, "html.parser")
+            for a in soup.find_all("a", href=True):
+                href = (a["href"] or "").strip()
+                if not href or href.startswith(("mailto:", "javascript:", "#")):
+                    continue
+                link_title = a.get_text(strip=True) or href
+                absolute = urljoin(BASE_URL + "/", href)
+                row_idx = len(all_items)
+                all_items.append({
+                    "chapter": chapter_title,
+                    "category": category,
+                    "title": link_title,
+                    "url": absolute,
+                })
+                low = absolute.lower()
+                if "gov.il" in low and low.endswith(doc_exts):
+                    filename = href.split("/")[-1].split("?")[0] or f"file_{row_idx}"
+                    try:
+                        from urllib.parse import unquote
+                        filename = unquote(filename)
+                    except Exception:
+                        pass
+                    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+                    all_attachments.append(FileAttachment(
+                        url=absolute,
+                        filename=filename,
+                        item_index=row_idx,
+                        file_type=ext,
+                    ))
+
         for i, ch in enumerate(chapter_indices):
             self.progress(
                 phase="scraping",
@@ -776,43 +810,28 @@ class GovILScraper:
                 )
                 data = resp.json()
 
-            sections = (data.get("contentMain") or {}).get("htmlContents") or []
+            main = data.get("contentMain") or {}
             chapter_title = chapter_titles[i] or f"Chapter {ch}"
 
-            for sec in sections:
-                html = sec.get("sectionData") or ""
-                if not html:
-                    continue
-                soup = BeautifulSoup(html, "html.parser")
-                for a in soup.find_all("a", href=True):
-                    href = (a["href"] or "").strip()
-                    if not href or href.startswith(("mailto:", "javascript:", "#")):
-                        continue
-                    title = a.get_text(strip=True) or href
-                    absolute = urljoin(BASE_URL + "/", href)
-                    row_idx = len(all_items)
-                    all_items.append({
-                        "chapter": chapter_title,
-                        "title": title,
-                        "url": absolute,
-                    })
-                    # Mark as attachment only if it's a gov.il document file
-                    low = absolute.lower()
-                    if "gov.il" in low and low.endswith(doc_exts):
-                        filename = href.split("/")[-1].split("?")[0] or f"file_{row_idx}"
-                        # URL decode the filename for nicer display (e.g. Hebrew chars)
-                        try:
-                            from urllib.parse import unquote
-                            filename = unquote(filename)
-                        except Exception:
-                            pass
-                        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-                        all_attachments.append(FileAttachment(
-                            url=absolute,
-                            filename=filename,
-                            item_index=row_idx,
-                            file_type=ext,
-                        ))
+            # Path 1: plain htmlContents (e.g. guidelines_state chapter 2,
+            # deputies_guidelines all chapters)
+            for sec in main.get("htmlContents") or []:
+                _extract_links_from_html(
+                    sec.get("sectionData") or "",
+                    chapter_title=chapter_title,
+                    category="",
+                )
+
+            # Path 2: FAQ-style accordion (e.g. guidelines_state chapters
+            # 1, 3, 4 — "guide" contentType). Each FAQ item has a headTitle
+            # (used as category) and regionContent (HTML with link table).
+            for faq in main.get("faqs") or []:
+                for item in ((faq.get("sectionData") or {}).get("dataItems") or []):
+                    _extract_links_from_html(
+                        item.get("regionContent") or "",
+                        chapter_title=chapter_title,
+                        category=(item.get("headTitle") or "").strip(),
+                    )
 
         logger.info(
             "ContentPage %s: %d items, %d attachments across %d chapters",
@@ -825,7 +844,7 @@ class GovILScraper:
             file_attachments=all_attachments,
             collector_name=name,
             page_type=PageType.CONTENT_PAGE,
-            column_headers=["chapter", "title", "url"],
+            column_headers=["chapter", "category", "title", "url"],
         )
 
     # ---- Traditional: content page file extraction -------------------------
