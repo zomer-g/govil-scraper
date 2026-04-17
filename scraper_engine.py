@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 class PageType(Enum):
     DYNAMIC_COLLECTOR = "dynamic_collector"
     TRADITIONAL_COLLECTOR = "traditional_collector"
+    CONTENT_PAGE = "content_page"  # /he/pages/{name} — React SPA backed by ContentPageWebApi
     UNKNOWN = "unknown"
 
 
@@ -304,6 +305,10 @@ RE_DYNAMIC = re.compile(
 RE_TRADITIONAL = re.compile(
     r"/he/collectors?/([^/?#]+)", re.IGNORECASE
 )
+# Regex for /he/pages/{name} — React SPA pages backed by ContentPageWebApi
+RE_CONTENT_PAGE = re.compile(
+    r"/he/pages/([^/?#]+)", re.IGNORECASE
+)
 
 
 def parse_gov_url(url: str) -> ParsedURL:
@@ -338,9 +343,20 @@ def parse_gov_url(url: str) -> ParsedURL:
             query_params={k: v[0] for k, v in params.items()},
         )
 
+    # Content Page (React SPA)
+    m = RE_CONTENT_PAGE.search(path)
+    if m:
+        return ParsedURL(
+            page_type=PageType.CONTENT_PAGE,
+            collector_name=m.group(1),
+            office_id=None,
+            original_url=url,
+            query_params={k: v[0] for k, v in params.items()},
+        )
+
     raise InvalidURLError(
         f"לא ניתן לזהות את סוג הדף עבור הכתובת: {url}\n"
-        "נתמכים: DynamicCollectors ו-Collectors (Publications)"
+        "נתמכים: DynamicCollectors, Collectors (Publications), ו-/he/pages/"
     )
 
 
@@ -483,6 +499,8 @@ class GovILScraper:
             return self._scrape_dynamic(parsed)
         elif parsed.page_type == PageType.TRADITIONAL_COLLECTOR:
             return self._scrape_traditional(parsed)
+        elif parsed.page_type == PageType.CONTENT_PAGE:
+            return self._scrape_content_page(parsed)
         else:
             raise InvalidURLError(f"סוג דף לא נתמך: {parsed.page_type}")
 
@@ -689,6 +707,126 @@ class GovILScraper:
             page_type=parsed.page_type,
             column_headers=headers,
             warning=warning,
+        )
+
+    # ---- ContentPage (React SPA /he/pages/...) ------------------------------
+
+    def _scrape_content_page(self, parsed: ParsedURL) -> ScrapeResult:
+        """Scrape a /he/pages/{name} page.
+
+        These are React SPAs whose HTML is empty; all content is fetched via
+        ``GET /ContentPageWebApi/api/content-pages/{name}?culture=he[&chapterIndex=N]``.
+        The response has a ``contentMain.sideNav.tagItems[]`` list of tabs
+        (each with a ``url`` containing chapterIndex) and one or more HTML
+        blobs in ``contentMain.htmlContents[*].sectionData`` which contain
+        ``<a href>`` links to PDFs (and sometimes other resources).
+
+        Each link becomes one row: ``{chapter, title, url}``. Links pointing
+        to gov.il BlobFolder with document extensions are tracked as
+        FileAttachments so the worker can download+ZIP them.
+        """
+        from bs4 import BeautifulSoup
+        from urllib.parse import urljoin
+        import re as _re
+
+        api_base = f"{BASE_URL}/ContentPageWebApi/api/content-pages"
+        name = parsed.collector_name
+
+        # Fetch the default view first to learn the tab structure
+        first_resp = self.session.get(f"{api_base}/{name}?culture=he", timeout=30)
+        first = first_resp.json()
+
+        tabs = (first.get("contentMain") or {}).get("sideNav", {}).get("tagItems") or []
+
+        # Figure out which chapterIndex values to loop through
+        chapter_indices: List[int] = []
+        chapter_titles: List[str] = []
+        if tabs:
+            for tab in tabs:
+                m = _re.search(r"chapterIndex=(\d+)", tab.get("url", "") or "")
+                chapter_indices.append(int(m.group(1)) if m else 1)
+                chapter_titles.append((tab.get("title") or "").strip())
+        else:
+            # Single-tab page
+            chapter_indices = [1]
+            page_title = ((first.get("contentHead") or {}).get("title") or name).strip()
+            chapter_titles = [page_title]
+
+        total_chapters = len(chapter_indices)
+        logger.info("ContentPage %s: %d chapter(s) detected", name, total_chapters)
+
+        all_items: List[dict] = []
+        all_attachments: List[FileAttachment] = []
+        doc_exts = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx")
+
+        for i, ch in enumerate(chapter_indices):
+            self.progress(
+                phase="scraping",
+                current=i,
+                total=total_chapters,
+                message=f"גורד לשונית {i + 1}/{total_chapters}: {chapter_titles[i] or f'ch{ch}'}",
+            )
+
+            # First chapter's data is already in hand for the common case (ch==1)
+            if i == 0 and ch == 1:
+                data = first
+            else:
+                resp = self.session.get(
+                    f"{api_base}/{name}?culture=he&chapterIndex={ch}",
+                    timeout=30,
+                )
+                data = resp.json()
+
+            sections = (data.get("contentMain") or {}).get("htmlContents") or []
+            chapter_title = chapter_titles[i] or f"Chapter {ch}"
+
+            for sec in sections:
+                html = sec.get("sectionData") or ""
+                if not html:
+                    continue
+                soup = BeautifulSoup(html, "html.parser")
+                for a in soup.find_all("a", href=True):
+                    href = (a["href"] or "").strip()
+                    if not href or href.startswith(("mailto:", "javascript:", "#")):
+                        continue
+                    title = a.get_text(strip=True) or href
+                    absolute = urljoin(BASE_URL + "/", href)
+                    row_idx = len(all_items)
+                    all_items.append({
+                        "chapter": chapter_title,
+                        "title": title,
+                        "url": absolute,
+                    })
+                    # Mark as attachment only if it's a gov.il document file
+                    low = absolute.lower()
+                    if "gov.il" in low and low.endswith(doc_exts):
+                        filename = href.split("/")[-1].split("?")[0] or f"file_{row_idx}"
+                        # URL decode the filename for nicer display (e.g. Hebrew chars)
+                        try:
+                            from urllib.parse import unquote
+                            filename = unquote(filename)
+                        except Exception:
+                            pass
+                        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+                        all_attachments.append(FileAttachment(
+                            url=absolute,
+                            filename=filename,
+                            item_index=row_idx,
+                            file_type=ext,
+                        ))
+
+        logger.info(
+            "ContentPage %s: %d items, %d attachments across %d chapters",
+            name, len(all_items), len(all_attachments), total_chapters,
+        )
+
+        return ScrapeResult(
+            items=all_items,
+            total_count=len(all_items),
+            file_attachments=all_attachments,
+            collector_name=name,
+            page_type=PageType.CONTENT_PAGE,
+            column_headers=["chapter", "title", "url"],
         )
 
     # ---- Traditional: content page file extraction -------------------------
