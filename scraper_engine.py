@@ -525,6 +525,14 @@ class GovILScraper:
         skip = 0
         warning = None
 
+        # Some custom APIs (e.g. gov.il police endpoints) accept a `limit`
+        # parameter to return many items in one call. Using it turns a 32k
+        # record scrape from ~3200 calls (default 10/page) into ~7 calls.
+        # The DOJ open-api endpoint returns 500 if `limit` is included, so
+        # we only opt in per-API.
+        supports_limit = use_custom_api and "/api/police/" in api_url.lower()
+        batch_limit = 5000 if supports_limit else None
+
         while True:
             try:
                 if use_custom_api:
@@ -532,7 +540,10 @@ class GovILScraper:
                     extra_headers = {}
                     if config.x_client_id:
                         extra_headers["x-client-id"] = config.x_client_id
-                    resp = self.session.post(api_url, json_data={"skip": skip},
+                    body = {"skip": skip}
+                    if batch_limit:
+                        body["limit"] = batch_limit
+                    resp = self.session.post(api_url, json_data=body,
                                              extra_headers=extra_headers)
                 else:
                     # Standard DynamicCollector API
@@ -558,7 +569,11 @@ class GovILScraper:
                 if not items or len(all_items) >= total_count:
                     break
 
-                skip += page_size
+                # Advance by the actual number received — safer than relying
+                # on page_size, since with `limit` the server may return
+                # batch_limit items while page_size is still the page's
+                # default (e.g. 10).
+                skip += len(items)
                 delay = 1.0 if total_count > 500 else 0.5
                 time.sleep(delay)
 
