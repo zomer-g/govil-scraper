@@ -733,7 +733,7 @@ class GovILScraper:
         name = parsed.collector_name
 
         # Fetch the default view first to learn the tab structure
-        first_resp = self.session.get(f"{api_base}/{name}?culture=he", timeout=30)
+        first_resp = self.session.get(f"{api_base}/{name}?culture=he")
         first = first_resp.json()
 
         tabs = (first.get("contentMain") or {}).get("sideNav", {}).get("tagItems") or []
@@ -773,7 +773,6 @@ class GovILScraper:
             else:
                 resp = self.session.get(
                     f"{api_base}/{name}?culture=he&chapterIndex={ch}",
-                    timeout=30,
                 )
                 data = resp.json()
 
