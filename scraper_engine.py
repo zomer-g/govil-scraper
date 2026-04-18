@@ -479,6 +479,80 @@ def _extract_items(data: dict) -> List[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Plain-text extraction for HTML-valued fields
+# ---------------------------------------------------------------------------
+
+# Matches any HTML tag — used as a quick "looks like HTML" signal
+_HTML_TAG_RE = re.compile(r"<[a-zA-Z/!][^>]*>")
+
+
+def _looks_like_html(key: str, value) -> bool:
+    """Heuristic: is this string value meant to be HTML?
+
+    - Explicit key name hints win (`...Html`, `...HtmlString`, `Html...`)
+    - Otherwise, presence of at least one real tag + one structural tag
+      (<p>, <div>, <li>, <br>) is treated as HTML.
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    lkey = key.lower()
+    if "html" in lkey:
+        return True
+    # Fallback: structural HTML tags mean it's meant to be rendered
+    if _HTML_TAG_RE.search(value) and any(
+        tag in value.lower() for tag in ("<p", "<div", "<li", "<br", "<table")
+    ):
+        return True
+    return False
+
+
+def _html_to_plain_text(key: str, value) -> Optional[str]:
+    """Convert an HTML-looking string value to readable plain text.
+
+    Returns None if the value isn't HTML (caller should then skip adding a
+    plain-text column). Uses BeautifulSoup for parsing and collapses
+    whitespace to keep CSV cells tidy.
+    """
+    if not _looks_like_html(key, value):
+        return None
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        return None
+    try:
+        soup = BeautifulSoup(value, "html.parser")
+        # Drop style/script/head blocks (they leak CSS/JS into the text)
+        for tag in soup(["style", "script", "head"]):
+            tag.decompose()
+        # Insert line breaks for block-level boundaries so paragraphs
+        # don't collapse onto one line
+        for tag in soup.find_all(["p", "li", "br", "tr", "div", "h1", "h2",
+                                   "h3", "h4", "h5", "h6"]):
+            tag.append("\n")
+        text = soup.get_text(separator=" ")
+        # Collapse runs of whitespace, preserve single newlines
+        lines = [re.sub(r"[ \t\xa0]+", " ", ln).strip()
+                 for ln in text.splitlines()]
+        text = "\n".join(ln for ln in lines if ln)
+        return text
+    except Exception:
+        return None
+
+
+def _plain_key_for(full_key: str) -> str:
+    """Produce a sibling column name for the plain-text version of an HTML
+    field. Strips trailing `HtmlString` / `Html` where present, else appends
+    `_text`.
+    """
+    for suffix in ("HtmlString", "HtmlText", "Html", "_html"):
+        if full_key.endswith(suffix):
+            stripped = full_key[: -len(suffix)]
+            # Avoid empty or trailing-dot names
+            return (stripped.rstrip("._") or full_key) + "_text"
+    return full_key + "_text"
+
+
+# ---------------------------------------------------------------------------
 # Main Scraper
 # ---------------------------------------------------------------------------
 
@@ -1013,6 +1087,14 @@ class GovILScraper:
                     flat[full_key] = ", ".join(str(v) for v in value)
             else:
                 flat[full_key] = value
+                # If this looks like an HTML blob (common in police/hesder data
+                # under `DescriptionHtmlString`), also emit a plain-text sibling
+                # so Excel users get a readable version without losing the raw
+                # HTML for anyone who needs it.
+                plain = _html_to_plain_text(full_key, value)
+                if plain is not None:
+                    plain_key = _plain_key_for(full_key)
+                    flat[plain_key] = plain
 
         return flat
 
