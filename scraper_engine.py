@@ -533,6 +533,14 @@ class GovILScraper:
         supports_limit = use_custom_api and "/api/police/" in api_url.lower()
         batch_limit = 5000 if supports_limit else None
 
+        # Extra filters from the URL (e.g. publications_subject=1, Type=2).
+        # Pagination params are controlled internally, so we exclude them.
+        _reserved = {"skip", "limit", "from"}
+        extra_filters: dict[str, object] = {
+            k: v for k, v in (parsed.query_params or {}).items()
+            if k.lower() not in _reserved and v not in (None, "")
+        }
+
         while True:
             try:
                 if use_custom_api:
@@ -543,13 +551,29 @@ class GovILScraper:
                     body = {"skip": skip}
                     if batch_limit:
                         body["limit"] = batch_limit
+                    # Forward URL filters as-is (custom APIs typically accept
+                    # them at the top level, e.g. {"skip":0,"Type":2})
+                    for k, v in extra_filters.items():
+                        body.setdefault(k, v)
                     resp = self.session.post(api_url, json_data=body,
                                              extra_headers=extra_headers)
                 else:
-                    # Standard DynamicCollector API
+                    # Standard DynamicCollector API — each filter goes in
+                    # QueryFilters as {"<name>": {"Query": <value>}}. Without
+                    # this, filters like publications_subject=1 on the URL
+                    # are silently ignored and we scrape the entire dataset
+                    # instead of the filtered subset.
+                    query_filters: dict[str, dict] = {"skip": {"Query": skip}}
+                    for k, v in extra_filters.items():
+                        # DynamicCollector expects string/number in Query
+                        try:
+                            qv = int(v)
+                        except (TypeError, ValueError):
+                            qv = v
+                        query_filters[k] = {"Query": qv}
                     resp = self.session.post(DYNAMIC_API_URL, json_data={
                         "DynamicTemplateID": config.template_id,
-                        "QueryFilters": {"skip": {"Query": skip}},
+                        "QueryFilters": query_filters,
                         "From": skip,
                     })
 
