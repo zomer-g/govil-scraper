@@ -751,7 +751,7 @@ class GovILScraper:
         first_resp = self.session.get(f"{api_base}/{name}?culture=he")
         first = first_resp.json()
 
-        tabs = (first.get("contentMain") or {}).get("sideNav", {}).get("tagItems") or []
+        tabs = ((first.get("contentMain") or {}).get("sideNav") or {}).get("tagItems") or []
 
         # Figure out which chapterIndex values to loop through
         chapter_indices: List[int] = []
