@@ -205,51 +205,78 @@ class OverWorkerClient:
 
     def upload_csv(self, tracked_dataset_id: str, version_number: int,
                    csv_bytes: bytes, resource_name: str, row_count: int,
-                   fields: list | None = None) -> str | None:
+                   fields: list | None = None,
+                   max_attempts: int = 3) -> str | None:
         """Upload a CSV file via multipart to /api/worker/upload-csv.
         Used when the records JSON would exceed Cloudflare's 100MB limit
         on push-version. Always sends gzip-compressed bytes — CSV compresses
         ~10:1 so even 100k+ row sets fit well under the 100MB edge limit.
-        The server decompresses on receipt, uploads plain CSV to odata, and
-        pushes the records to the datastore (so the dataset page shows a
-        queryable table, same as small datasets).
+        The server streams the upload through disk, uploads the plain CSV to
+        odata, and pushes rows to the datastore in a background task.
         `fields` is forwarded so the datastore schema matches the inline path.
-        Returns the odata resource_id, or None on error."""
-        import gzip, io, json as _json
+        Retries with backoff on 5xx/connection errors (the server may be mid
+        restart or recovering).
+        Returns the odata resource_id, or None after all attempts fail."""
+        import gzip, io, json as _json, time as _time
         try:
             compressed = gzip.compress(csv_bytes, compresslevel=6)
             logger.info("CSV gzip: %d KB plain → %d KB compressed (%.1fx)",
                         len(csv_bytes) // 1024, len(compressed) // 1024,
                         len(csv_bytes) / max(len(compressed), 1))
-            files = {"file": (f"{resource_name}.csv.gz", io.BytesIO(compressed),
-                             "application/gzip")}
-            data = {
-                "version_number": str(version_number),
-                "resource_name": resource_name,
-                "row_count": str(row_count),
-                "compression": "gzip",
-            }
-            if fields:
-                data["fields_json"] = _json.dumps(fields, ensure_ascii=False)
-            import requests
-            resp = requests.post(
-                self._url(f"/api/worker/upload-csv/{tracked_dataset_id}"),
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                files=files,
-                data=data,
-                timeout=1800,  # datastore push of 30k+ rows can take a few minutes
-            )
-            if resp.status_code == 200:
-                result = resp.json()
-                logger.info("CSV uploaded → resource_id=%s, plain_size=%d KB (%d rows), datastore=%s",
-                            result.get("resource_id"),
-                            result.get("size", 0) // 1024,
-                            result.get("rows", row_count),
-                            result.get("datastore", False))
-                return result.get("resource_id")
-            logger.error("CSV upload failed: %d %s", resp.status_code, resp.text[:300])
         except Exception as e:
-            logger.exception("CSV upload error: %s", e)
+            logger.exception("CSV compression error: %s", e)
+            return None
+
+        last_err = ""
+        for attempt in range(1, max_attempts + 1):
+            try:
+                files = {"file": (f"{resource_name}.csv.gz", io.BytesIO(compressed),
+                                 "application/gzip")}
+                data = {
+                    "version_number": str(version_number),
+                    "resource_name": resource_name,
+                    "row_count": str(row_count),
+                    "compression": "gzip",
+                }
+                if fields:
+                    data["fields_json"] = _json.dumps(fields, ensure_ascii=False)
+                import requests
+                resp = requests.post(
+                    self._url(f"/api/worker/upload-csv/{tracked_dataset_id}"),
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    files=files,
+                    data=data,
+                    timeout=1800,
+                )
+                if resp.status_code == 200:
+                    result = resp.json()
+                    logger.info("CSV uploaded → resource_id=%s, size=%d KB (%d rows), datastore=%s",
+                                result.get("resource_id"),
+                                result.get("size", 0) // 1024,
+                                result.get("rows", row_count),
+                                result.get("datastore", False))
+                    return result.get("resource_id")
+                last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                # 5xx and 502 in particular often mean server is restarting —
+                # wait a bit and retry.
+                if resp.status_code >= 500 and attempt < max_attempts:
+                    wait = 15 * attempt
+                    logger.warning("CSV upload attempt %d/%d got %d — retrying in %ds",
+                                   attempt, max_attempts, resp.status_code, wait)
+                    _time.sleep(wait)
+                    continue
+                logger.error("CSV upload failed (attempt %d/%d): %s",
+                             attempt, max_attempts, last_err)
+                break
+            except Exception as e:
+                last_err = str(e)
+                if attempt < max_attempts:
+                    wait = 10 * attempt
+                    logger.warning("CSV upload attempt %d/%d raised: %s — retrying in %ds",
+                                   attempt, max_attempts, last_err, wait)
+                    _time.sleep(wait)
+                    continue
+                logger.exception("CSV upload error after %d attempts: %s", attempt, e)
         return None
 
     def push_version(self, tracked_dataset_id: str, source_url: str,
@@ -473,7 +500,8 @@ class OverWorkerClient:
             csv_resource_ids: dict[str, str] | None = None
             import json as _json
             est_json_bytes = len(_json.dumps(records, ensure_ascii=False)) if records else 0
-            if est_json_bytes > 50 * 1024 * 1024:
+            needs_multipart = est_json_bytes > 50 * 1024 * 1024
+            if needs_multipart:
                 self.report_progress(task_id, "uploading", 0, 1,
                                      f"מעלה CSV ({est_json_bytes // 1024 // 1024}MB) דרך multipart...")
                 # Generate CSV bytes from records (utf-8-sig BOM for Excel)
@@ -485,7 +513,7 @@ class OverWorkerClient:
                 for row in records:
                     writer.writerow({k: ("" if v is None else v) for k, v in row.items()})
                 csv_bytes = buf.getvalue().encode("utf-8-sig")
-                logger.info("Records JSON est=%dMB → falling back to CSV multipart upload (%d KB)",
+                logger.info("Records JSON est=%dMB → CSV multipart upload (%d KB plain)",
                              est_json_bytes // 1024 // 1024, len(csv_bytes) // 1024)
                 rid = self.upload_csv(
                     tracked_dataset_id=tracked_dataset_id,
@@ -497,8 +525,24 @@ class OverWorkerClient:
                 )
                 if rid:
                     csv_resource_ids = {"נתוני הסורק": rid}
+                    # Free the large buffers now that the CSV is safely uploaded
+                    # server-side; push-version only needs empty records + csv_resource_ids
+                    del csv_bytes
                 else:
-                    logger.warning("CSV multipart upload failed — push-version may fail too")
+                    # CSV multipart upload failed. We CANNOT fall back to an
+                    # inline push-version with the full records — that payload
+                    # would be >100MB and Cloudflare's edge would reject it
+                    # with another 502. Fail the task cleanly instead, so the
+                    # UI shows the real reason (upload-csv failed) rather
+                    # than a misleading "push-version 502".
+                    msg = (f"CSV multipart upload failed "
+                           f"(JSON estimate {est_json_bytes // 1024 // 1024}MB "
+                           f"exceeds inline push-version safe limit). "
+                           f"Likely server OOM or deploy in progress — "
+                           f"try again in a minute.")
+                    logger.error(msg)
+                    self.report_failure(task_id, msg, phase="uploading")
+                    return
 
             self.report_progress(task_id, "exporting", 1, 1, "שולח נתונים לשרת...")
 
