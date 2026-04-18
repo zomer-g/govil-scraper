@@ -29,6 +29,20 @@ logging.getLogger("cloudscraper").setLevel(logging.WARNING)
 
 SERVER = "https://www.over.org.il"
 
+# Local file we keep updated with the worker's current state. `cat` it on the
+# worker host to see what the worker is doing right now.
+STATUS_FILE = os.environ.get("OVER_WORKER_STATUS_FILE", "worker_status.txt")
+
+
+def _write_status(line: str) -> None:
+    """Best-effort write of the worker's current state to a small file."""
+    try:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(STATUS_FILE, "w", encoding="utf-8") as f:
+            f.write(f"[{ts}] {line}\n")
+    except Exception:
+        pass
+
 # Max ZIP size before splitting — stays comfortably under Cloudflare's 100MB
 # edge limit that fronts Render (exceeding it returns 502 Bad Gateway).
 MAX_ZIP_SIZE = 80 * 1024 * 1024
@@ -312,20 +326,37 @@ class OverWorkerClient:
         config = task.get("scraper_config", {})
         download_files = config.get("download_files", False)
 
-        logger.info("=" * 50)
-        logger.info("Task %s: %s", task_id, source_url)
-        logger.info("=" * 50)
+        logger.info("=" * 70)
+        logger.info("▶  TASK START")
+        logger.info("   task_id: %s", task_id)
+        logger.info("   url:     %s", source_url)
+        logger.info("=" * 70)
+        _write_status(f"WORKING on {source_url}")
 
         session = None
         start_time = time.time()
         last_report = [0.0]
+        last_local_log = [0.0]
 
         def _progress(**kwargs):
             now = time.time()
+            phase = kwargs.get("phase", "scraping")
+            current = kwargs.get("current", 0)
+            total = kwargs.get("total", 0)
+            message = kwargs.get("message", "")
+            # Send to server (throttled to 5s)
             if now - last_report[0] >= 5:
-                phase = kwargs.pop("phase", "scraping")
-                self.report_progress(task_id, phase, **kwargs)
+                phase_kw = kwargs.pop("phase", "scraping")
+                self.report_progress(task_id, phase_kw, **kwargs)
                 last_report[0] = now
+            # Also print to local log (throttled to 15s) so the operator sees
+            # "still working" instead of complete silence during long phases.
+            if now - last_local_log[0] >= 15:
+                pct = f"{int(current/total*100)}%" if total else "?%"
+                logger.info("  ⏳ phase=%s %s (%d/%d) %s",
+                            phase, pct, current, total, message[:80] if message else "")
+                _write_status(f"{phase} {pct} — {message[:120]}")
+                last_local_log[0] = now
 
         try:
             self.report_progress(task_id, "initializing", 0, 1, "מתחבר לאתר gov.il...")
@@ -501,18 +532,33 @@ class OverWorkerClient:
         logger.info("Shutdown requested...")
 
     def run(self):
+        logger.info("=" * 70)
         logger.info("Over.org.il worker starting")
-        logger.info("Server: %s", SERVER)
-        logger.info("Poll interval: %ds", self.poll_interval)
+        logger.info("  Server:        %s", SERVER)
+        logger.info("  Poll interval: %ds", self.poll_interval)
+        logger.info("  Status file:   %s", os.path.abspath(STATUS_FILE))
+        logger.info("=" * 70)
+        _write_status("idle (just started)")
 
+        idle_polls = 0
         while self._running:
             task = self.poll()
             if task:
+                idle_polls = 0
                 self.execute_task(task)
+                _write_status("idle (between tasks)")
             else:
+                idle_polls += 1
+                # Print "still alive, waiting" every minute when idle
+                if idle_polls * self.poll_interval >= 60 and idle_polls % max(1, 60 // self.poll_interval) == 0:
+                    minutes = (idle_polls * self.poll_interval) // 60
+                    logger.info("⏸  Idle — no pending tasks (waited %d min so far, polling every %ds)",
+                                minutes, self.poll_interval)
+                    _write_status(f"idle for {minutes} min — polling every {self.poll_interval}s")
                 time.sleep(self.poll_interval)
 
         logger.info("Worker stopped")
+        _write_status("stopped")
 
 
 # ------------------------------------------------------------------
