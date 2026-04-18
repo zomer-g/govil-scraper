@@ -189,13 +189,53 @@ class OverWorkerClient:
             logger.exception("ZIP upload error: %s", e)
         return None
 
+    def upload_csv(self, tracked_dataset_id: str, version_number: int,
+                   csv_bytes: bytes, resource_name: str, row_count: int) -> str | None:
+        """Upload a CSV file via multipart to /api/worker/upload-csv.
+        Used when the records JSON would exceed Cloudflare's 100MB limit
+        on push-version. Returns the odata resource_id, or None on error."""
+        import io
+        try:
+            files = {"file": (f"{resource_name}.csv", io.BytesIO(csv_bytes), "text/csv")}
+            data = {
+                "version_number": str(version_number),
+                "resource_name": resource_name,
+                "row_count": str(row_count),
+            }
+            import requests
+            resp = requests.post(
+                self._url(f"/api/worker/upload-csv/{tracked_dataset_id}"),
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                files=files,
+                data=data,
+                timeout=600,
+            )
+            if resp.status_code == 200:
+                result = resp.json()
+                logger.info("CSV uploaded → resource_id=%s, size=%d KB (%d rows)",
+                            result.get("resource_id"), result.get("size", 0) // 1024, row_count)
+                return result.get("resource_id")
+            logger.error("CSV upload failed: %d %s", resp.status_code, resp.text[:300])
+        except Exception as e:
+            logger.exception("CSV upload error: %s", e)
+        return None
+
     def push_version(self, tracked_dataset_id: str, source_url: str,
                      records: list, fields: list, attachments: list,
                      duration_seconds: float,
                      zip_resource_id: str | None = None,
-                     zip_resource_ids: list[str] | None = None) -> dict:
+                     zip_resource_ids: list[str] | None = None,
+                     csv_resource_ids: dict[str, str] | None = None) -> dict:
         """Push scraped data as a new version to over.org.il.
-        zip_resource_id: single ZIP (legacy). zip_resource_ids: list of parts (preferred)."""
+        zip_resource_id: single ZIP (legacy). zip_resource_ids: list of parts (preferred).
+        csv_resource_ids: maps resource_name -> odata resource_id when records were
+            uploaded out-of-band via /api/worker/upload-csv (used for very large record
+            sets that would exceed the 100MB JSON push limit). When provided for a
+            resource, send empty `records` for it."""
+        # If a resource has a pre-uploaded CSV, drop its records from the JSON
+        # to keep the payload small (the server uses the uploaded file instead).
+        records_for_resource = [] if (csv_resource_ids and "נתוני הסורק" in csv_resource_ids) else records
+
         payload = {
             "tracked_dataset_id": tracked_dataset_id,
             "metadata_modified": datetime.now().isoformat(),
@@ -203,7 +243,7 @@ class OverWorkerClient:
                 {
                     "name": "נתוני הסורק",
                     "format": "CSV",
-                    "records": records,
+                    "records": records_for_resource,
                     "fields": fields,
                     "row_count": len(records),
                 }
@@ -221,13 +261,16 @@ class OverWorkerClient:
             payload["zip_resource_ids"] = zip_resource_ids
         elif zip_resource_id:
             payload["zip_resource_id"] = zip_resource_id
+        if csv_resource_ids:
+            payload["csv_resource_ids"] = csv_resource_ids
 
         import json as _json
         payload_size = len(_json.dumps(payload, ensure_ascii=False))
         zip_info = (f"{len(zip_resource_ids)} parts" if zip_resource_ids
                     else (zip_resource_id or "none"))
-        logger.info("Pushing version: %d records, %d fields, %d attachments, ZIP=%s, payload ~%d KB",
-                     len(records), len(fields), len(attachments),
+        csv_info = (f"{len(csv_resource_ids)} pre-uploaded" if csv_resource_ids else "inline")
+        logger.info("Pushing version: %d records (%s), %d fields, %d attachments, ZIP=%s, payload ~%d KB",
+                     len(records), csv_info, len(fields), len(attachments),
                      zip_info,
                      payload_size // 1024)
         resp = self._session.post(
@@ -375,6 +418,38 @@ class OverWorkerClient:
                         import shutil
                         shutil.rmtree(tmp_dir, ignore_errors=True)
 
+            # If the records JSON would exceed Cloudflare's 100MB body limit,
+            # upload the CSV separately via multipart and skip inline records.
+            # Threshold: 50MB JSON ≈ 80MB after key/quote overhead → safe margin.
+            csv_resource_ids: dict[str, str] | None = None
+            import json as _json
+            est_json_bytes = len(_json.dumps(records, ensure_ascii=False)) if records else 0
+            if est_json_bytes > 50 * 1024 * 1024:
+                self.report_progress(task_id, "uploading", 0, 1,
+                                     f"מעלה CSV ({est_json_bytes // 1024 // 1024}MB) דרך multipart...")
+                # Generate CSV bytes from records (utf-8-sig BOM for Excel)
+                import csv as _csv, io as _io
+                buf = _io.StringIO()
+                fieldnames = [f["id"] for f in fields] if fields else (list(records[0].keys()) if records else [])
+                writer = _csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+                writer.writeheader()
+                for row in records:
+                    writer.writerow({k: ("" if v is None else v) for k, v in row.items()})
+                csv_bytes = buf.getvalue().encode("utf-8-sig")
+                logger.info("Records JSON est=%dMB → falling back to CSV multipart upload (%d KB)",
+                             est_json_bytes // 1024 // 1024, len(csv_bytes) // 1024)
+                rid = self.upload_csv(
+                    tracked_dataset_id=tracked_dataset_id,
+                    version_number=1,
+                    csv_bytes=csv_bytes,
+                    resource_name="נתוני הסורק",
+                    row_count=len(records),
+                )
+                if rid:
+                    csv_resource_ids = {"נתוני הסורק": rid}
+                else:
+                    logger.warning("CSV multipart upload failed — push-version may fail too")
+
             self.report_progress(task_id, "exporting", 1, 1, "שולח נתונים לשרת...")
 
             duration = time.time() - start_time
@@ -386,6 +461,7 @@ class OverWorkerClient:
                 attachments=attachments,
                 duration_seconds=duration,
                 zip_resource_ids=zip_resource_ids or None,
+                csv_resource_ids=csv_resource_ids,
             )
             logger.info("Task %s completed: %s", task_id, push_result.get("message"))
 
