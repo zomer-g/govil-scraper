@@ -601,6 +601,18 @@ class GovILScraper:
         skip = 0
         warning = None
 
+        # Forward any extra filter params from the original URL (e.g. `Type=`,
+        # which narrows /he/collectors/policies?Type=... to a specific category).
+        # Reserved keys we set ourselves are excluded.
+        from urllib.parse import quote
+        reserved = {"officeid", "culture", "skip", "limit", "collectortype"}
+        extra_filters = {
+            k: v for k, v in (parsed.query_params or {}).items()
+            if k.lower() not in reserved and v not in (None, "")
+        }
+        if extra_filters:
+            logger.info("Forwarding extra filters: %s", extra_filters)
+
         while True:
             try:
                 # Build URL with repeated CollectorType params
@@ -611,6 +623,8 @@ class GovILScraper:
                 query_parts.append(f"limit={self.page_size}")
                 if parsed.office_id:
                     query_parts.append(f"officeId={parsed.office_id}")
+                for k, v in extra_filters.items():
+                    query_parts.append(f"{k}={quote(str(v), safe='')}")
 
                 url = f"{TRADITIONAL_ENDPOINT}?{'&'.join(query_parts)}"
                 resp = self.session.get(url)
