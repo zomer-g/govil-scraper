@@ -193,14 +193,23 @@ class OverWorkerClient:
                    csv_bytes: bytes, resource_name: str, row_count: int) -> str | None:
         """Upload a CSV file via multipart to /api/worker/upload-csv.
         Used when the records JSON would exceed Cloudflare's 100MB limit
-        on push-version. Returns the odata resource_id, or None on error."""
-        import io
+        on push-version. Always sends gzip-compressed bytes — CSV compresses
+        ~10:1 so even 100k+ row sets fit well under the 100MB edge limit.
+        The server decompresses on receipt and uploads plain CSV to odata.
+        Returns the odata resource_id, or None on error."""
+        import gzip, io
         try:
-            files = {"file": (f"{resource_name}.csv", io.BytesIO(csv_bytes), "text/csv")}
+            compressed = gzip.compress(csv_bytes, compresslevel=6)
+            logger.info("CSV gzip: %d KB plain → %d KB compressed (%.1fx)",
+                        len(csv_bytes) // 1024, len(compressed) // 1024,
+                        len(csv_bytes) / max(len(compressed), 1))
+            files = {"file": (f"{resource_name}.csv.gz", io.BytesIO(compressed),
+                             "application/gzip")}
             data = {
                 "version_number": str(version_number),
                 "resource_name": resource_name,
                 "row_count": str(row_count),
+                "compression": "gzip",
             }
             import requests
             resp = requests.post(
@@ -212,8 +221,10 @@ class OverWorkerClient:
             )
             if resp.status_code == 200:
                 result = resp.json()
-                logger.info("CSV uploaded → resource_id=%s, size=%d KB (%d rows)",
-                            result.get("resource_id"), result.get("size", 0) // 1024, row_count)
+                logger.info("CSV uploaded → resource_id=%s, plain_size=%d KB (%d rows)",
+                            result.get("resource_id"),
+                            result.get("plain_size", result.get("size", 0)) // 1024,
+                            row_count)
                 return result.get("resource_id")
             logger.error("CSV upload failed: %d %s", resp.status_code, resp.text[:300])
         except Exception as e:
