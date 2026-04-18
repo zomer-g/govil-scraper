@@ -1019,49 +1019,72 @@ class GovILScraper:
     def _extract_attachments(self, item: dict, item_index: int) -> List[FileAttachment]:
         """Extract file attachment info from an item.
 
-        DynamicCollector: item.Data.file = [{ FileName, FileMime, FileSize, Extension, DisplayName }]
-        Traditional: typically no direct file attachments (links are in url field)
+        DynamicCollector: file entries look like
+            { FileName, FileMime, FileSize, Extension, DisplayName }
+        but they can sit under ANY key in Data (e.g. `file`, `Document`,
+        `file_name`, `attachments`, template-specific names etc). Rather
+        than hardcoding key names, we walk every list-of-dicts under Data
+        and treat any list whose items carry a FileName as attachments.
+
+        Traditional: typically no direct file attachments (links in url field).
         """
         attachments = []
+        seen_urls: set[str] = set()
 
-        # DynamicCollector: files in item["Data"]["file"], "fileData", or "Document"
         url_name = item.get("UrlName") or ""
         data = item.get("Data", {})
-        if isinstance(data, dict):
-            files = (data.get("file") or data.get("File") or data.get("files")
-                     or data.get("Files") or data.get("fileData")
-                     or data.get("Document") or data.get("document"))
-            if isinstance(files, list):
-                for f in files:
-                    if not isinstance(f, dict):
-                        continue
-                    filename = f.get("FileName") or f.get("fileName") or ""
-                    display = f.get("DisplayName") or f.get("displayName") or ""
-                    ext = f.get("Extension") or f.get("extension") or ""
+        if not isinstance(data, dict):
+            return attachments
 
-                    if not filename:
-                        continue
+        def _looks_like_file_list(v) -> bool:
+            if not isinstance(v, list) or not v:
+                return False
+            # Consider it a file list if ANY entry is a dict with FileName
+            for entry in v:
+                if isinstance(entry, dict) and (
+                    entry.get("FileName") or entry.get("fileName")
+                ):
+                    return True
+            return False
 
-                    # Determine download URL
-                    if filename.startswith("http"):
-                        # Custom API: FileName is already a full URL
-                        file_url = filename
-                    elif url_name:
-                        # Standard DynamicCollector: build BlobFolder URL
-                        file_url = f"{BASE_URL}/BlobFolder/dynamiccollectorresultitem/{url_name}/he/{filename}"
-                    else:
-                        continue
+        # Walk all Data fields and pick out any list that looks like files
+        for key, value in data.items():
+            if not _looks_like_file_list(value):
+                continue
+            for f in value:
+                if not isinstance(f, dict):
+                    continue
+                filename = f.get("FileName") or f.get("fileName") or ""
+                display = f.get("DisplayName") or f.get("displayName") or ""
+                ext = f.get("Extension") or f.get("extension") or ""
 
-                    nice_name = display or filename.split("/")[-1]
-                    if ext and not nice_name.lower().endswith(f".{ext.lower()}"):
-                        nice_name = f"{nice_name}.{ext}"
+                if not filename:
+                    continue
 
-                    attachments.append(FileAttachment(
-                        url=file_url,
-                        filename=nice_name,
-                        item_index=item_index,
-                        file_type=ext.lower(),
-                    ))
+                # Determine download URL
+                if filename.startswith("http"):
+                    # Custom API: FileName is already a full URL
+                    file_url = filename
+                elif url_name:
+                    # Standard DynamicCollector: build BlobFolder URL
+                    file_url = f"{BASE_URL}/BlobFolder/dynamiccollectorresultitem/{url_name}/he/{filename}"
+                else:
+                    continue
+
+                if file_url in seen_urls:
+                    continue
+                seen_urls.add(file_url)
+
+                nice_name = display or filename.split("/")[-1]
+                if ext and not nice_name.lower().endswith(f".{ext.lower()}"):
+                    nice_name = f"{nice_name}.{ext}"
+
+                attachments.append(FileAttachment(
+                    url=file_url,
+                    filename=nice_name,
+                    item_index=item_index,
+                    file_type=ext.lower(),
+                ))
 
         # Also look for top-level file keys
         for key in ("Files", "files", "Attachments", "attachments"):
