@@ -204,14 +204,18 @@ class OverWorkerClient:
         return None
 
     def upload_csv(self, tracked_dataset_id: str, version_number: int,
-                   csv_bytes: bytes, resource_name: str, row_count: int) -> str | None:
+                   csv_bytes: bytes, resource_name: str, row_count: int,
+                   fields: list | None = None) -> str | None:
         """Upload a CSV file via multipart to /api/worker/upload-csv.
         Used when the records JSON would exceed Cloudflare's 100MB limit
         on push-version. Always sends gzip-compressed bytes — CSV compresses
         ~10:1 so even 100k+ row sets fit well under the 100MB edge limit.
-        The server decompresses on receipt and uploads plain CSV to odata.
+        The server decompresses on receipt, uploads plain CSV to odata, and
+        pushes the records to the datastore (so the dataset page shows a
+        queryable table, same as small datasets).
+        `fields` is forwarded so the datastore schema matches the inline path.
         Returns the odata resource_id, or None on error."""
-        import gzip, io
+        import gzip, io, json as _json
         try:
             compressed = gzip.compress(csv_bytes, compresslevel=6)
             logger.info("CSV gzip: %d KB plain → %d KB compressed (%.1fx)",
@@ -225,20 +229,23 @@ class OverWorkerClient:
                 "row_count": str(row_count),
                 "compression": "gzip",
             }
+            if fields:
+                data["fields_json"] = _json.dumps(fields, ensure_ascii=False)
             import requests
             resp = requests.post(
                 self._url(f"/api/worker/upload-csv/{tracked_dataset_id}"),
                 headers={"Authorization": f"Bearer {self.api_key}"},
                 files=files,
                 data=data,
-                timeout=600,
+                timeout=1800,  # datastore push of 30k+ rows can take a few minutes
             )
             if resp.status_code == 200:
                 result = resp.json()
-                logger.info("CSV uploaded → resource_id=%s, plain_size=%d KB (%d rows)",
+                logger.info("CSV uploaded → resource_id=%s, plain_size=%d KB (%d rows), datastore=%s",
                             result.get("resource_id"),
-                            result.get("plain_size", result.get("size", 0)) // 1024,
-                            row_count)
+                            result.get("size", 0) // 1024,
+                            result.get("rows", row_count),
+                            result.get("datastore", False))
                 return result.get("resource_id")
             logger.error("CSV upload failed: %d %s", resp.status_code, resp.text[:300])
         except Exception as e:
@@ -486,6 +493,7 @@ class OverWorkerClient:
                     csv_bytes=csv_bytes,
                     resource_name="נתוני הסורק",
                     row_count=len(records),
+                    fields=fields,
                 )
                 if rid:
                     csv_resource_ids = {"נתוני הסורק": rid}
