@@ -15,6 +15,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 from datetime import datetime
 
@@ -372,12 +373,26 @@ class OverWorkerClient:
         last_report = [0.0]
         last_local_log = [0.0]
 
+        # Heartbeat thread — fires every 30 s even when the main thread is
+        # stuck on a single page or file download, preventing server timeout.
+        last_state = {"phase": "initializing", "current": 0, "total": 1, "message": ""}
+        _hb_stop = threading.Event()
+
+        def _heartbeat():
+            while not _hb_stop.wait(30):
+                s = last_state.copy()
+                self.report_progress(task_id, s["phase"], s["current"], s["total"], s["message"])
+
+        _hb_thread = threading.Thread(target=_heartbeat, daemon=True, name="heartbeat")
+        _hb_thread.start()
+
         def _progress(**kwargs):
             now = time.time()
             phase = kwargs.get("phase", "scraping")
             current = kwargs.get("current", 0)
             total = kwargs.get("total", 0)
             message = kwargs.get("message", "")
+            last_state.update({"phase": phase, "current": current, "total": total, "message": message})
             # Send to server (throttled to 5s)
             if now - last_report[0] >= 5:
                 phase_kw = kwargs.pop("phase", "scraping")
@@ -446,6 +461,12 @@ class OverWorkerClient:
 
                     # Download attachments
                     def dl_progress(**kw):
+                        last_state.update({
+                            "phase": "downloading",
+                            "current": kw.get("current", 0),
+                            "total": kw.get("total", 0),
+                            "message": kw.get("message", ""),
+                        })
                         self.report_progress(task_id, "downloading",
                                              kw.get("current", 0),
                                              kw.get("total", 0),
@@ -569,6 +590,7 @@ class OverWorkerClient:
             logger.exception("Unexpected error in task %s", task_id)
             self.report_failure(task_id, f"{type(e).__name__}: {e}")
         finally:
+            _hb_stop.set()
             if session:
                 try:
                     session.close()

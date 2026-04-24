@@ -387,6 +387,33 @@ class DynamicPageConfig:
     results_api_url: str = ""      # Custom API URL (empty = use standard)
     x_client_id: str = ""          # x-client-id header for custom APIs
     items_per_page: int = 20
+    page_title: str = ""           # Hebrew page title extracted from HTML
+
+
+def _extract_page_title(page_html: str) -> str:
+    """Extract a meaningful Hebrew page title from gov.il HTML.
+
+    Tries <h1>, then <title> (stripping the ' | gov.il' suffix).
+    Returns empty string if nothing found.
+    """
+    # Try <h1> first — usually the most accurate content title
+    m = re.search(r'<h1[^>]*>\s*(.+?)\s*</h1>', page_html, re.DOTALL)
+    if m:
+        title = re.sub(r'<[^>]+>', '', m.group(1)).strip()
+        if title:
+            return title
+
+    # Fallback to <title> tag, strip common suffixes
+    m = re.search(r'<title[^>]*>\s*(.+?)\s*</title>', page_html, re.DOTALL | re.IGNORECASE)
+    if m:
+        title = re.sub(r'<[^>]+>', '', m.group(1)).strip()
+        # Remove gov.il suffix patterns like " | gov.il" or " - אתר ממשלתי"
+        title = re.sub(r'\s*[|\-–—]\s*gov\.il.*$', '', title, flags=re.IGNORECASE).strip()
+        title = re.sub(r'\s*[|\-–—]\s*אתר ממשלתי.*$', '', title).strip()
+        if title:
+            return title
+
+    return ""
 
 
 def extract_dynamic_page_config(session: GovILSession, page_url: str) -> DynamicPageConfig:
@@ -398,6 +425,7 @@ def extract_dynamic_page_config(session: GovILSession, page_url: str) -> Dynamic
     resp = session.get(page_url)
     page_html = resp.text
     config = DynamicPageConfig()
+    config.page_title = _extract_page_title(page_html)
 
     m_init = re.search(r'ng-init="(dynamicCtrl\.Events\.initCtrl\([^"]*)"', page_html)
     if not m_init:
@@ -585,6 +613,11 @@ class GovILScraper:
         config = extract_dynamic_page_config(self.session, parsed.original_url)
         parsed.api_method = "POST"
 
+        # Use page title instead of URL slug when available
+        if config.page_title:
+            parsed.collector_name = config.page_title
+            logger.info("Using page title as collector name: %s", config.page_title)
+
         use_custom_api = bool(config.results_api_url)
         api_url = config.results_api_url or DYNAMIC_API_URL
         parsed.api_endpoint = api_url
@@ -690,8 +723,21 @@ class GovILScraper:
         parsed.api_endpoint = TRADITIONAL_ENDPOINT
 
         # Dynamically discover CollectorType values from the layout model API.
-        # The layout model's filter URLs contain the actual collectionTypes params.
+        # Must use the original URL slug for the API call.
         collector_types = self._discover_collector_types(parsed.collector_name)
+
+        # Extract page title from HTML for a meaningful collector name
+        try:
+            resp = self.session.get(parsed.original_url)
+            page_title = _extract_page_title(resp.text)
+            if page_title:
+                parsed.collector_name = page_title
+                logger.info("Using page title as collector name: %s", page_title)
+            else:
+                # SPA page — clean up the URL slug as fallback
+                parsed.collector_name = parsed.collector_name.replace("-", " ").replace("_", " ")
+        except Exception as e:
+            logger.warning("Failed to extract page title: %s", e)
         logger.info("Collector types for '%s': %s", parsed.collector_name, collector_types)
 
         all_items = []
