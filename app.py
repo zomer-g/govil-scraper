@@ -34,6 +34,7 @@ from auth import (
     auth_bp, init_oauth, admin_required, admin_or_worker,
     worker_auth_required, get_current_user, is_admin,
 )
+from archive_engine import run_bootstrap as _archive_bootstrap, run_incremental as _archive_incremental
 
 # ---------------------------------------------------------------------------
 # Config
@@ -989,6 +990,237 @@ def worker_status():
         "count": len(online),
         "workers": online,
     })
+
+
+# ---------------------------------------------------------------------------
+# Scheduled archive runner
+# ---------------------------------------------------------------------------
+
+def _register_archive_collection(
+    collection_id: str,
+    source_url: str,
+    collector_name: str,
+    file_info: dict,
+) -> None:
+    csv_rel = os.path.relpath(file_info["csv_path"], TEMP_DIR)
+    excel_rel = os.path.relpath(file_info["excel_path"], TEMP_DIR)
+    store.save_collection(
+        collection_id=collection_id,
+        source_url=source_url,
+        collector_name=collector_name,
+        page_type="archive",
+        record_count=file_info["record_count"],
+        column_headers=file_info["column_headers"],
+        csv_path=csv_rel,
+        excel_path=excel_rel,
+        warning=file_info.get("warning") or "",
+    )
+    csv_size = os.path.getsize(file_info["csv_path"])
+    excel_size = os.path.getsize(file_info["excel_path"])
+    store.save_files_bulk(collection_id, [
+        {"filename": file_info["csv_basename"], "file_type": "csv", "category": "csv",
+         "size_bytes": csv_size, "rel_path": csv_rel},
+        {"filename": file_info["excel_basename"], "file_type": "xlsx", "category": "excel",
+         "size_bytes": excel_size, "rel_path": excel_rel},
+    ])
+
+
+def _run_archive_job(archive_id: str) -> None:
+    archive = store.get_scheduled_archive(archive_id)
+    if not archive:
+        return
+
+    session = None
+    try:
+        session = GovILSession(use_playwright_fallback=not DISABLE_PLAYWRIGHT)
+        session.warm()
+
+        checkpoint = archive["checkpoint"]
+        collection_id = archive.get("collection_id") or archive_id
+        archive_dir = os.path.join(TEMP_DIR, collection_id)
+
+        # Need bootstrap if no checkpoint or master CSV is missing
+        csv_name = (checkpoint or {}).get("archive_csv", "")
+        needs_bootstrap = (
+            not checkpoint
+            or not csv_name
+            or not os.path.exists(os.path.join(archive_dir, csv_name))
+        )
+
+        if needs_bootstrap:
+            file_info, checkpoint = _archive_bootstrap(
+                url=archive["url"],
+                archive_dir=archive_dir,
+                session=session,
+                name_override=archive.get("name") or "",
+            )
+            new_count = file_info["record_count"]
+            _register_archive_collection(
+                collection_id=collection_id,
+                source_url=archive["url"],
+                collector_name=archive.get("name") or file_info["collector_name"],
+                file_info=file_info,
+            )
+        else:
+            # known_urls stored as list in DB → convert to set for engine
+            if isinstance(checkpoint.get("known_urls"), list):
+                checkpoint = dict(checkpoint)
+                checkpoint["known_urls"] = set(checkpoint["known_urls"])
+
+            new_count, checkpoint = _archive_incremental(
+                url=archive["url"],
+                archive_dir=archive_dir,
+                checkpoint=checkpoint,
+                session=session,
+            )
+            if new_count > 0:
+                coll = store.get_collection(collection_id)
+                if coll:
+                    store.save_collection(
+                        collection_id=collection_id,
+                        source_url=archive["url"],
+                        collector_name=coll["collector_name"],
+                        page_type="archive",
+                        record_count=checkpoint.get("total_archived", coll["record_count"]),
+                        column_headers=checkpoint.get("column_headers", coll["column_headers"]),
+                        csv_path=coll["csv_path"],
+                        excel_path=coll["excel_path"],
+                        warning=coll.get("warning") or "",
+                    )
+
+        store.finish_archive_run(
+            archive_id=archive_id,
+            status="idle",
+            collection_id=collection_id,
+            checkpoint=checkpoint,
+            new_count=new_count,
+            error="",
+        )
+        logger.info("Archive job %s finished. new_count=%d", archive_id, new_count)
+
+    except Exception as e:
+        logger.exception("Archive job %s failed: %s", archive_id, e)
+        store.finish_archive_run(
+            archive_id=archive_id,
+            status="error",
+            collection_id=archive.get("collection_id") or archive_id,
+            checkpoint=archive.get("checkpoint") or {},
+            new_count=0,
+            error=str(e),
+        )
+    finally:
+        if session:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+
+def _archive_scheduler_loop() -> None:
+    """Daemon thread: checks every minute whether any archive is due to run."""
+    while True:
+        time.sleep(60)
+        try:
+            now = datetime.now()
+            for archive in store.list_scheduled_archives():
+                if not archive.get("enabled"):
+                    continue
+                if archive.get("status") == "running":
+                    continue
+                sched_hour = int(archive.get("schedule_hour") or 6)
+                if now.hour < sched_hour:
+                    continue
+                today_cutoff = now.replace(
+                    hour=sched_hour, minute=0, second=0, microsecond=0,
+                ).isoformat(timespec="seconds")
+                last_run = archive.get("last_run") or ""
+                if last_run >= today_cutoff:
+                    continue
+                if store.claim_archive_run(archive["id"], today_cutoff):
+                    logger.info("Scheduler: launching archive job %s", archive["id"])
+                    threading.Thread(
+                        target=_run_archive_job,
+                        args=(archive["id"],),
+                        daemon=True,
+                    ).start()
+        except Exception as e:
+            logger.exception("Archive scheduler error: %s", e)
+
+
+# Start the scheduler once per worker process
+_archive_scheduler = threading.Thread(target=_archive_scheduler_loop, daemon=True)
+_archive_scheduler.start()
+
+
+# ---------------------------------------------------------------------------
+# Archive API (admin only)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/archives", methods=["GET"])
+@admin_required
+def list_archives():
+    archives = store.list_scheduled_archives()
+    # Don't send known_urls over the wire — can be large
+    for a in archives:
+        a.get("checkpoint", {}).pop("known_urls", None)
+    return jsonify(archives)
+
+
+@app.route("/api/archives", methods=["POST"])
+@admin_required
+def create_archive():
+    data = request.get_json() or {}
+    url = (data.get("url") or "").strip()
+    if not url:
+        return jsonify({"error": "URL is required"}), 400
+    name = (data.get("name") or "").strip()
+    try:
+        schedule_hour = int(data.get("schedule_hour") or 6)
+        if not (0 <= schedule_hour <= 23):
+            raise ValueError
+    except (ValueError, TypeError):
+        return jsonify({"error": "schedule_hour must be 0–23"}), 400
+
+    archive_id = str(uuid.uuid4())
+    archive = store.upsert_scheduled_archive(
+        archive_id=archive_id,
+        url=url,
+        name=name,
+        schedule_hour=schedule_hour,
+        enabled=True,
+    )
+    return jsonify(archive), 201
+
+
+@app.route("/api/archives/<archive_id>", methods=["GET"])
+@admin_required
+def get_archive(archive_id):
+    archive = store.get_scheduled_archive(archive_id)
+    if not archive:
+        return jsonify({"error": "Not found"}), 404
+    archive.get("checkpoint", {}).pop("known_urls", None)
+    return jsonify(archive)
+
+
+@app.route("/api/archives/<archive_id>", methods=["DELETE"])
+@admin_required
+def delete_archive(archive_id):
+    if not store.delete_scheduled_archive(archive_id):
+        return jsonify({"error": "Not found"}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/archives/<archive_id>/run", methods=["POST"])
+@admin_required
+def run_archive_now(archive_id):
+    archive = store.get_scheduled_archive(archive_id)
+    if not archive:
+        return jsonify({"error": "Not found"}), 404
+    if archive.get("status") == "running":
+        return jsonify({"error": "Archive is already running"}), 409
+    store.start_archive_run(archive_id)
+    threading.Thread(target=_run_archive_job, args=(archive_id,), daemon=True).start()
+    return jsonify({"ok": True})
 
 
 # ---------------------------------------------------------------------------

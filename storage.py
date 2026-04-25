@@ -68,6 +68,23 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 """
 
+ARCHIVES_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS scheduled_archives (
+    id            TEXT PRIMARY KEY,
+    url           TEXT NOT NULL,
+    name          TEXT NOT NULL DEFAULT '',
+    schedule_hour INTEGER DEFAULT 6,
+    enabled       INTEGER DEFAULT 1,
+    collection_id TEXT DEFAULT '',
+    checkpoint    TEXT DEFAULT '{}',
+    status        TEXT DEFAULT 'idle',
+    last_run      TEXT DEFAULT '',
+    last_run_new  INTEGER DEFAULT 0,
+    last_error    TEXT DEFAULT '',
+    created_at    TEXT NOT NULL
+);
+"""
+
 
 class CollectionStore:
     """Multi-process-safe SQLite store for collections, files, and tasks.
@@ -88,6 +105,7 @@ class CollectionStore:
                     conn.executescript(SCHEMA_SQL)
                     conn.executescript(FILES_SCHEMA_SQL)
                     conn.executescript(TASKS_SCHEMA_SQL)
+                    conn.executescript(ARCHIVES_SCHEMA_SQL)
                     conn.commit()
                 break
             except sqlite3.OperationalError as e:
@@ -419,6 +437,104 @@ class CollectionStore:
             logger.info("Reset %d stale tasks back to pending", cur.rowcount)
         return cur.rowcount
 
+    # ---- Scheduled Archives --------------------------------------------------
+
+    def list_scheduled_archives(self) -> List[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM scheduled_archives ORDER BY created_at DESC"
+            ).fetchall()
+        return [self._archive_to_dict(r) for r in rows]
+
+    def get_scheduled_archive(self, archive_id: str) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM scheduled_archives WHERE id = ?", (archive_id,)
+            ).fetchone()
+        return self._archive_to_dict(row) if row else None
+
+    def upsert_scheduled_archive(
+        self,
+        archive_id: str,
+        url: str,
+        name: str = "",
+        schedule_hour: int = 6,
+        enabled: bool = True,
+    ) -> dict:
+        now = datetime.now().isoformat(timespec="seconds")
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """INSERT INTO scheduled_archives
+                   (id, url, name, schedule_hour, enabled, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                     url=excluded.url, name=excluded.name,
+                     schedule_hour=excluded.schedule_hour, enabled=excluded.enabled""",
+                (archive_id, url, name, schedule_hour, 1 if enabled else 0, now),
+            )
+            conn.commit()
+        return self.get_scheduled_archive(archive_id)
+
+    def claim_archive_run(self, archive_id: str, today_cutoff: str) -> bool:
+        """Atomically claim an archive for running.
+
+        Sets status='running' only if not already running and not yet run today
+        (last_run < today_cutoff). Returns True if this caller won the claim.
+        """
+        now = datetime.now().isoformat(timespec="seconds")
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                """UPDATE scheduled_archives
+                   SET status = 'running', last_run = ?
+                   WHERE id = ? AND status != 'running'
+                     AND (last_run < ? OR last_run = '')""",
+                (now, archive_id, today_cutoff),
+            )
+            conn.commit()
+        return cur.rowcount > 0
+
+    def start_archive_run(self, archive_id: str) -> None:
+        """Unconditionally mark an archive as running (for manual triggers)."""
+        now = datetime.now().isoformat(timespec="seconds")
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE scheduled_archives SET status = 'running', last_run = ? WHERE id = ?",
+                (now, archive_id),
+            )
+            conn.commit()
+
+    def finish_archive_run(
+        self,
+        archive_id: str,
+        status: str,
+        collection_id: str,
+        checkpoint: dict,
+        new_count: int,
+        error: str = "",
+    ) -> None:
+        # Serialize known_urls set → sorted list
+        cp = dict(checkpoint or {})
+        if isinstance(cp.get("known_urls"), set):
+            cp["known_urls"] = sorted(cp["known_urls"])
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """UPDATE scheduled_archives
+                   SET status = ?, collection_id = ?, checkpoint = ?,
+                       last_run_new = ?, last_error = ?
+                   WHERE id = ?""",
+                (status, collection_id, json.dumps(cp, ensure_ascii=False),
+                 new_count, error, archive_id),
+            )
+            conn.commit()
+
+    def delete_scheduled_archive(self, archive_id: str) -> bool:
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM scheduled_archives WHERE id = ?", (archive_id,)
+            )
+            conn.commit()
+        return cur.rowcount > 0
+
     # ---- Storage management --------------------------------------------------
 
     def get_total_size(self) -> int:
@@ -470,4 +586,18 @@ class CollectionStore:
                 d[field] = json.loads(d.get(field) or "{}")
             except (json.JSONDecodeError, TypeError):
                 d[field] = {}
+        return d
+
+    @staticmethod
+    def _archive_to_dict(row: sqlite3.Row) -> dict:
+        d = dict(row)
+        d["enabled"] = bool(d.get("enabled", 1))
+        try:
+            cp = json.loads(d.get("checkpoint") or "{}")
+            # known_urls: keep as list in API responses (sets aren't JSON-serialisable)
+            if isinstance(cp.get("known_urls"), list):
+                cp["known_urls"] = cp["known_urls"]
+            d["checkpoint"] = cp
+        except (json.JSONDecodeError, TypeError):
+            d["checkpoint"] = {}
         return d

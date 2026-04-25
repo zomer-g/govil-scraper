@@ -802,6 +802,44 @@ class GovILScraper:
 
         return self._build_result(all_items, total_count, parsed, warning)
 
+    def fetch_traditional_page(self, url: str, skip: int = 0, limit: int = 1):
+        """Fetch one page from a traditional collector and return (total_count, raw_items).
+
+        Does not paginate, flatten items, or download attachments — designed for
+        incremental delta checks where only a small slice of the top (newest) items
+        is needed without triggering a full scrape.
+        """
+        from urllib.parse import quote
+        parsed = parse_gov_url(url)
+        if parsed.page_type != PageType.TRADITIONAL_COLLECTOR:
+            raise InvalidURLError(
+                f"fetch_traditional_page requires a /he/collectors/ URL, got: {url}"
+            )
+
+        collector_types = self._discover_collector_types(parsed.collector_name)
+
+        reserved = {"officeid", "culture", "skip", "limit", "collectortype"}
+        extra_filters = {
+            k: v for k, v in (parsed.query_params or {}).items()
+            if k.lower() not in reserved and v not in (None, "")
+        }
+
+        query_parts = [f"CollectorType={ct}" for ct in collector_types]
+        query_parts.append("culture=he")
+        query_parts.append(f"skip={skip}")
+        query_parts.append(f"limit={limit}")
+        if parsed.office_id:
+            query_parts.append(f"officeId={parsed.office_id}")
+        for k, v in extra_filters.items():
+            query_parts.append(f"{k}={quote(str(v), safe='')}")
+
+        api_url = f"{TRADITIONAL_ENDPOINT}?{'&'.join(query_parts)}"
+        resp = self.session.get(api_url)
+        data = resp.json()
+        total = _extract_total(data) or 0
+        items = _extract_items(data)
+        return total, items
+
     # ---- Traditional collector type discovery --------------------------------
 
     def _discover_collector_types(self, collector_name: str) -> List[str]:

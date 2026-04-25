@@ -124,6 +124,14 @@
                     <i class="bi bi-collection"></i> אוספים
                 </button>
             </li>
+            {% if is_admin %}
+            <li class="nav-item">
+                <button class="nav-link" data-bs-toggle="tab" data-bs-target="#archivesTab" type="button"
+                        onclick="loadArchives()">
+                    <i class="bi bi-archive"></i> ארכיב
+                </button>
+            </li>
+            {% endif %}
             <li class="nav-item">
                 <button class="nav-link" data-bs-toggle="tab" data-bs-target="#apiDocsTab" type="button">
                     <i class="bi bi-code-slash"></i> API
@@ -563,6 +571,60 @@ Fields:
                 </div>
             </div>
         </div>
+
+        <!-- ============ ARCHIVES TAB ============ -->
+        {% if is_admin %}
+        <div class="tab-pane fade" id="archivesTab">
+
+        <!-- Archive list -->
+        <div class="card mb-3">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-archive"></i> ארכיבים מתוזמנים</span>
+                <button class="btn btn-sm btn-outline-secondary" onclick="loadArchives()">
+                    <i class="bi bi-arrow-clockwise"></i> רענן
+                </button>
+            </div>
+            <div class="card-body p-0" id="archivesContainer">
+                <div class="empty-state text-muted p-4">
+                    <div class="spinner-border spinner-border-sm me-2"></div> טוען...
+                </div>
+            </div>
+        </div>
+
+        <!-- Add archive form -->
+        <div class="card mb-3">
+            <div class="card-header"><i class="bi bi-plus-circle"></i> הוסף ארכיב חדש</div>
+            <div class="card-body p-4">
+                <form id="addArchiveForm">
+                    <div class="row g-3 mb-3">
+                        <div class="col-md-7">
+                            <label class="form-label small fw-bold">כתובת URL</label>
+                            <input type="url" class="form-control" id="archiveUrl" dir="ltr"
+                                   placeholder="https://www.gov.il/he/collectors/policies?Type=..." required>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label small fw-bold">שם (אופציונלי)</label>
+                            <input type="text" class="form-control" id="archiveName"
+                                   placeholder="למשל: החלטות ממשלה">
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label small fw-bold">שעת עדכון (0–23)</label>
+                            <input type="number" class="form-control" id="archiveHour"
+                                   value="6" min="0" max="23">
+                        </div>
+                    </div>
+                    <div class="d-flex align-items-center gap-3">
+                        <button type="submit" class="btn btn-primary" id="addArchiveBtn">
+                            <i class="bi bi-plus-lg"></i> צור ארכיב
+                        </button>
+                        <small class="text-muted" id="addArchiveStatus"></small>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        </div><!-- /archivesTab -->
+        {% endif %}
 
         </div><!-- /tab-content -->
     </div>
@@ -1141,6 +1203,155 @@ Fields:
             await fetch('/api/tasks/' + taskId, { method: 'DELETE' });
             loadTasks();
         } catch { /* ignore */ }
+    }
+
+    // ===================== ARCHIVES =====================
+
+    let archiveRefreshTimer = null;
+
+    async function loadArchives() {
+        const container = document.getElementById('archivesContainer');
+        if (!container) return;
+        try {
+            const resp = await fetch('/api/archives');
+            if (!resp.ok) { container.innerHTML = '<div class="empty-state text-danger p-3">שגיאה בטעינה</div>'; return; }
+            const archives = await resp.json();
+
+            if (archives.length === 0) {
+                container.innerHTML = '<div class="empty-state p-4"><i class="bi bi-archive fs-1 text-muted"></i><p class="mt-2 text-muted">אין ארכיבים עדיין. צור ארכיב חדש למטה.</p></div>';
+                return;
+            }
+
+            let html = '<div class="list-group list-group-flush">';
+            let hasRunning = false;
+            for (const a of archives) {
+                const isRunning = a.status === 'running';
+                const isError = a.status === 'error';
+                if (isRunning) hasRunning = true;
+
+                const statusBadge = isRunning
+                    ? '<span class="badge bg-primary-subtle text-primary"><span class="spinner-border spinner-border-sm me-1" style="width:.6rem;height:.6rem"></span>מעדכן...</span>'
+                    : isError
+                        ? `<span class="badge bg-danger-subtle text-danger" title="${escapeHtml(a.last_error || '')}">שגיאה</span>`
+                        : '<span class="badge bg-success-subtle text-success">פעיל</span>';
+
+                const cp = a.checkpoint || {};
+                const totalArchived = cp.total_archived || a.last_run_new || 0;
+                const lastRun = a.last_run
+                    ? new Date(a.last_run).toLocaleDateString('he-IL', { year:'numeric', month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' })
+                    : 'לא הורץ עדיין';
+                const collId = a.collection_id || '';
+
+                html += `
+                <div class="list-group-item p-3" id="archive-${a.id}">
+                    <div class="d-flex justify-content-between align-items-start flex-wrap gap-2">
+                        <div>
+                            <strong>${escapeHtml(a.name || a.url)}</strong>
+                            ${statusBadge}
+                            ${!a.enabled ? '<span class="badge bg-secondary ms-1">מושבת</span>' : ''}
+                        </div>
+                        <div class="d-flex gap-1 flex-wrap">
+                            ${collId ? `
+                            <a href="/api/collections/${collId}/csv" class="btn btn-sm btn-outline-success" title="הורד CSV" onclick="event.stopPropagation()">
+                                <i class="bi bi-filetype-csv"></i> CSV
+                            </a>
+                            <a href="/api/collections/${collId}/excel" class="btn btn-sm btn-outline-primary" title="הורד Excel" onclick="event.stopPropagation()">
+                                <i class="bi bi-file-earmark-excel"></i> Excel
+                            </a>` : ''}
+                            <button class="btn btn-sm btn-outline-secondary" onclick="runArchiveNow('${a.id}')"
+                                    ${isRunning ? 'disabled' : ''} title="הרץ עכשיו">
+                                <i class="bi bi-play-fill"></i> עדכן עכשיו
+                            </button>
+                            <button class="btn btn-sm btn-outline-danger" onclick="deleteArchive('${a.id}')" title="מחק">
+                                <i class="bi bi-trash"></i>
+                            </button>
+                        </div>
+                    </div>
+                    <div class="collection-url mt-1">${escapeHtml(a.url)}</div>
+                    <div class="collection-meta mt-1">
+                        <i class="bi bi-calendar3"></i> עדכון אחרון: ${lastRun}
+                        ${a.last_run_new > 0 ? ` &middot; <span class="text-success">+${a.last_run_new} חדשים</span>` : ''}
+                        ${totalArchived > 0 ? ` &middot; <i class="bi bi-table"></i> ${totalArchived.toLocaleString()} רשומות בסה"כ` : ''}
+                        &middot; <i class="bi bi-clock"></i> מתוזמן לשעה ${a.schedule_hour}:00
+                        ${isError ? `<div class="text-danger small mt-1"><i class="bi bi-exclamation-triangle"></i> ${escapeHtml(a.last_error || '')}</div>` : ''}
+                    </div>
+                </div>`;
+            }
+            html += '</div>';
+            container.innerHTML = html;
+
+            // Auto-refresh while any archive is running
+            clearTimeout(archiveRefreshTimer);
+            if (hasRunning) {
+                archiveRefreshTimer = setTimeout(loadArchives, 5000);
+            }
+        } catch (err) {
+            container.innerHTML = `<div class="empty-state text-danger p-3">שגיאה: ${escapeHtml(err.message)}</div>`;
+        }
+    }
+
+    async function runArchiveNow(archiveId) {
+        try {
+            const resp = await fetch(`/api/archives/${archiveId}/run`, { method: 'POST' });
+            if (!resp.ok) {
+                const d = await resp.json();
+                alert(d.error || 'שגיאה');
+                return;
+            }
+            await loadArchives();
+            archiveRefreshTimer = setTimeout(loadArchives, 5000);
+        } catch (err) {
+            alert('שגיאה: ' + err.message);
+        }
+    }
+
+    async function deleteArchive(archiveId) {
+        if (!confirm('למחוק את הארכיב? הקבצים ישמרו באוספים.')) return;
+        try {
+            await fetch(`/api/archives/${archiveId}`, { method: 'DELETE' });
+            loadArchives();
+        } catch { /* ignore */ }
+    }
+
+    const addArchiveForm = document.getElementById('addArchiveForm');
+    if (addArchiveForm) {
+        addArchiveForm.addEventListener('submit', async e => {
+            e.preventDefault();
+            const btn = document.getElementById('addArchiveBtn');
+            const status = document.getElementById('addArchiveStatus');
+            const url = document.getElementById('archiveUrl').value.trim();
+            const name = document.getElementById('archiveName').value.trim();
+            const hour = parseInt(document.getElementById('archiveHour').value) || 6;
+
+            btn.disabled = true;
+            status.textContent = 'יוצר...';
+
+            try {
+                const resp = await fetch('/api/archives', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url, name, schedule_hour: hour }),
+                });
+                const data = await resp.json();
+                if (!resp.ok) { status.textContent = data.error || 'שגיאה'; btn.disabled = false; return; }
+
+                status.textContent = 'נוצר בהצלחה! מריץ סריקה ראשונית...';
+                addArchiveForm.reset();
+                document.getElementById('archiveHour').value = 6;
+
+                // Trigger immediate bootstrap run
+                await fetch(`/api/archives/${data.id}/run`, { method: 'POST' });
+
+                // Switch to list view and refresh
+                await loadArchives();
+                archiveRefreshTimer = setTimeout(loadArchives, 5000);
+                status.textContent = '';
+            } catch (err) {
+                status.textContent = 'שגיאה: ' + err.message;
+            } finally {
+                btn.disabled = false;
+            }
+        });
     }
     </script>
 </body>

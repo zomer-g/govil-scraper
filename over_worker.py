@@ -285,7 +285,9 @@ class OverWorkerClient:
                      duration_seconds: float,
                      zip_resource_id: str | None = None,
                      zip_resource_ids: list[str] | None = None,
-                     csv_resource_ids: dict[str, str] | None = None) -> dict:
+                     csv_resource_ids: dict[str, str] | None = None,
+                     scraper_config_patch: dict | None = None,
+                     skip_version: bool = False) -> dict:
         """Push scraped data as a new version to over.org.il.
         zip_resource_id: single ZIP (legacy). zip_resource_ids: list of parts (preferred).
         csv_resource_ids: maps resource_name -> odata resource_id when records were
@@ -323,6 +325,10 @@ class OverWorkerClient:
             payload["zip_resource_id"] = zip_resource_id
         if csv_resource_ids:
             payload["csv_resource_ids"] = csv_resource_ids
+        if scraper_config_patch is not None:
+            payload["scraper_config_patch"] = scraper_config_patch
+        if skip_version:
+            payload["skip_version"] = True
 
         import json as _json
         payload_size = len(_json.dumps(payload, ensure_ascii=False))
@@ -348,6 +354,183 @@ class OverWorkerClient:
     # Task execution
     # ------------------------------------------------------------------
 
+    def execute_archive_task(self, task: dict):
+        """Execute an incremental archive task (scraper_config.archive == true).
+
+        On each run:
+          - Bootstrap (full scrape) if no checkpoint or local CSV is missing.
+          - Otherwise fetch only the delta and append to the master CSV.
+          - Upload the full master CSV to odata and push a new version.
+          - If 0 new items, mark the task done without creating a new version.
+          - Persist the updated checkpoint back to the server via scraper_config_patch.
+        """
+        from archive_engine import run_bootstrap, run_incremental
+        from scraper_engine import (
+            GovILSession, GovILScraperError,
+            InvalidURLError, CloudflareBlockError,
+        )
+
+        task_id = task["task_id"]
+        tracked_dataset_id = task["tracked_dataset_id"]
+        source_url = task["source_url"]
+        config = task.get("scraper_config", {})
+
+        logger.info("=" * 70)
+        logger.info("▶  ARCHIVE TASK START")
+        logger.info("   task_id: %s", task_id)
+        logger.info("   url:     %s", source_url)
+        logger.info("=" * 70)
+        _write_status(f"ARCHIVE on {source_url}")
+
+        # Archive dir is kept next to the script and keyed by dataset ID so
+        # it survives multiple runs without re-bootstrapping.
+        archive_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "over_archives", tracked_dataset_id,
+        )
+        os.makedirs(archive_dir, exist_ok=True)
+
+        # Load checkpoint from scraper_config; known_urls must be a set.
+        raw_checkpoint = config.get("checkpoint")
+        checkpoint = None
+        if raw_checkpoint:
+            checkpoint = dict(raw_checkpoint)
+            checkpoint["known_urls"] = set(checkpoint.get("known_urls") or [])
+
+        need_bootstrap = (
+            checkpoint is None
+            or not checkpoint.get("archive_csv")
+            or not os.path.exists(
+                os.path.join(archive_dir, checkpoint.get("archive_csv", ""))
+            )
+        )
+
+        start_time = time.time()
+        session = None
+        last_state = {"phase": "initializing", "current": 0, "total": 1, "message": ""}
+        _hb_stop = threading.Event()
+
+        def _heartbeat():
+            while not _hb_stop.wait(30):
+                s = last_state.copy()
+                self.report_progress(task_id, s["phase"], s["current"], s["total"], s["message"])
+
+        _hb_thread = threading.Thread(target=_heartbeat, daemon=True, name="archive-heartbeat")
+        _hb_thread.start()
+
+        try:
+            self.report_progress(task_id, "initializing", 0, 1, "מתחבר לאתר gov.il...")
+            session = GovILSession(use_playwright_fallback=False)
+            session.warm()
+
+            if need_bootstrap:
+                logger.info("Archive bootstrap required — full scrape")
+
+                last_report = [0.0]
+
+                def _progress_cb(**kw):
+                    now = time.time()
+                    current = kw.get("current", 0)
+                    total = kw.get("total", 1) or 1
+                    msg = kw.get("message", "")
+                    last_state.update({"phase": "scraping", "current": current,
+                                       "total": total, "message": msg})
+                    if now - last_report[0] >= 5:
+                        self.report_progress(task_id, "scraping", current, total, msg)
+                        last_report[0] = now
+
+                file_info, checkpoint = run_bootstrap(
+                    url=source_url,
+                    archive_dir=archive_dir,
+                    session=session,
+                    progress_cb=_progress_cb,
+                )
+                new_count = file_info["record_count"]
+                logger.info("Bootstrap done: %d records", new_count)
+            else:
+                logger.info("Archive incremental run")
+                self.report_progress(task_id, "scraping", 0, 1, "בודק עדכונים...")
+                last_state.update({"phase": "scraping", "current": 0, "total": 1,
+                                   "message": "בודק עדכונים..."})
+                new_count, checkpoint = run_incremental(
+                    url=source_url,
+                    archive_dir=archive_dir,
+                    checkpoint=checkpoint,
+                    session=session,
+                )
+                logger.info("Incremental done: %d new items", new_count)
+
+            # Serialize checkpoint: known_urls set → sorted list for JSON storage.
+            checkpoint_serial = dict(checkpoint)
+            checkpoint_serial["known_urls"] = sorted(checkpoint.get("known_urls") or [])
+            scraper_config_patch = {"checkpoint": checkpoint_serial}
+
+            if not need_bootstrap and new_count == 0:
+                logger.info("No new items — completing task without new version")
+                self.push_version(
+                    tracked_dataset_id=tracked_dataset_id,
+                    source_url=source_url,
+                    records=[], fields=[], attachments=[],
+                    duration_seconds=time.time() - start_time,
+                    scraper_config_patch=scraper_config_patch,
+                    skip_version=True,
+                )
+                return
+
+            # Upload the full master CSV to odata.
+            csv_path = os.path.join(archive_dir, checkpoint["archive_csv"])
+            with open(csv_path, "rb") as fh:
+                csv_bytes = fh.read()
+
+            total_rows = checkpoint.get("total_archived", 0)
+            fields = [{"id": col, "type": "text"} for col in (checkpoint.get("column_headers") or [])]
+            self.report_progress(task_id, "uploading", 0, 1,
+                                 f"מעלה CSV ({len(csv_bytes) // 1024 // 1024}MB, {total_rows} שורות)...")
+            last_state.update({"phase": "uploading", "current": 0, "total": 1,
+                                "message": "מעלה CSV..."})
+
+            csv_rid = self.upload_csv(
+                tracked_dataset_id=tracked_dataset_id,
+                version_number=1,
+                csv_bytes=csv_bytes,
+                resource_name="נתוני הסורק",
+                row_count=total_rows,
+                fields=fields,
+            )
+            del csv_bytes  # free memory before push_version JSON encode
+
+            if not csv_rid:
+                self.report_failure(task_id, "CSV upload failed for archive task", phase="uploading")
+                return
+
+            self.push_version(
+                tracked_dataset_id=tracked_dataset_id,
+                source_url=source_url,
+                records=[], fields=fields, attachments=[],
+                duration_seconds=time.time() - start_time,
+                csv_resource_ids={"נתוני הסורק": csv_rid},
+                scraper_config_patch=scraper_config_patch,
+            )
+            logger.info("Archive task done: %d new items, total %d in archive",
+                        new_count, total_rows)
+
+        except (InvalidURLError, CloudflareBlockError, GovILScraperError) as e:
+            logger.error("Archive scrape error in task %s: %s", task_id, e)
+            self.report_failure(task_id, str(e), phase="scraping")
+        except RuntimeError as e:
+            logger.error("Archive push error in task %s: %s", task_id, e)
+            self.report_failure(task_id, str(e), phase="exporting")
+        except Exception as e:
+            logger.exception("Unexpected error in archive task %s", task_id)
+            self.report_failure(task_id, f"{type(e).__name__}: {e}")
+        finally:
+            _hb_stop.set()
+            if session:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+
     def execute_task(self, task: dict):
         """Execute a single scrape task and push results to over.org.il."""
         from scraper_engine import (
@@ -359,6 +542,11 @@ class OverWorkerClient:
         tracked_dataset_id = task["tracked_dataset_id"]
         source_url = task["source_url"]
         config = task.get("scraper_config", {})
+
+        # Archive mode: incremental append-only archiving via archive_engine.
+        if config.get("archive"):
+            return self.execute_archive_task(task)
+
         download_files = config.get("download_files", False)
 
         logger.info("=" * 70)
