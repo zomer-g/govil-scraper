@@ -26,6 +26,7 @@ class PageType(Enum):
     DYNAMIC_COLLECTOR = "dynamic_collector"
     TRADITIONAL_COLLECTOR = "traditional_collector"
     CONTENT_PAGE = "content_page"  # /he/pages/{name} — React SPA backed by ContentPageWebApi
+    NADLAN_PARCEL = "nadlan_parcel"  # nadlan.gov.il single (gush, chelka) deal history
     UNKNOWN = "unknown"
 
 
@@ -316,6 +317,25 @@ def parse_gov_url(url: str) -> ParsedURL:
     parsed = urlparse(url)
     path = parsed.path.rstrip("/")
     params = parse_qs(parsed.query)
+    host = (parsed.hostname or "").lower()
+
+    # Nadlan.gov.il parcel page: ?view=kparcel_all&id=<gush>-<chelka>
+    if host.endswith("nadlan.gov.il"):
+        view = (params.get("view", [None])[0] or "").lower()
+        pid = params.get("id", [None])[0] or ""
+        if view == "kparcel_all" and "-" in pid:
+            gush, _, chelka = pid.partition("-")
+            return ParsedURL(
+                page_type=PageType.NADLAN_PARCEL,
+                collector_name=f"nadlan_{gush}_{chelka}",
+                office_id=None,
+                original_url=url,
+                query_params={"gush": gush, "chelka": chelka},
+            )
+        raise InvalidURLError(
+            f"כתובת nadlan.gov.il לא נתמכת: {url}\n"
+            "נתמך כרגע: ?view=kparcel_all&id=<גוש>-<חלקה>&page=deals"
+        )
 
     # DynamicCollector
     m = RE_DYNAMIC.search(path)
@@ -603,6 +623,8 @@ class GovILScraper:
             return self._scrape_traditional(parsed)
         elif parsed.page_type == PageType.CONTENT_PAGE:
             return self._scrape_content_page(parsed)
+        elif parsed.page_type == PageType.NADLAN_PARCEL:
+            return self._scrape_nadlan(parsed)
         else:
             raise InvalidURLError(f"סוג דף לא נתמך: {parsed.page_type}")
 
@@ -914,6 +936,42 @@ class GovILScraper:
             items=flat_items,
             total_count=total_count,
             file_attachments=attachments,
+            collector_name=parsed.collector_name,
+            page_type=parsed.page_type,
+            column_headers=headers,
+            warning=warning,
+        )
+
+    # ---- Nadlan parcel deals --------------------------------------------------
+
+    def _scrape_nadlan(self, parsed: ParsedURL) -> ScrapeResult:
+        """Scrape real-estate deal history for one (gush, chelka) parcel.
+
+        Drives a Playwright Chromium (visible — headless is rejected by the
+        site's reCAPTCHA) and intercepts the /deal-data + /deal-info responses.
+        See nadlan_api.py for the protocol notes.
+        """
+        from nadlan_api import fetch_parcel_deals, order_columns
+
+        gush = parsed.query_params.get("gush")
+        chelka = parsed.query_params.get("chelka")
+
+        items, parcel_meta, warning = fetch_parcel_deals(
+            gush, chelka, progress=self.progress
+        )
+
+        # Merge parcel-level metadata into each row so the CSV is self-contained.
+        for it in items:
+            for k, v in parcel_meta.items():
+                # Don't overwrite per-deal fields; only fill in parcel context.
+                it.setdefault(f"parcel_{k}", v)
+
+        headers = order_columns(items) if items else []
+
+        return ScrapeResult(
+            items=items,
+            total_count=len(items),
+            file_attachments=[],
             collector_name=parsed.collector_name,
             page_type=parsed.page_type,
             column_headers=headers,
