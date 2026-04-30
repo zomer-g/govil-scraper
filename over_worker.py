@@ -531,6 +531,165 @@ class OverWorkerClient:
                 except Exception:
                     pass
 
+    def execute_nadlan_archive_task(self, task: dict):
+        """Execute a nadlan_settlements archive task.
+
+        Mirrors execute_archive_task line-by-line; the differences are:
+          - imports nadlan_incremental_engine (Playwright-driven, no GovILSession)
+          - bootstrap/incremental signatures take no source_url
+          - lookback_days + settlements_filter come from scraper_config
+        """
+        from nadlan_incremental_engine import run_bootstrap, run_incremental
+
+        task_id = task["task_id"]
+        tracked_dataset_id = task["tracked_dataset_id"]
+        source_url = task.get("source_url", "")
+        config = task.get("scraper_config", {})
+
+        logger.info("=" * 70)
+        logger.info("▶  NADLAN ARCHIVE TASK START")
+        logger.info("   task_id: %s", task_id)
+        logger.info("   type:    nadlan_settlements")
+        logger.info("=" * 70)
+        _write_status("ARCHIVE nadlan_settlements")
+
+        archive_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "over_archives", tracked_dataset_id,
+        )
+        os.makedirs(archive_dir, exist_ok=True)
+
+        raw_checkpoint = config.get("checkpoint")
+        checkpoint = None
+        if raw_checkpoint:
+            checkpoint = dict(raw_checkpoint)
+            checkpoint["known_urls"] = set(checkpoint.get("known_urls") or [])
+
+        need_bootstrap = (
+            checkpoint is None
+            or not checkpoint.get("archive_csv")
+            or not os.path.exists(
+                os.path.join(archive_dir, checkpoint.get("archive_csv", ""))
+            )
+        )
+
+        lookback_days = int(config.get("nadlan_lookback_days", 90))
+        settlements_filter = config.get("nadlan_settlements_filter")
+
+        start_time = time.time()
+        last_state = {"phase": "initializing", "current": 0, "total": 1, "message": ""}
+        _hb_stop = threading.Event()
+
+        def _heartbeat():
+            while not _hb_stop.wait(30):
+                s = last_state.copy()
+                self.report_progress(task_id, s["phase"], s["current"], s["total"], s["message"])
+
+        _hb_thread = threading.Thread(target=_heartbeat, daemon=True, name="nadlan-archive-heartbeat")
+        _hb_thread.start()
+
+        try:
+            self.report_progress(task_id, "initializing", 0, 1, "טוען קטלוג יישובים...")
+
+            last_report = [0.0]
+
+            def _progress_cb(**kw):
+                now = time.time()
+                current = kw.get("current", 0)
+                total = kw.get("total", 1) or 1
+                msg = kw.get("message", "")
+                last_state.update({"phase": "scraping", "current": current,
+                                   "total": total, "message": msg})
+                if now - last_report[0] >= 5:
+                    self.report_progress(task_id, "scraping", current, total, msg)
+                    last_report[0] = now
+
+            if need_bootstrap:
+                logger.info("Nadlan bootstrap required — settlement-by-settlement scan")
+                file_info, checkpoint = run_bootstrap(
+                    archive_dir=archive_dir,
+                    progress_cb=_progress_cb,
+                    settlements_filter=settlements_filter,
+                )
+                new_count = file_info["record_count"]
+                logger.info("Bootstrap done: %d deals", new_count)
+            else:
+                logger.info("Nadlan incremental run (lookback=%dd)", lookback_days)
+                self.report_progress(task_id, "scraping", 0, 1, "בודק עסקאות חדשות...")
+                last_state.update({"phase": "scraping", "current": 0, "total": 1,
+                                   "message": "בודק עסקאות חדשות..."})
+                new_count, checkpoint = run_incremental(
+                    archive_dir=archive_dir,
+                    checkpoint=checkpoint,
+                    progress_cb=_progress_cb,
+                    lookback_days=lookback_days,
+                    settlements_filter=settlements_filter,
+                )
+                logger.info("Incremental done: %d new deals", new_count)
+
+            checkpoint_serial = dict(checkpoint)
+            checkpoint_serial["known_urls"] = sorted(checkpoint.get("known_urls") or [])
+            scraper_config_patch = {"checkpoint": checkpoint_serial}
+
+            if not need_bootstrap and new_count == 0:
+                logger.info("No new deals — completing task without new version")
+                self.push_version(
+                    tracked_dataset_id=tracked_dataset_id,
+                    source_url=source_url,
+                    records=[], fields=[], attachments=[],
+                    duration_seconds=time.time() - start_time,
+                    scraper_config_patch=scraper_config_patch,
+                    skip_version=True,
+                )
+                return
+
+            csv_path = os.path.join(archive_dir, checkpoint["archive_csv"])
+            with open(csv_path, "rb") as fh:
+                csv_bytes = fh.read()
+
+            total_rows = checkpoint.get("total_archived", 0)
+            fields = [{"id": col, "type": "text"}
+                      for col in (checkpoint.get("column_headers") or [])]
+            self.report_progress(task_id, "uploading", 0, 1,
+                                 f"מעלה CSV ({len(csv_bytes) // 1024 // 1024}MB, {total_rows} שורות)...")
+            last_state.update({"phase": "uploading", "current": 0, "total": 1,
+                                "message": "מעלה CSV..."})
+
+            csv_rid = self.upload_csv(
+                tracked_dataset_id=tracked_dataset_id,
+                version_number=1,
+                csv_bytes=csv_bytes,
+                resource_name="נתוני הסורק",
+                row_count=total_rows,
+                fields=fields,
+            )
+            del csv_bytes
+
+            if not csv_rid:
+                self.report_failure(task_id, "CSV upload failed for nadlan archive task",
+                                    phase="uploading")
+                return
+
+            self.push_version(
+                tracked_dataset_id=tracked_dataset_id,
+                source_url=source_url,
+                records=[], fields=fields, attachments=[],
+                duration_seconds=time.time() - start_time,
+                csv_resource_ids={"נתוני הסורק": csv_rid},
+                scraper_config_patch=scraper_config_patch,
+            )
+            logger.info("Nadlan archive task done: +%d deals, total %d",
+                        new_count, total_rows)
+
+        except RuntimeError as e:
+            logger.error("Nadlan push error in task %s: %s", task_id, e)
+            self.report_failure(task_id, str(e), phase="exporting")
+        except Exception as e:
+            logger.exception("Unexpected error in nadlan archive task %s", task_id)
+            self.report_failure(task_id, f"{type(e).__name__}: {e}")
+        finally:
+            _hb_stop.set()
+
     def execute_task(self, task: dict):
         """Execute a single scrape task and push results to over.org.il."""
         from scraper_engine import (
@@ -543,8 +702,12 @@ class OverWorkerClient:
         source_url = task["source_url"]
         config = task.get("scraper_config", {})
 
-        # Archive mode: incremental append-only archiving via archive_engine.
+        # Archive mode: incremental append-only archiving via archive_engine
+        # or its nadlan-specific sibling, selected by archive_type.
         if config.get("archive"):
+            archive_type = config.get("archive_type")
+            if archive_type == "nadlan_settlements":
+                return self.execute_nadlan_archive_task(task)
             return self.execute_archive_task(task)
 
         download_files = config.get("download_files", False)

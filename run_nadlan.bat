@@ -26,13 +26,15 @@ if errorlevel 1 (
 )
 
 echo Choose mode:
-echo   [1] Single parcel  (enter gush + chelka, get one CSV)
-echo   [2] Bulk           (read parcels.csv, append to deals.csv)
+echo   [1] Single parcel    (enter gush + chelka, get one CSV)
+echo   [2] Bulk             (read parcels.csv, append to deals.csv)
+echo   [3] Daily incremental (settlement-level scan, append new deals only)
 echo.
-set /p MODE="Choice (1 or 2): "
+set /p MODE="Choice (1, 2, or 3): "
 
 if "%MODE%"=="1" goto SINGLE
 if "%MODE%"=="2" goto BULK
+if "%MODE%"=="3" goto DAILY
 echo [ERROR] Invalid choice.
 pause
 exit /b 1
@@ -88,6 +90,34 @@ if errorlevel 1 (
 ) else (
     echo.
     echo Done.
+)
+goto END
+
+:DAILY
+echo.
+set /p ARCHIVE_DIR="Archive directory (will hold nadlan_master.csv + checkpoint.json): "
+if "%ARCHIVE_DIR%"=="" goto BAD_INPUT
+set /p SETTLEMENTS="Settlements filter (comma-separated setlCodes; blank = all 1,509 settlements): "
+set /p LOOKBACK="Lookback days (blank = 90): "
+
+echo.
+echo Running daily incremental against %ARCHIVE_DIR%...
+echo (A Chromium window will pop up. ~3 hours for full Israel scan.)
+echo If checkpoint.json is missing this will run a bootstrap instead.
+echo.
+
+set DAILY_ARGS=--archive-dir "%ARCHIVE_DIR%"
+if not "%SETTLEMENTS%"=="" set DAILY_ARGS=%DAILY_ARGS% --settlements %SETTLEMENTS%
+if not "%LOOKBACK%"=="" set DAILY_ARGS=%DAILY_ARGS% --lookback-days %LOOKBACK%
+
+python incremental_nadlan_daily.py %DAILY_ARGS%
+
+if errorlevel 1 (
+    echo.
+    echo [ERROR] Incremental run failed. See output above.
+) else (
+    echo.
+    echo Done. Master CSV updated; daily delta saved as nadlan_delta_*.csv.
 )
 goto END
 
