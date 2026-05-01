@@ -8,7 +8,7 @@ services:
       - key: PORT
         value: "5000"
       - key: TEMP_DIR
-        value: /tmp/govil_scraper
+        value: /var/data/govil_scraper
       - key: DISABLE_PLAYWRIGHT
         value: "1"
       - key: FLASK_SECRET_KEY
@@ -23,5 +23,5 @@ services:
         generateValue: true
     disk:
       name: scraper-data
-      mountPath: /tmp/govil_scraper
+      mountPath: /var/data/govil_scraper
       sizeGB: 1
