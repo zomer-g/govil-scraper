@@ -1,0 +1,45 @@
+name: Nadlan daily trigger
+
+# Free GitHub-hosted cron — sits outside Render and pings the trigger endpoint.
+# The endpoint records the event; the actual ~3-hour scrape runs on the local
+# worker machine (which polls OVER for tasks).
+#
+# Required secrets (Settings → Secrets and variables → Actions):
+#   NADLAN_TRIGGER_URL  — e.g. https://govil-scraper.onrender.com
+#   NADLAN_TRIGGER_KEY  — must match the same env var on Render
+#
+# Manual run: Actions tab → "Nadlan daily trigger" → "Run workflow".
+
+on:
+  schedule:
+    # 03:00 UTC daily = 06:00 Israel (winter) / 06:00 (summer is +3, so 06:00 either way roughly)
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      note:
+        description: 'Optional note to attach to the trigger event'
+        required: false
+        default: 'manual run from GitHub UI'
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: POST trigger to Render
+        env:
+          URL: ${{ secrets.NADLAN_TRIGGER_URL }}
+          KEY: ${{ secrets.NADLAN_TRIGGER_KEY }}
+          NOTE: ${{ github.event.inputs.note || 'scheduled daily run' }}
+        run: |
+          if [ -z "$URL" ] || [ -z "$KEY" ]; then
+            echo "::error::NADLAN_TRIGGER_URL or NADLAN_TRIGGER_KEY secret is missing."
+            exit 1
+          fi
+          curl -fsS -X POST \
+            -H "X-Trigger-Key: $KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"source\":\"github-actions\",\"note\":\"$NOTE\"}" \
+            "$URL/api/nadlan/notify-trigger"
+          echo
+          echo "Trigger sent to $URL"

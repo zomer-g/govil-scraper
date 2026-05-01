@@ -63,6 +63,10 @@ store = CollectionStore(TEMP_DIR)
 init_oauth(app)
 app.register_blueprint(auth_bp)
 
+# --- Lightweight nadlan helper endpoints (zero-cost on Render) ---
+from nadlan_api_routes import nadlan_api_bp
+app.register_blueprint(nadlan_api_bp)
+
 # --- Rate limiting ---
 limiter = Limiter(
     get_remote_address,
