@@ -18,9 +18,45 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
 
 def _cmd_worker(args: argparse.Namespace) -> int:
-    print(f"[govscraper] `worker --source {args.source}` not yet wired in phase A", file=sys.stderr)
-    print("[govscraper] use the existing worker.py / over_worker.py / nadlan_worker.py for now", file=sys.stderr)
-    return 2
+    """Boot the unified Worker against the chosen TaskSource."""
+    import os
+    from pathlib import Path
+
+    # Import scrapers package so registry self-registration runs.
+    from govscraper import scrapers as _scrapers  # noqa: F401
+    from govscraper.config import work_dir
+    from govscraper.worker import Worker
+
+    if args.source == "over":
+        from govscraper.worker.sources import OverOrgSource
+        api_key = args.key or os.environ.get("OVER_API_KEY")
+        if not api_key:
+            print("[govscraper] missing --key or OVER_API_KEY env var", file=sys.stderr)
+            return 2
+        source = OverOrgSource(api_key, poll_interval=int(args.poll_interval) or 30)
+    elif args.source == "local":
+        from govscraper.worker.sources import LocalServerSource
+        server = args.server or os.environ.get("RENDER_SERVER_URL") or os.environ.get("WORKER_SERVER_URL")
+        api_key = args.key or os.environ.get("WORKER_API_KEY")
+        worker_id = os.environ.get("WORKER_ID") or os.environ.get("HOSTNAME") or "worker-1"
+        if not (server and api_key):
+            print("[govscraper] missing --server/--key (or env vars)", file=sys.stderr)
+            return 2
+        source = LocalServerSource(server, api_key, worker_id, poll_interval=int(args.poll_interval) or 10)
+    elif args.source == "nadlan-queue":
+        from govscraper.worker.sources import NadlanQueueSource
+        server = args.server or os.environ.get("RENDER_SERVER_URL")
+        worker_id = os.environ.get("WORKER_ID") or os.environ.get("HOSTNAME") or "nadlan-worker-1"
+        if not server:
+            print("[govscraper] missing --server (or RENDER_SERVER_URL env)", file=sys.stderr)
+            return 2
+        source = NadlanQueueSource(server, worker_id, api_key=args.key)
+    else:
+        print(f"[govscraper] unknown --source {args.source!r}", file=sys.stderr)
+        return 2
+
+    Worker(source=source, work_dir=Path(work_dir()), poll_interval=float(args.poll_interval)).run()
+    return 0
 
 
 def _cmd_scrape(args: argparse.Namespace) -> int:
