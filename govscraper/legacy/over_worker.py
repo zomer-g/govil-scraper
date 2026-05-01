@@ -44,6 +44,30 @@ SERVER = "https://www.over.org.il"
 STATUS_FILE = os.environ.get("OVER_WORKER_STATUS_FILE", "worker_status.txt")
 
 
+def _archive_root() -> str:
+    """Resolve where to write `over_archives/<dataset_id>/...`.
+
+    Original layout placed this next to over_worker.py at the project root.
+    After the post-G move into govscraper/legacy/ the file's __file__ now
+    points 3 levels deep, so naïvely using `dirname(__file__)` would write
+    archives inside the package — non-obvious and pollutes site-packages
+    on installed deployments.
+
+    Resolution order:
+      1. $OVER_ARCHIVES_DIR    (operator override)
+      2. project root (3 levels up from this file)  — matches legacy behaviour
+      3. cwd                                          — script-style fallback
+    """
+    env = os.environ.get("OVER_ARCHIVES_DIR")
+    if env:
+        return env
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.abspath(os.path.join(here, "..", ".."))
+    if os.path.isdir(repo_root) and os.path.exists(os.path.join(repo_root, "over_worker.py")):
+        return repo_root
+    return os.getcwd()
+
+
 def _write_status(line: str) -> None:
     """Best-effort write of the worker's current state to a small file."""
     try:
@@ -392,11 +416,10 @@ class OverWorkerClient:
         _write_status(f"ARCHIVE on {source_url}")
 
         # Archive dir is kept next to the script and keyed by dataset ID so
-        # it survives multiple runs without re-bootstrapping.
-        archive_dir = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "over_archives", tracked_dataset_id,
-        )
+        # it survives multiple runs without re-bootstrapping. After the
+        # post-G package move, _archive_root() walks back up to the repo
+        # root so archives stay in their pre-refactor location.
+        archive_dir = os.path.join(_archive_root(), "over_archives", tracked_dataset_id)
         os.makedirs(archive_dir, exist_ok=True)
 
         # Load checkpoint from scraper_config; known_urls must be a set.
@@ -562,10 +585,7 @@ class OverWorkerClient:
         logger.info("=" * 70)
         _write_status("ARCHIVE nadlan_settlements")
 
-        archive_dir = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "over_archives", tracked_dataset_id,
-        )
+        archive_dir = os.path.join(_archive_root(), "over_archives", tracked_dataset_id)
         os.makedirs(archive_dir, exist_ok=True)
 
         raw_checkpoint = config.get("checkpoint")

@@ -25,7 +25,16 @@ from govscraper.worker.publishers import _contract as C  # noqa: E402
 
 
 def _read_over_worker_source() -> str:
-    with open(os.path.join(_ROOT, "over_worker.py"), encoding="utf-8") as f:
+    """Read the canonical over_worker source. After the post-G refactor the
+    file at the repo root is a thin re-export shim; the real literals live
+    at govscraper/legacy/over_worker.py."""
+    canonical = os.path.join(_ROOT, "govscraper", "legacy", "over_worker.py")
+    if os.path.exists(canonical):
+        path = canonical
+    else:
+        # Pre-refactor layout (still supported during transition)
+        path = os.path.join(_ROOT, "over_worker.py")
+    with open(path, encoding="utf-8") as f:
         return f.read()
 
 
