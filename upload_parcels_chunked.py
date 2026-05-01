@@ -47,6 +47,9 @@ def main():
     ap.add_argument("--chunk-size", type=int, default=25000)
     ap.add_argument("--filter-status", default="",
                     help="server-side filter (already applied client-side, optional)")
+    ap.add_argument("--pause", type=float, default=0.5,
+                    help="seconds to wait between chunks to avoid overwhelming "
+                         "the server (Render Starter is sensitive to bursts)")
     args = ap.parse_args()
 
     headers = {"X-Worker-Key": args.worker_key}
@@ -92,6 +95,8 @@ def main():
                     time.sleep(5 * (attempt + 1))
             else:
                 sys.exit(1)
+            if args.pause:
+                time.sleep(args.pause)
 
     print()
     print(f"DONE: {total_inserted:,} new, {total_skipped:,} skipped, "
