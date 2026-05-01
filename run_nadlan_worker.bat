@@ -1,6 +1,6 @@
 @echo off
 REM ========================================================================
-REM  Distributed nadlan worker — one-click runner for any helper machine
+REM  Distributed nadlan worker - one-click runner for any helper machine
 REM
 REM  What this does:
 REM    1. Verifies Python is on PATH (and offers a download link if not).
@@ -8,10 +8,7 @@ REM    2. Auto-installs requests + playwright + Chromium on first run.
 REM    3. Prompts for server URL and worker id (defaults handled).
 REM    4. Connects to the central queue and starts pulling tasks.
 REM
-REM  No need to clone the repo manually or set up a venv — drop this folder
-REM  on the machine, double-click this .bat, and the worker is online.
-REM
-REM  Stop with Ctrl+C. Re-run any time to resume; the server tracks state.
+REM  Stop with Ctrl+C. Re-run to resume; server tracks state.
 REM ========================================================================
 setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
@@ -22,7 +19,6 @@ echo   Nadlan Distributed Worker
 echo ============================================================
 echo.
 
-REM ---- 1. Python check -----------------------------------------------------
 where python >nul 2>nul
 if errorlevel 1 (
     echo [ERROR] python is not on PATH.
@@ -32,7 +28,6 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM ---- 2. Dependencies ----------------------------------------------------
 echo Checking dependencies...
 python -c "import requests, playwright" >nul 2>nul
 if errorlevel 1 (
@@ -46,10 +41,6 @@ if errorlevel 1 (
     )
 )
 
-REM ---- 3. Chromium browser ------------------------------------------------
-REM  Playwright stores Chromium under %USERPROFILE%\AppData\Local\ms-playwright.
-REM  A naive existence check would be brittle; just call playwright install
-REM  every time — it's a no-op if already installed.
 echo Ensuring Chromium is installed (no-op if already present)...
 python -m playwright install chromium >nul 2>nul
 if errorlevel 1 (
@@ -59,7 +50,6 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM ---- 4. Configuration ---------------------------------------------------
 echo.
 set "DEFAULT_SERVER=https://govil-scraper.onrender.com"
 set "SERVER=%NADLAN_SERVER_URL%"
@@ -71,7 +61,7 @@ if "%SERVER%"=="" set "SERVER=%DEFAULT_SERVER%"
 
 set "WORKER=%NADLAN_WORKER_ID%"
 if "%WORKER%"=="" set "WORKER=%COMPUTERNAME%"
-echo Worker ID: %WORKER%   ^(set NADLAN_WORKER_ID env var to override^)
+echo Worker ID: %WORKER%   (set NADLAN_WORKER_ID env var to override)
 
 echo.
 echo ============================================================
@@ -79,12 +69,11 @@ echo   Connecting to:  %SERVER%
 echo   Worker ID:      %WORKER%
 echo ============================================================
 echo.
-echo A Chromium window will pop up while scraping — leave it open.
+echo A Chromium window will pop up while scraping - leave it open.
 echo This worker will keep pulling tasks until you press Ctrl+C.
 echo Re-run this script any time to resume.
 echo.
 
-REM ---- 5. Run -------------------------------------------------------------
 python nadlan_worker.py --server "%SERVER%" --worker-id "%WORKER%"
 
 if errorlevel 1 (
