@@ -85,6 +85,33 @@ CREATE TABLE IF NOT EXISTS scheduled_archives (
 );
 """
 
+# Distributed bulk-nadlan task queue: one row per (gush, chelka). Workers claim
+# tasks atomically and upload deals back to the central deals_master.csv.
+NADLAN_TASKS_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS nadlan_tasks (
+    parcel_id      TEXT PRIMARY KEY,           -- '{gush}-{chelka}'
+    gush           TEXT NOT NULL,
+    chelka         TEXT NOT NULL,
+    locality       TEXT DEFAULT '',
+    municipality   TEXT DEFAULT '',
+    parcel_type    TEXT DEFAULT '',
+    status_text    TEXT DEFAULT '',            -- 'מוסדר' etc.
+    legal_area_sqm TEXT DEFAULT '',
+    area_sqm       TEXT DEFAULT '',
+    centroid_lat   TEXT DEFAULT '',
+    centroid_lon   TEXT DEFAULT '',
+    state          TEXT DEFAULT 'pending',     -- pending|claimed|done|failed
+    worker_id      TEXT DEFAULT '',
+    deals_count    INTEGER DEFAULT 0,
+    error          TEXT DEFAULT '',
+    created_at     TEXT NOT NULL,
+    claimed_at     TEXT DEFAULT '',
+    completed_at   TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_nadlan_state ON nadlan_tasks(state);
+CREATE INDEX IF NOT EXISTS idx_nadlan_claimed ON nadlan_tasks(claimed_at);
+"""
+
 
 class CollectionStore:
     """Multi-process-safe SQLite store for collections, files, and tasks.
@@ -106,6 +133,7 @@ class CollectionStore:
                     conn.executescript(FILES_SCHEMA_SQL)
                     conn.executescript(TASKS_SCHEMA_SQL)
                     conn.executescript(ARCHIVES_SCHEMA_SQL)
+                    conn.executescript(NADLAN_TASKS_SCHEMA_SQL)
                     conn.commit()
                 break
             except sqlite3.OperationalError as e:
@@ -601,3 +629,187 @@ class CollectionStore:
         except (json.JSONDecodeError, TypeError):
             d["checkpoint"] = {}
         return d
+
+    # ---- Nadlan distributed bulk task queue --------------------------------
+
+    # Columns from a parcels.csv row that we copy into the task. The worker
+    # uses these to enrich each deal it scrapes (locality, lat/lon, etc.).
+    _NADLAN_PARCEL_COLS = (
+        "gush", "chelka", "locality", "municipality", "parcel_type",
+        "status", "legal_area_sqm", "area_sqm",
+        "centroid_lat", "centroid_lon",
+    )
+
+    def nadlan_create_tasks(self, rows: list[dict]) -> dict:
+        """Bulk-insert pending tasks. Existing parcel_ids are silently skipped
+        via INSERT OR IGNORE (idempotent — re-running queue is safe).
+
+        Returns {"inserted": N, "skipped": M}.
+        """
+        now = datetime.now().isoformat(timespec="seconds")
+        inserted = 0
+        skipped = 0
+        with self._lock, self._connect() as conn:
+            for r in rows:
+                gush = (r.get("gush") or "").strip()
+                chelka = (r.get("chelka") or "").strip()
+                if not gush or not chelka:
+                    skipped += 1
+                    continue
+                parcel_id = f"{gush}-{chelka}"
+                cur = conn.execute(
+                    """INSERT OR IGNORE INTO nadlan_tasks
+                       (parcel_id, gush, chelka, locality, municipality,
+                        parcel_type, status_text, legal_area_sqm,
+                        area_sqm, centroid_lat, centroid_lon,
+                        created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        parcel_id, gush, chelka,
+                        r.get("locality", "") or "",
+                        r.get("municipality", "") or "",
+                        r.get("parcel_type", "") or "",
+                        r.get("status", "") or "",
+                        str(r.get("legal_area_sqm", "") or ""),
+                        str(r.get("area_sqm", "") or ""),
+                        str(r.get("centroid_lat", "") or ""),
+                        str(r.get("centroid_lon", "") or ""),
+                        now,
+                    ),
+                )
+                if cur.rowcount > 0:
+                    inserted += 1
+                else:
+                    skipped += 1
+            conn.commit()
+        return {"inserted": inserted, "skipped": skipped}
+
+    def nadlan_claim_tasks(self, worker_id: str, count: int = 1) -> list[dict]:
+        """Atomically claim up to ``count`` pending tasks for ``worker_id``.
+
+        Returns list of task dicts (may be empty if no work available).
+        """
+        if count < 1:
+            return []
+        now = datetime.now().isoformat(timespec="seconds")
+        claimed: list[dict] = []
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """SELECT parcel_id FROM nadlan_tasks
+                   WHERE state = 'pending'
+                   ORDER BY created_at ASC
+                   LIMIT ?""",
+                (count,),
+            ).fetchall()
+            for row in rows:
+                pid = row["parcel_id"]
+                conn.execute(
+                    """UPDATE nadlan_tasks
+                       SET state = 'claimed', worker_id = ?, claimed_at = ?
+                       WHERE parcel_id = ? AND state = 'pending'""",
+                    (worker_id, now, pid),
+                )
+            conn.commit()
+            # Re-fetch full task rows for the IDs we claimed.
+            for row in rows:
+                full = conn.execute(
+                    "SELECT * FROM nadlan_tasks WHERE parcel_id = ?",
+                    (row["parcel_id"],),
+                ).fetchone()
+                if full and full["worker_id"] == worker_id:
+                    claimed.append(dict(full))
+        return claimed
+
+    def nadlan_complete_task(self, parcel_id: str, deals_count: int) -> bool:
+        """Mark a parcel done after the worker successfully scraped it."""
+        now = datetime.now().isoformat(timespec="seconds")
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                """UPDATE nadlan_tasks
+                   SET state = 'done', deals_count = ?,
+                       completed_at = ?, error = ''
+                   WHERE parcel_id = ?""",
+                (int(deals_count or 0), now, parcel_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+    def nadlan_fail_task(self, parcel_id: str, error: str,
+                         transient: bool = True) -> bool:
+        """Record a worker failure.
+
+        ``transient=True`` (network error) → state goes back to ``pending`` so
+        the same or another worker retries it later. ``transient=False`` (real
+        bug, parsing crash) → state goes to ``failed`` and won't be retried.
+        """
+        now = datetime.now().isoformat(timespec="seconds")
+        new_state = "pending" if transient else "failed"
+        worker_id = "" if transient else None  # release on transient
+        with self._lock, self._connect() as conn:
+            if transient:
+                cur = conn.execute(
+                    """UPDATE nadlan_tasks
+                       SET state = 'pending', worker_id = '',
+                           claimed_at = '', error = ?
+                       WHERE parcel_id = ?""",
+                    (str(error)[:500], parcel_id),
+                )
+            else:
+                cur = conn.execute(
+                    """UPDATE nadlan_tasks
+                       SET state = 'failed', completed_at = ?, error = ?
+                       WHERE parcel_id = ?""",
+                    (now, str(error)[:500], parcel_id),
+                )
+            conn.commit()
+            return cur.rowcount > 0
+
+    def nadlan_status(self) -> dict:
+        """Return aggregate counts for the queue."""
+        with self._connect() as conn:
+            counts = {r["state"]: r["c"] for r in conn.execute(
+                "SELECT state, COUNT(*) AS c FROM nadlan_tasks GROUP BY state"
+            ).fetchall()}
+            total_deals = conn.execute(
+                "SELECT COALESCE(SUM(deals_count), 0) AS t FROM nadlan_tasks"
+            ).fetchone()["t"]
+        total = sum(counts.values())
+        return {
+            "pending":  counts.get("pending", 0),
+            "claimed":  counts.get("claimed", 0),
+            "done":     counts.get("done", 0),
+            "failed":   counts.get("failed", 0),
+            "total":    total,
+            "deals_collected": int(total_deals or 0),
+        }
+
+    def nadlan_reset_stale(self, timeout_seconds: int = 600) -> int:
+        """Return claimed tasks that have been stuck > ``timeout_seconds`` to
+        ``pending`` so another worker can pick them up. Returns count reset.
+        """
+        cutoff = (datetime.now() - timedelta(seconds=timeout_seconds)
+                  ).isoformat(timespec="seconds")
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                """UPDATE nadlan_tasks
+                   SET state = 'pending', worker_id = '', claimed_at = ''
+                   WHERE state = 'claimed' AND claimed_at < ?""",
+                (cutoff,),
+            )
+            conn.commit()
+            return cur.rowcount
+
+    def nadlan_clear(self) -> int:
+        """Drop all queued tasks. Returns count cleared. (Admin / testing.)"""
+        with self._lock, self._connect() as conn:
+            cur = conn.execute("DELETE FROM nadlan_tasks")
+            conn.commit()
+            return cur.rowcount
+
+    def nadlan_get_task(self, parcel_id: str) -> Optional[dict]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM nadlan_tasks WHERE parcel_id = ?",
+                (parcel_id,),
+            ).fetchone()
+        return dict(row) if row else None
