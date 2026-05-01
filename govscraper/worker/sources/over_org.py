@@ -32,9 +32,10 @@ class OverOrgSource:
     name = "over.org.il"
 
     def __init__(self, api_key: str, *, poll_interval: int = 30, publisher: ResultPublisher | None = None):
-        # Lazy import keeps over_worker (and its requests/cloudscraper deps)
-        # off the hot path for non-over deployments.
-        from over_worker import OverWorkerClient
+        # Lazy import keeps the legacy worker (and its requests/cloudscraper deps)
+        # off the hot path for non-over deployments. Import the canonical path
+        # directly rather than going through the over_worker.py shim.
+        from govscraper.legacy.over_worker import OverWorkerClient
         self._client = OverWorkerClient(api_key, poll_interval=poll_interval)
         self._api_key = api_key
         self._publisher = publisher

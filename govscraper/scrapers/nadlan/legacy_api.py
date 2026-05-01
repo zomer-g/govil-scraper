@@ -1,6 +1,15 @@
 """
 Nadlan.gov.il (Israeli Tax Authority real-estate transactions) — API client.
 
+⚠️  KNOWN ISSUE (verified 2026-05-02):  As of this date the SPA at
+nadlan.gov.il no longer issues the `POST /deal-data` request automatically
+on page load — it appears to require an explicit user gesture or has been
+reworked behind a different endpoint. tests/nadlan/test_validation.py B1/B3
+fail with `items=0` for that reason. The fetch_parcel_deals implementation
+below is unchanged from when it worked; the failure is real-world API drift,
+not a regression in this codebase. Re-verification of the protocol is
+needed before relying on this scraper for new collections.
+
 Background — reverse-engineered from the SPA's JS bundle on 2026-04-28:
 
 The SPA at https://www.nadlan.gov.il/?view=kparcel_all&id=<gush>-<chelka>&page=deals

@@ -19,7 +19,7 @@ class LocalCollectionsPublisher:
     def __init__(self, *, client: Any | None = None, server_url: str | None = None,
                  api_key: str | None = None, worker_id: str | None = None):
         if client is None:
-            from worker import WorkerClient
+            from govscraper.legacy.worker_client import WorkerClient
             if not (server_url and api_key and worker_id):
                 raise ValueError(
                     "LocalCollectionsPublisher needs either an existing client= or "

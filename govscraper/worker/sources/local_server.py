@@ -34,7 +34,7 @@ class LocalServerSource:
         poll_interval: int = 10,
         publisher: ResultPublisher | None = None,
     ):
-        from worker import WorkerClient
+        from govscraper.legacy.worker_client import WorkerClient
         self._client = WorkerClient(
             server_url=server_url,
             api_key=api_key,

@@ -17,7 +17,7 @@ class NadlanQueuePublisher:
                  server_url: str | None = None, worker_id: str | None = None,
                  api_key: str | None = None):
         if client is None:
-            from nadlan_worker import NadlanWorkerClient
+            from govscraper.legacy.nadlan_worker import NadlanWorkerClient
             if not (server_url and worker_id):
                 raise ValueError(
                     "NadlanQueuePublisher needs an existing client= or "

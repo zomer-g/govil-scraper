@@ -38,7 +38,9 @@ class OverOrgPublisher:
 
     def __init__(self, api_key: str, *, _client: Any = None):
         if _client is None:
-            from over_worker import OverWorkerClient
+            # Import the canonical path directly; the over_worker.py at the
+            # repo root is a shim that round-trips back to govscraper/legacy/.
+            from govscraper.legacy.over_worker import OverWorkerClient
             _client = OverWorkerClient(api_key)
         self._client = _client
         self._api_key = api_key

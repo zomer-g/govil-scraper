@@ -40,7 +40,7 @@ class NadlanQueueSource:
         api_key: str | None = None,
         publisher: ResultPublisher | None = None,
     ):
-        from nadlan_worker import NadlanWorkerClient
+        from govscraper.legacy.nadlan_worker import NadlanWorkerClient
         self._client = NadlanWorkerClient(
             server_url=server_url,
             worker_id=worker_id,
