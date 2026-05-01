@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
-"""
-גרסאות לעם — Worker Client for over.org.il
+"""גרסאות לעם — Worker Client for over.org.il.
 
-Polls over.org.il for scrape tasks, executes them locally using the
-govil-scraper engine, and pushes results back via the push-version API.
+DEPRECATED entry point — prefer:
+    python -m govscraper.cli worker --source over --key <OVER_API_KEY>
 
-Usage:
+The new CLI uses OverOrgSource + OverOrgPublisher (govscraper.worker.*),
+which delegate poll/progress/upload-zip/upload-csv/push-version to the
+OverWorkerClient class defined below. This file remains the live
+production entry until the CLI path has run for one release cycle.
+
+The wire-format contract is captured byte-for-byte in
+govscraper/worker/publishers/_contract.py; tests/contract/test_over_org.py
+pins each constant against the literals here, so any drift on either
+side trips the test.
+
+Legacy usage:
     python over_worker.py --key <API_KEY>
     python over_worker.py  # uses OVER_API_KEY env var
 """

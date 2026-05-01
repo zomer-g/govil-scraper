@@ -1,9 +1,13 @@
-"""
-Distributed bulk-nadlan worker. Run on any number of machines simultaneously.
+"""Distributed bulk-nadlan worker.
+
+DEPRECATED entry point — prefer:
+    python -m govscraper.cli worker --source nadlan-queue --server <URL>
 
 Each instance polls the central server for parcel tasks, scrapes them via
 ``nadlan_api.fetch_parcel_deals``, and uploads the deals back. The server
 is the single source of truth (see nadlan_api_routes.py + storage.py).
+The unified CLI uses NadlanQueueSource which wraps the NadlanWorkerClient
+class defined here, so the on-the-wire behaviour is identical.
 
 Quick start::
 

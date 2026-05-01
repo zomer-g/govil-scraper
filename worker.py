@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""
-Gov.il Scraper — Remote Worker Client
+"""Remote Worker Client — polls our Render server for scrape tasks.
 
-Polls a Render server for scrape tasks, executes them locally,
-and uploads results back.
+DEPRECATED entry point — prefer:
+    python -m govscraper.cli worker --source local --server <URL> --key <API_KEY>
 
-Usage:
+This script remains the production-running worker (Phase D wired up
+LocalServerSource as a thin facade over WorkerClient defined here, so
+both paths share the on-the-wire behaviour). It will be removed after
+the new CLI has run in production for one release cycle.
+
+Legacy usage:
     python worker.py --server https://govil-scraper.onrender.com --key <API_KEY>
-    python worker.py  # uses RENDER_SERVER_URL and WORKER_API_KEY env vars
+    python worker.py  # uses RENDER_SERVER_URL + WORKER_API_KEY env vars
 """
 
 import argparse

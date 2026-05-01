@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
-"""
-Local Gov.il Scraper CLI — scrape data and files to a local folder,
-optionally upload to a remote server.
+"""Local Gov.il Scraper CLI.
 
-Usage:
+DEPRECATED entry point — prefer:
+    python -m govscraper.cli scrape <URL>           (or: start.bat scrape <URL>)
+
+This script keeps working for back-compat, but new features land in the
+unified CLI under govscraper/cli.py. Will be removed after a release of
+stability with the new entry point.
+
+Usage (legacy):
     python local_scrape.py --url <GOV_IL_URL> [--dest ./scraped_data] [--no-files]
-    python local_scrape.py --url <URL> --upload --server https://govil-scraper.onrender.com --token <ADMIN_TOKEN>
-
-Features:
-    - Saves to dest/{collector_name}/ subfolder
-    - Skips files that already exist (won't re-download)
-    - Exports CSV + Excel
-    - Optional --upload to push scraped data to remote server
+    python local_scrape.py --url <URL> --upload --server https://...onrender.com --token <ADMIN_TOKEN>
 """
 
 import argparse
