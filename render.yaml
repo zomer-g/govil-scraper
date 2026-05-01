@@ -24,4 +24,4 @@ services:
     disk:
       name: scraper-data
       mountPath: /var/data/govil_scraper
-      sizeGB: 1
+      sizeGB: 5
