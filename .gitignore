@@ -37,6 +37,5 @@ worker_data/
 collections.db
 collections.db-*
 _doc_test*/
-_*.py
-!__init__.py
-!__main__.py
+_scratch*.py
+_test_*.py
