@@ -37,14 +37,14 @@ class GovIlScraper(BaseScraper):
         # Traditional / ContentPage). It raises InvalidURLError for unsupported
         # paths — translate that to None so the registry can keep searching.
         try:
-            from scraper_engine import parse_gov_url
+            from .legacy_engine import parse_gov_url
             legacy = parse_gov_url(url)
         except Exception:
             return None
         return legacy_parsed_to_new(legacy, scraper_id=cls.id)
 
     def fetch(self, parsed: ParsedURL, *, progress: ProgressFn) -> ScrapeResult:
-        from scraper_engine import GovILScraper, GovILSession
+        from .legacy_engine import GovILScraper, GovILSession
 
         legacy_parsed = parsed.params.get("_legacy")
 

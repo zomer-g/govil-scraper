@@ -91,40 +91,53 @@ desktop).
 
 The scraper auto-detects what to do based on the URL host:
 
-| Source | URL pattern | Backend |
+| Source | URL pattern | Scraper class |
 |---|---|---|
-| **gov.il DynamicCollectors** | `/he/departments/dynamiccollectors/<name>` | `scraper_engine._scrape_dynamic` |
-| **gov.il Collectors** (traditional) | `/he/collectors/<name>` | `scraper_engine._scrape_traditional` |
-| **gov.il Pages** (React SPA) | `/he/pages/<name>` | `scraper_engine._scrape_content_page` |
-| **nadlan.gov.il parcel deals** | `?view=kparcel_all&id=<gush>-<chelka>` | `scraper_engine._scrape_nadlan` (Playwright) |
-| **govmap.gov.il GIS layers** | `?lay=<layerId>` | `govmap_engine.scrape_govmap` (OGC WFS) |
+| **gov.il DynamicCollectors** | `/he/departments/dynamiccollectors/<name>` | `govscraper.scrapers.govil.GovIlScraper` (DynamicCollector path) |
+| **gov.il Collectors** (traditional) | `/he/collectors/<name>` | `govscraper.scrapers.govil.GovIlScraper` (Traditional path) |
+| **gov.il Pages** (React SPA) | `/he/pages/<name>` | `govscraper.scrapers.govil.GovIlScraper` (ContentPage path) |
+| **nadlan.gov.il parcel deals** | `?view=kparcel_all&id=<gush>-<chelka>` | `govscraper.scrapers.nadlan.NadlanScraper` (Playwright) |
+| **govmap.gov.il GIS layers** | `?lay=<layerId>` | `govscraper.scrapers.govmap.GovMapScraper` (OGC WFS) |
+| **data.gov.il datasets** (CKAN) | `/dataset[/<name>[/resource/<uuid>]]` | `govscraper.scrapers.datagovil.DataGovIlScraper` |
 
-All flow through the same `/api/scrape` endpoint and produce the same
-`ScrapeResult` shape; see [GovMap GIS layers](#govmap-gis-layers) below
-for what's special about geospatial output (additional `.geojson` file).
+All flow through the same `/api/scrape` endpoint and produce one of three
+result shapes (`TabularResult`, `CkanCatalogResult`, `GeoFeatureResult`)
+under a single `ScrapeResult` union; see [GovMap GIS layers](#govmap-gis-layers)
+below for what's special about geospatial output (additional `.geojson` file).
 
-**Key abstractions** (file ↦ purpose):
+### Package layout (post-refactor)
 
-| File | Purpose |
+The codebase was reorganised into a single `govscraper/` package. Top-level
+modules (`scraper_engine.py`, `over_worker.py`, `file_handler.py`, …) are
+now thin re-export shims that forward to the canonical implementations
+under the package — every existing `from <module> import …` keeps working.
+New code should import from `govscraper.*` directly.
+
+| Canonical path | Purpose |
+|---|---|
+| [`govscraper/cli.py`](govscraper/cli.py) | Unified entry: `python -m govscraper.cli {serve,worker,scrape,bulk-nadlan}` |
+| [`govscraper/scrapers/base.py`](govscraper/scrapers/base.py) | `BaseScraper`, `ScrapeResult` union, `ParsedURL`, `Checkpoint` |
+| [`govscraper/scrapers/registry.py`](govscraper/scrapers/registry.py) | URL → scraper dispatch (auto-registers all 4 scrapers on import) |
+| [`govscraper/scrapers/govil/`](govscraper/scrapers/govil/) | gov.il (Dynamic + Traditional + ContentPage). Engine at `legacy_engine.py`; facade at `scraper.py`. |
+| [`govscraper/scrapers/datagovil/`](govscraper/scrapers/datagovil/) | data.gov.il CKAN: `package_search`, `package_show`, `datastore_search`. |
+| [`govscraper/scrapers/nadlan/`](govscraper/scrapers/nadlan/) | nadlan.gov.il parcel + settlement engines. Playwright-driven. |
+| [`govscraper/scrapers/govmap/`](govscraper/scrapers/govmap/) | govmap.gov.il OGC WFS + `layers.json`. |
+| [`govscraper/worker/`](govscraper/worker/) | Unified `Worker` + 3 `TaskSource`s (`local_server`, `over_org`, `nadlan_queue`) + 3 `ResultPublisher`s. |
+| [`govscraper/worker/publishers/_contract.py`](govscraper/worker/publishers/_contract.py) | **Frozen** over.org.il wire-format constants — pinned by `tests/contract/test_over_org.py`. |
+| [`govscraper/io/`](govscraper/io/) | CSV / Excel / GeoJSON / ZIP writers, attachment downloader, `sanitize_filename`. |
+| [`govscraper/geo/`](govscraper/geo/) | ITM ↔ WGS84 ↔ Web Mercator transforms; OGC WFS 2.0 client. |
+| [`govscraper/legacy/`](govscraper/legacy/) | Legacy `worker.py`, `over_worker.py`, `nadlan_worker.py` clients (kept until the unified CLI worker has run for one release cycle). |
+
+| Top-level (still here, unchanged) | Purpose |
 |------|---------|
 | [`app.py`](app.py) | Flask web app: UI, admin API, worker queue, archives. Hosted on Render. |
-| [`scraper_engine.py`](scraper_engine.py) | Core scraper: URL parsing, page-type dispatch, pagination. Routes govmap URLs to `govmap_engine`. |
-| [`govmap_engine.py`](govmap_engine.py) | GovMap GIS scraper via the public OGC WFS at `/api/geoserver/wfs`. Loads `layers.json`. |
-| [`govmap_api_routes.py`](govmap_api_routes.py) | Blueprint: `/api/govmap/layers`, `/api/govmap/preview-bbox`. |
-| [`coords.py`](coords.py) | ITM (EPSG:2039) ↔ WGS84 ↔ Web Mercator transforms (pyproj). |
-| [`wfs_client.py`](wfs_client.py) | Thin OGC WFS 2.0 REST client (used by `govmap_engine`). |
-| [`archive_engine.py`](archive_engine.py) | Incremental archive (bootstrap + delta) for traditional collectors. |
-| [`nadlan_api.py`](nadlan_api.py) | Playwright-driven nadlan single-parcel scraper. |
-| [`nadlan_incremental_engine.py`](nadlan_incremental_engine.py) | Settlement-level nadlan bootstrap + daily incremental. |
-| [`nadlan_api_routes.py`](nadlan_api_routes.py) | Public HTTP helpers: `/parcel-info`, `/settlements`, `/notify-trigger`. |
-| [`worker.py`](worker.py) | Worker that polls the Render Flask app for delegated scrapes. |
-| [`over_worker.py`](over_worker.py) | Worker that polls `over.org.il` for tracked-dataset tasks. |
-| [`bulk_nadlan.py`](bulk_nadlan.py) | Standalone CLI: scrape every parcel in a CSV (with checkpoint + circuit breaker). |
-| [`incremental_nadlan_daily.py`](incremental_nadlan_daily.py) | Standalone CLI for the daily nadlan delta. |
-| [`catalog/parcels_shapefile.py`](catalog/parcels_shapefile.py) | Builds `parcels.csv` from the Israel Mapping Center helkot shapefile. |
 | [`auth.py`](auth.py) | Google OAuth2 SSO + admin/worker auth decorators. |
 | [`storage.py`](storage.py) | SQLite-backed collection store. |
-| [`file_handler.py`](file_handler.py) | CSV/Excel export, attachment downloads. |
+| [`govmap_api_routes.py`](govmap_api_routes.py) | Flask blueprint: `/api/govmap/layers`, `/api/govmap/preview-bbox`. |
+| [`nadlan_api_routes.py`](nadlan_api_routes.py) | Flask blueprint: `/parcel-info`, `/settlements`, `/notify-trigger`, distributed bulk queue. |
+| [`bulk_nadlan.py`](bulk_nadlan.py), [`incremental_nadlan_daily.py`](incremental_nadlan_daily.py) | Standalone CLIs for nadlan batch + daily delta (will fold into `cli.py bulk-nadlan`). |
+| [`catalog/parcels_shapefile.py`](catalog/parcels_shapefile.py) | Builds `parcels.csv` from the Israel Mapping Center helkot shapefile. |
+| [`scraper_engine.py`, `over_worker.py`, `worker.py`, `nadlan_worker.py`, `file_handler.py`, `archive_engine.py`, `govmap_engine.py`, `nadlan_api.py`, `nadlan_incremental_engine.py`, `coords.py`, `wfs_client.py`] | **Re-export shims only** — point at the canonical govscraper/ paths. |
 
 ---
 
@@ -743,35 +756,58 @@ older smoke tools for the gov.il scraper itself.
 
 ```
 .
-├── app.py                          Flask app — UI, admin API, worker queue
+├── govscraper/                     Canonical package — everything authoritative lives here
+│   ├── cli.py                      Unified entry: serve | worker | scrape | bulk-nadlan
+│   ├── types.py                    Task, Progress, ParsedURL, FileAttachment, Checkpoint
+│   ├── config.py                   Env-var helpers (TEMP_DIR, OVER_API_KEY, …)
+│   ├── scrapers/
+│   │   ├── base.py                 BaseScraper + ScrapeResult union
+│   │   ├── registry.py             URL → scraper dispatch
+│   │   ├── govil/                  www.gov.il (legacy_engine.py + scraper.py + _fields.py)
+│   │   ├── datagovil/              data.gov.il CKAN (ckan_client.py + scraper.py + _fields.py)
+│   │   ├── nadlan/                 nadlan.gov.il parcel + settlement engines
+│   │   └── govmap/                 govmap.gov.il OGC WFS + layers.json
+│   ├── worker/                     Worker + 3 sources + 3 publishers
+│   │   ├── runner.py               Main loop, throttled progress, heartbeat thread
+│   │   ├── sources/                local_server / over_org / nadlan_queue
+│   │   └── publishers/             local_collections / over_org / nadlan_queue + _contract.py
+│   ├── io/                         CSV / Excel / GeoJSON / ZIP / attachments / sanitize
+│   ├── geo/                        coords (ITM ↔ WGS84 ↔ WM) + WFSClient
+│   ├── http/                       Shared HTTP plumbing
+│   ├── storage/                    SQLite store entry point
+│   ├── web/                        Flask web layer entry point
+│   └── legacy/                     worker.py / over_worker.py / nadlan_worker.py clients
+├── app.py                          Flask app — UI, admin API, worker queue (still here)
 ├── auth.py                         Google OAuth2 + auth decorators
-├── scraper_engine.py               Core gov.il scraper engine
-├── archive_engine.py               Incremental archive (gov.il)
-├── nadlan_api.py                   Single-parcel nadlan scraper (Playwright)
-├── nadlan_incremental_engine.py    Settlement-level nadlan bootstrap + delta
-├── nadlan_api_routes.py            Public HTTP helpers + distributed bulk queue
-├── bulk_nadlan.py                  Bulk parcel scrape CLI (with checkpoint, single-machine)
-├── nadlan_worker.py                Distributed bulk worker (multi-machine)
+├── storage.py                      SQLite store
+├── govmap_api_routes.py            Flask blueprint: /api/govmap/*
+├── nadlan_api_routes.py            Flask blueprint: /parcel-info, /settlements, /bulk-*
+├── bulk_nadlan.py                  Bulk parcel scrape CLI (single-machine, with checkpoint)
 ├── incremental_nadlan_daily.py     Daily nadlan incremental CLI
 ├── run_single_parcel.py            One-shot single-parcel CLI
-├── catalog/
-│   └── parcels_shapefile.py        Build parcels.csv from IMC shapefile
-├── worker.py                       Local worker for the Flask task queue
-├── over_worker.py                  Local worker for over.org.il
-├── storage.py                      SQLite store
-├── file_handler.py                 CSV/Excel/ZIP export helpers
-├── incremental_update.py           CLI scheduler wrapper for archive_engine
-├── local_scrape.py                 Standalone scrape CLI (no Flask)
+├── catalog/parcels_shapefile.py    Build parcels.csv from IMC shapefile
 ├── benchmark.py                    Throughput benchmarks
-├── tests/nadlan/                   Validation suite + post-run quality check
+│
+├── scraper_engine.py · over_worker.py · worker.py · nadlan_worker.py
+├── file_handler.py · archive_engine.py · govmap_engine.py · nadlan_api.py
+├── nadlan_incremental_engine.py · coords.py · wfs_client.py
+│      ↑↑↑ all of these are re-export shims pointing into govscraper/  ↑↑↑
+│
+├── layers.json                     GovMap layer catalog (loaded by govscraper/scrapers/govmap)
+├── tests/
+│   ├── test_coords.py              Geo transforms
+│   ├── contract/test_over_org.py   Pins over.org.il wire-format byte-for-byte
+│   ├── scrapers/                   URL-parser tests per scraper (govil, nadlan, govmap, datagovil)
+│   └── nadlan/                     Live nadlan validation + distributed-flow checks
 ├── templates/index.html            Single-page admin UI
 ├── static/                         CSS / JS / icons
+├── docs/glossary.md                Identifier conventions + _fields.py reference
 ├── .github/workflows/
 │   └── nadlan-daily.yml            Daily trigger ping
 ├── run_worker.bat                  Windows launcher — Flask worker
 ├── run_over_worker.bat             Windows launcher — OVER worker
 ├── run_nadlan.bat                  Windows launcher — nadlan tools menu (single/bulk/daily)
-├── run_nadlan_worker.bat           Windows launcher — distributed worker (auto-installs deps)
+├── run_nadlan_worker.bat           Windows launcher — distributed worker
 ├── render.yaml                     Render service config
 ├── Dockerfile                      Container build
 ├── requirements.txt                Python deps

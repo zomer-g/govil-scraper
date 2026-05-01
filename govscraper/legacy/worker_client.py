@@ -142,11 +142,11 @@ class WorkerClient:
 
     def execute_task(self, task: dict):
         """Execute a single scrape task."""
-        from scraper_engine import (
+        from govscraper.scrapers.govil.legacy_engine import (
             GovILSession, GovILScraper, GovILScraperError,
             InvalidURLError, CloudflareBlockError,
         )
-        from file_handler import FileHandler
+        from govscraper.io.file_handler import FileHandler
 
         task_id = task["id"]
         url = task["url"]

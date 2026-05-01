@@ -23,15 +23,15 @@ class GovMapScraper(BaseScraper):
         if not host.endswith("govmap.gov.il"):
             return None
         try:
-            from scraper_engine import parse_gov_url
+            from ..govil.legacy_engine import parse_gov_url
             legacy = parse_gov_url(url)
         except Exception:
             return None
         return legacy_parsed_to_new(legacy, scraper_id=cls.id)
 
     def fetch(self, parsed: ParsedURL, *, progress: ProgressFn) -> ScrapeResult:
-        from govmap_engine import scrape_govmap
-        from scraper_engine import GovILSession
+        from .legacy_engine import scrape_govmap
+        from ..govil.legacy_engine import GovILSession
 
         legacy_parsed = parsed.params.get("_legacy")
 

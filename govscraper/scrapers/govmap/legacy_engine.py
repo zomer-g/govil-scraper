@@ -22,9 +22,9 @@ from dataclasses import dataclass, field, asdict
 from typing import Callable, List, Optional, Tuple
 from urllib.parse import urlparse, parse_qs
 
-import coords
-from wfs_client import WFSClient, WFSError
-from scraper_engine import (
+from govscraper.geo import coords
+from govscraper.geo.wfs_client import WFSClient, WFSError
+from govscraper.scrapers.govil.legacy_engine import (
     PageType, ParsedURL, ScrapeResult, FileAttachment,
     InvalidURLError, GovILScraperError,
 )

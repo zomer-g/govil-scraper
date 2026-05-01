@@ -331,7 +331,7 @@ def parse_gov_url(url: str) -> ParsedURL:
     # GovMap.gov.il GIS layer: ?lay=<id>(&c=x,y or &bbox=...)
     if host.endswith("govmap.gov.il"):
         # Lazy import to avoid loading pyproj/wfs deps for non-govmap users
-        from govmap_engine import parse_govmap_url
+        from govscraper.scrapers.govmap.legacy_engine import parse_govmap_url
         return parse_govmap_url(url, params)
 
     # Nadlan.gov.il parcel page: ?view=kparcel_all&id=<gush>-<chelka>
@@ -641,7 +641,7 @@ class GovILScraper:
         elif parsed.page_type == PageType.NADLAN_PARCEL:
             return self._scrape_nadlan(parsed)
         elif parsed.page_type == PageType.GOVMAP_LAYER:
-            from govmap_engine import scrape_govmap
+            from govscraper.scrapers.govmap.legacy_engine import scrape_govmap
             return scrape_govmap(self.session, parsed,
                                  progress_callback=self.progress)
         else:
@@ -970,7 +970,7 @@ class GovILScraper:
         site's reCAPTCHA) and intercepts the /deal-data + /deal-info responses.
         See nadlan_api.py for the protocol notes.
         """
-        from nadlan_api import fetch_parcel_deals, order_columns
+        from govscraper.scrapers.nadlan.legacy_api import fetch_parcel_deals, order_columns
 
         gush = parsed.query_params.get("gush")
         chelka = parsed.query_params.get("chelka")

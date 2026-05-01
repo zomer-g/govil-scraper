@@ -17,8 +17,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
 from openpyxl.utils import get_column_letter
 
-from scraper_engine import GovILSession, ScrapeResult, FileAttachment
-from govscraper.io.sanitize import sanitize_filename  # canonical location since phase B
+from govscraper.scrapers.govil.legacy_engine import GovILSession, ScrapeResult, FileAttachment
+from govscraper.io.sanitize import sanitize_filename
 
 logger = logging.getLogger(__name__)
 

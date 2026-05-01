@@ -22,8 +22,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
-from file_handler import sanitize_filename
-from scraper_engine import GovILScraper, GovILSession
+from govscraper.io.sanitize import sanitize_filename
+from govscraper.scrapers.govil.legacy_engine import GovILScraper, GovILSession
 
 logger = logging.getLogger(__name__)
 

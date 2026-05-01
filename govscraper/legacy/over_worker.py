@@ -397,8 +397,8 @@ class OverWorkerClient:
           - If 0 new items, mark the task done without creating a new version.
           - Persist the updated checkpoint back to the server via scraper_config_patch.
         """
-        from archive_engine import run_bootstrap, run_incremental
-        from scraper_engine import (
+        from govscraper.io.archive_engine import run_bootstrap, run_incremental
+        from govscraper.scrapers.govil.legacy_engine import (
             GovILSession, GovILScraperError,
             InvalidURLError, CloudflareBlockError,
         )
@@ -571,7 +571,7 @@ class OverWorkerClient:
           - bootstrap/incremental signatures take no source_url
           - lookback_days + settlements_filter come from scraper_config
         """
-        from nadlan_incremental_engine import run_bootstrap, run_incremental
+        from govscraper.scrapers.nadlan.legacy_incremental import run_bootstrap, run_incremental
 
         task_id = task["task_id"]
         tracked_dataset_id = task["tracked_dataset_id"]
@@ -721,7 +721,7 @@ class OverWorkerClient:
 
     def execute_task(self, task: dict):
         """Execute a single scrape task and push results to over.org.il."""
-        from scraper_engine import (
+        from govscraper.scrapers.govil.legacy_engine import (
             GovILSession, GovILScraper, GovILScraperError,
             InvalidURLError, CloudflareBlockError,
         )
@@ -827,7 +827,7 @@ class OverWorkerClient:
             tmp_dir = None
             if result.file_attachments:
                 import tempfile
-                from file_handler import FileHandler
+                from govscraper.io.file_handler import FileHandler
 
                 self.report_progress(task_id, "downloading", 0,
                                      len(result.file_attachments),

@@ -170,7 +170,7 @@ def run(server_url: str, worker_id: str,
       returned the in-flight tasks to pending via stale-task reset.
     """
     from playwright.sync_api import sync_playwright
-    from nadlan_api import fetch_parcel_deals
+    from govscraper.scrapers.nadlan.legacy_api import fetch_parcel_deals
 
     client = NadlanWorkerClient(server_url, worker_id)
     consecutive_transient = 0
