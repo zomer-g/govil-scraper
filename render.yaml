@@ -21,8 +21,6 @@ services:
         sync: false
       - key: WORKER_API_KEY
         generateValue: true
-      - key: NADLAN_TRIGGER_KEY
-        generateValue: true
     disk:
       name: scraper-data
       mountPath: /tmp/govil_scraper

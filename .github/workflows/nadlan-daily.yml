@@ -1,18 +1,18 @@
 name: Nadlan daily trigger
 
-# Free GitHub-hosted cron — sits outside Render and pings the trigger endpoint.
-# The endpoint records the event; the actual ~3-hour scrape runs on the local
-# worker machine (which polls OVER for tasks).
+# Free GitHub-hosted cron — pings the public, rate-limited trigger endpoint
+# on Render. The endpoint records the event; the actual ~3-hour scrape runs
+# on the local worker machine (which polls OVER for tasks).
 #
-# Required secrets (Settings → Secrets and variables → Actions):
-#   NADLAN_TRIGGER_URL  — e.g. https://govil-scraper.onrender.com
-#   NADLAN_TRIGGER_KEY  — must match the same env var on Render
+# No secrets needed. The trigger URL is public and the endpoint is
+# intentionally unauthenticated (idempotent ring buffer + per-IP rate limit).
+# To target a different deployment, edit TRIGGER_URL below.
 #
 # Manual run: Actions tab → "Nadlan daily trigger" → "Run workflow".
 
 on:
   schedule:
-    # 03:00 UTC daily = 06:00 Israel (winter) / 06:00 (summer is +3, so 06:00 either way roughly)
+    # 03:00 UTC daily (06:00 Israel winter / 06:00 summer)
     - cron: '0 3 * * *'
   workflow_dispatch:
     inputs:
@@ -21,6 +21,9 @@ on:
         required: false
         default: 'manual run from GitHub UI'
 
+env:
+  TRIGGER_URL: https://govil-scraper.onrender.com/api/nadlan/notify-trigger
+
 jobs:
   ping:
     runs-on: ubuntu-latest
@@ -28,18 +31,11 @@ jobs:
     steps:
       - name: POST trigger to Render
         env:
-          URL: ${{ secrets.NADLAN_TRIGGER_URL }}
-          KEY: ${{ secrets.NADLAN_TRIGGER_KEY }}
           NOTE: ${{ github.event.inputs.note || 'scheduled daily run' }}
         run: |
-          if [ -z "$URL" ] || [ -z "$KEY" ]; then
-            echo "::error::NADLAN_TRIGGER_URL or NADLAN_TRIGGER_KEY secret is missing."
-            exit 1
-          fi
           curl -fsS -X POST \
-            -H "X-Trigger-Key: $KEY" \
             -H "Content-Type: application/json" \
             -d "{\"source\":\"github-actions\",\"note\":\"$NOTE\"}" \
-            "$URL/api/nadlan/notify-trigger"
+            "$TRIGGER_URL"
           echo
-          echo "Trigger sent to $URL"
+          echo "Trigger sent to $TRIGGER_URL"

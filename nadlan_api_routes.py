@@ -13,17 +13,20 @@ Endpoints:
 
     POST /api/nadlan/notify-trigger
         Webhook for an external scheduler (e.g. GitHub Actions cron). Records
-        a trigger event in an in-memory ring buffer. Use this hook to wire
-        future scheduling integrations (e.g. enqueue a task on OVER) without
-        running Playwright on Render.
-        Auth: X-Trigger-Key header == NADLAN_TRIGGER_KEY env var.
+        a trigger event in an in-memory ring buffer.
+
+        Intentionally unauthenticated to keep the public repo's CI free of
+        secrets. The handler is idempotent (writes to a 100-entry ring buffer
+        only) and rate-limited per-IP. When this endpoint evolves to enqueue
+        real tasks on OVER, harden it with GitHub OIDC verification then.
 
     GET  /api/nadlan/trigger-log
         Admin-only — last 50 trigger events (for debugging the cron pipeline).
 """
 
+import collections
 import logging
-import os
+import threading
 import time
 
 import requests
@@ -47,6 +50,37 @@ _SETTLEMENTS_TTL_S = 24 * 3600
 # fine because the GitHub Actions workflow is the source of truth.
 _TRIGGER_LOG: list[dict] = []
 _TRIGGER_LOG_MAX = 100
+
+# Per-IP rate limit for the public trigger endpoint.
+_RATE_BUCKETS: dict[str, collections.deque] = {}
+_RATE_LOCK = threading.Lock()
+_RATE_WINDOW_S = 3600   # 1-hour sliding window
+_RATE_MAX = 60          # 60 calls/hour/IP — generous for cron, throttles abuse
+
+
+def _client_ip() -> str:
+    fwd = request.headers.get("X-Forwarded-For", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.remote_addr or "unknown"
+
+
+def _rate_check(ip: str) -> bool:
+    """Sliding-window rate check. Returns True if request is allowed."""
+    now = time.time()
+    cutoff = now - _RATE_WINDOW_S
+    with _RATE_LOCK:
+        bucket = _RATE_BUCKETS.setdefault(ip, collections.deque())
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        if len(bucket) >= _RATE_MAX:
+            return False
+        bucket.append(now)
+        # Periodic GC: drop empty buckets to bound memory.
+        if len(_RATE_BUCKETS) > 1024:
+            for k in [k for k, v in _RATE_BUCKETS.items() if not v]:
+                del _RATE_BUCKETS[k]
+        return True
 
 
 def _proxy_headers() -> dict:
@@ -143,15 +177,12 @@ def settlements():
 def notify_trigger():
     """Webhook for an external scheduler. Records the trigger event.
 
-    Auth: ``X-Trigger-Key: <NADLAN_TRIGGER_KEY>``. Separate from admin OAuth
-    so a CI pipeline can call this without OAuth credentials.
+    Public + rate-limited (60/hour/IP). The handler is idempotent — it only
+    appends to a 100-entry in-memory log. Abuse is harmless.
     """
-    expected = os.environ.get("NADLAN_TRIGGER_KEY", "").strip()
-    if not expected:
-        return jsonify({"error": "NADLAN_TRIGGER_KEY not configured on server"}), 503
-    provided = request.headers.get("X-Trigger-Key", "").strip()
-    if provided != expected:
-        return jsonify({"error": "missing or invalid X-Trigger-Key"}), 403
+    ip = _client_ip()
+    if not _rate_check(ip):
+        return jsonify({"error": "rate limit exceeded"}), 429
 
     body = request.get_json(silent=True) or {}
     entry = {
@@ -159,8 +190,7 @@ def notify_trigger():
         "iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "source": str(body.get("source", "unknown"))[:80],
         "note": str(body.get("note", ""))[:500],
-        "remote": (request.headers.get("X-Forwarded-For",
-                                       request.remote_addr) or "").split(",")[0],
+        "remote": ip,
     }
     _TRIGGER_LOG.append(entry)
     if len(_TRIGGER_LOG) > _TRIGGER_LOG_MAX:
