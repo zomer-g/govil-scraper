@@ -20,3 +20,12 @@ tmp/
 *~
 
 *.log
+
+# nadlan scraper artifacts (large or runtime)
+parcels.csv
+parcels_batch*.csv
+gush_*.csv
+batch*_failed_parcels.txt
+still_failed*.txt
+downloads/
+worker_status.txt

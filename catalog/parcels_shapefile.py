@@ -2,16 +2,17 @@
 Build a master parcels CSV from the Israel Mapping Center shapefiles.
 
 Sources (download manually from data.gov.il — large files, may need browser):
-  - gushim.zip   — https://data.gov.il/he/datasets/israel_mapping_center/subgushallshape  (~64 MB)
   - helkot.zip   — https://data.gov.il/he/datasets/israel_mapping_center/shape           (~668 MB)
+  - gushim.zip   — https://data.gov.il/he/datasets/israel_mapping_center/subgushallshape  (~64 MB)  [optional]
 
-Output CSV columns:
-  gush, chelka, locality, area_sqm, centroid_lat, centroid_lon
+Output CSV columns (helkot-only mode):
+  gush, chelka, locality, municipality, parcel_type, status,
+  legal_area_sqm, area_sqm, centroid_lat, centroid_lon
 
 Usage:
-  python catalog/parcels_shapefile.py gushim.zip helkot.zip parcels.csv
-  python catalog/parcels_shapefile.py --inspect gushim.zip          # print fields, exit
-  python catalog/parcels_shapefile.py --inspect helkot.zip
+  python catalog/parcels_shapefile.py helkot.zip parcels.csv           # helkot only (recommended)
+  python catalog/parcels_shapefile.py gushim.zip helkot.zip parcels.csv  # legacy: join with gushim
+  python catalog/parcels_shapefile.py --inspect helkot.zip              # print fields, exit
 
 The Israel Mapping Center publishes geometries in ITM (EPSG:2039). We reproject
 centroids to WGS84 (EPSG:4326) so they're usable as lat/lon directly.
@@ -131,47 +132,54 @@ def inspect(zip_path: str):
         except Exception: pass
 
 
-def build(gushim_zip: str, helkot_zip: str, out_csv: str):
-    """Read both shapefiles, join chelka→gush by gush number, write parcels.csv."""
-    g_reader, g_tmp = _open_shp(gushim_zip)
-    try:
-        g_fields = [f[0] for f in g_reader.fields[1:]]
-        g_gush_f = _pick_field(g_fields, GUSH_FIELD_CANDIDATES)
-        g_loc_f = _pick_field(g_fields, LOCALITY_FIELD_CANDIDATES)
-        if not g_gush_f:
-            raise RuntimeError(
-                f"Could not find gush field in {gushim_zip}. "
-                f"Available: {g_fields}. "
-                "Run with --inspect to see actual field names and update GUSH_FIELD_CANDIDATES."
-            )
-        logger.info("Gushim: gush=%s locality=%s (%d records)",
-                    g_gush_f, g_loc_f, len(g_reader))
-        gush_to_locality: dict[str, str] = {}
-        for rec in g_reader.records():
-            gush = str(rec[g_fields.index(g_gush_f)])
-            loc = str(rec[g_fields.index(g_loc_f)]) if g_loc_f else ""
-            gush_to_locality[gush] = loc
-    finally:
-        try: g_reader.close()
-        except Exception: pass
+def build(helkot_zip: str, out_csv: str, gushim_zip: str | None = None):
+    """Read helkot shapefile (and optionally gushim for locality override), write parcels.csv.
 
-    # Now stream helkot
+    helkot.zip already contains LOCALITY_N, REG_MUN_NA, STATUS_TEX, PNUMTYPE_T and
+    LEGAL_AREA, so gushim.zip is optional and only used as a fallback for locality.
+    """
+    # Optional: load gush→locality from gushim.zip for legacy override
+    gush_to_locality: dict[str, str] = {}
+    if gushim_zip:
+        g_reader, g_tmp = _open_shp(gushim_zip)
+        try:
+            g_fields = [f[0] for f in g_reader.fields[1:]]
+            g_gush_f = _pick_field(g_fields, GUSH_FIELD_CANDIDATES)
+            g_loc_f = _pick_field(g_fields, LOCALITY_FIELD_CANDIDATES)
+            if g_gush_f:
+                for rec in g_reader.records():
+                    gush = str(rec[g_fields.index(g_gush_f)])
+                    loc = str(rec[g_fields.index(g_loc_f)]) if g_loc_f else ""
+                    gush_to_locality[gush] = loc
+                logger.info("Gushim: loaded %d locality entries", len(gush_to_locality))
+        finally:
+            try: g_reader.close()
+            except Exception: pass
+
     h_reader, h_tmp = _open_shp(helkot_zip)
     try:
         h_fields = [f[0] for f in h_reader.fields[1:]]
-        h_gush_f = _pick_field(h_fields, GUSH_FIELD_CANDIDATES)
+        h_gush_f   = _pick_field(h_fields, GUSH_FIELD_CANDIDATES)
         h_chelka_f = _pick_field(h_fields, CHELKA_FIELD_CANDIDATES)
-        h_area_f = _pick_field(h_fields, AREA_FIELD_CANDIDATES)
+        h_area_f   = _pick_field(h_fields, AREA_FIELD_CANDIDATES)
+        h_loc_f    = _pick_field(h_fields, LOCALITY_FIELD_CANDIDATES)
+        # Extra fields present in newer IMC helkot releases
+        h_muni_f       = _pick_field(h_fields, ["REG_MUN_NA", "reg_mun_na", "MUNICIPAL"])
+        h_status_f     = _pick_field(h_fields, ["STATUS_TEX", "status_tex", "STATUS"])
+        h_ptype_f      = _pick_field(h_fields, ["PNUMTYPE_T", "pnumtype_t", "PNUMTYPE"])
+        h_legalarea_f  = _pick_field(h_fields, ["LEGAL_AREA", "legal_area"])
+
         if not h_gush_f or not h_chelka_f:
             raise RuntimeError(
                 f"Could not find gush/chelka fields in {helkot_zip}. "
                 f"Available: {h_fields}. "
                 "Run with --inspect to see actual field names."
             )
-        logger.info("Helkot: gush=%s chelka=%s area=%s (%d records)",
-                    h_gush_f, h_chelka_f, h_area_f, len(h_reader))
+        logger.info("Helkot: gush=%s chelka=%s area=%s locality=%s muni=%s status=%s "
+                    "ptype=%s legalarea=%s (%d records)",
+                    h_gush_f, h_chelka_f, h_area_f, h_loc_f,
+                    h_muni_f, h_status_f, h_ptype_f, h_legalarea_f, len(h_reader))
 
-        # Detect CRS from .prj sibling
         prj_candidates = list(Path(h_tmp).rglob("*.prj"))
         prj_path = str(prj_candidates[0]) if prj_candidates else None
         transformer = _build_transformer(prj_path)
@@ -180,34 +188,41 @@ def build(gushim_zip: str, helkot_zip: str, out_csv: str):
 
         with open(out_csv, "w", encoding="utf-8-sig", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["gush", "chelka", "locality", "area_sqm",
-                        "centroid_lat", "centroid_lon"])
+            w.writerow(["gush", "chelka", "locality", "municipality",
+                        "parcel_type", "status", "legal_area_sqm",
+                        "area_sqm", "centroid_lat", "centroid_lon"])
 
             n = 0
             for shape, rec in zip(h_reader.iterShapes(), h_reader.iterRecords()):
-                gush = str(rec[h_fields.index(h_gush_f)])
-                chelka = str(rec[h_fields.index(h_chelka_f)])
-                area = rec[h_fields.index(h_area_f)] if h_area_f else ""
-                locality = gush_to_locality.get(gush, "")
+                gush   = str(int(rec[h_fields.index(h_gush_f)])) if h_gush_f else ""
+                chelka = str(int(rec[h_fields.index(h_chelka_f)])) if h_chelka_f else ""
+                area   = rec[h_fields.index(h_area_f)] if h_area_f else ""
 
-                # Build per-part rings from shape.points + shape.parts
+                # Locality: prefer gushim join if loaded, else take from helkot directly
+                locality = (gush_to_locality.get(gush)
+                            or (str(rec[h_fields.index(h_loc_f)]).strip() if h_loc_f else ""))
+                muni       = str(rec[h_fields.index(h_muni_f)]).strip()    if h_muni_f    else ""
+                status     = str(rec[h_fields.index(h_status_f)]).strip()  if h_status_f  else ""
+                ptype      = str(rec[h_fields.index(h_ptype_f)]).strip()   if h_ptype_f   else ""
+                legal_area = rec[h_fields.index(h_legalarea_f)]            if h_legalarea_f else ""
+
                 points = list(shape.points)
-                parts = list(shape.parts) + [len(points)]
-                rings = [points[parts[i]:parts[i + 1]] for i in range(len(parts) - 1)]
+                parts  = list(shape.parts) + [len(points)]
+                rings  = [points[parts[i]:parts[i + 1]] for i in range(len(parts) - 1)]
                 lat = lon = ""
                 if rings and rings[0]:
                     try:
                         cx, cy = _polygon_centroid(rings)
                         if transformer is not None:
-                            # always_xy=True → (lon, lat) order
                             lon, lat = transformer.transform(cx, cy)
                         else:
                             lon, lat = cx, cy
                     except Exception as e:
                         logger.warning("centroid failed for %s-%s: %s", gush, chelka, e)
 
-                w.writerow([gush, chelka, locality, area, lat, lon])
-
+                w.writerow([gush, chelka, locality, muni,
+                            ptype, status, legal_area,
+                            area, lat, lon])
                 n += 1
                 if n % 50000 == 0:
                     logger.info("processed %d parcels", n)
@@ -224,7 +239,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--inspect", action="store_true",
                     help="Print field names + sample record from a single ZIP and exit")
-    ap.add_argument("paths", nargs="+", help="gushim.zip helkot.zip out.csv  OR  --inspect file.zip")
+    ap.add_argument("paths", nargs="+",
+                    help="helkot.zip out.csv  OR  gushim.zip helkot.zip out.csv  OR  --inspect file.zip")
     args = ap.parse_args()
 
     if args.inspect:
@@ -232,9 +248,12 @@ def main():
             inspect(p)
         return
 
-    if len(args.paths) != 3:
-        ap.error("Build mode requires three positional args: gushim.zip helkot.zip out.csv")
-    build(args.paths[0], args.paths[1], args.paths[2])
+    if len(args.paths) == 2:
+        build(helkot_zip=args.paths[0], out_csv=args.paths[1])
+    elif len(args.paths) == 3:
+        build(helkot_zip=args.paths[1], out_csv=args.paths[2], gushim_zip=args.paths[0])
+    else:
+        ap.error("Build mode: helkot.zip out.csv  OR  gushim.zip helkot.zip out.csv")
 
 
 if __name__ == "__main__":
