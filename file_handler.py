@@ -18,22 +18,9 @@ from openpyxl.styles import Font, Alignment
 from openpyxl.utils import get_column_letter
 
 from scraper_engine import GovILSession, ScrapeResult, FileAttachment
+from govscraper.io.sanitize import sanitize_filename  # canonical location since phase B
 
 logger = logging.getLogger(__name__)
-
-
-def sanitize_filename(name: str, max_len: int = 200) -> str:
-    """Remove invalid filesystem characters and truncate."""
-    if not name:
-        return "unnamed"
-    # Remove chars invalid on Windows
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)
-    # Collapse multiple underscores
-    name = re.sub(r'_+', '_', name).strip('_. ')
-    if len(name) > max_len:
-        base, ext = os.path.splitext(name)
-        name = base[:max_len - len(ext)] + ext
-    return name or "unnamed"
 
 
 class FileHandler:
