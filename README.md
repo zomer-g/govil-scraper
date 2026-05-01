@@ -15,6 +15,9 @@ The repo holds **three cooperating subsystems**:
 3. **nadlan.gov.il real-estate scraper** — Playwright-driven extraction
    of Israel Tax Authority transaction data, both single-parcel and
    nation-wide settlement-level. Daily incremental updates supported.
+4. **Distributed bulk-nadlan worker pool** — server-coordinated queue
+   so multiple machines can scrape the 1M+ parcels in parallel. Atomic
+   task claims, central CSV aggregation, automatic stale-task recovery.
 
 The Flask app is deployed on Render at
 [`https://govil-scraper.onrender.com`](https://govil-scraper.onrender.com).
@@ -31,6 +34,7 @@ desktop).
   - [govil-scraper worker](#1-govil-scraper-worker-runs-flask-tasks)
   - [OVER worker](#2-over-worker-tracked-datasets-on-overorgil)
   - [nadlan tools](#3-nadlan-tools-real-estate-deals)
+  - [Distributed bulk-nadlan worker pool](#4-distributed-bulk-nadlan-worker-pool)
 - [HTTP API reference](#http-api-reference)
 - [Environment variables](#environment-variables)
 - [Deployment](#deployment-render)
@@ -231,6 +235,81 @@ via reCAPTCHA Enterprise, so a real browser window pops up during the
 scrape. Set `NADLAN_HEADLESS=1` only with a stealth-patched browser or
 `xvfb` on Linux.
 
+### 4. Distributed bulk-nadlan worker pool
+
+For nation-wide scraping (~748k urban parcels), `bulk_nadlan.py` on a
+single machine takes weeks. The distributed pool lets any number of
+helper machines pull tasks from the central server in parallel.
+
+**Architecture**
+
+```
+   ┌────────────────────────────────────────────────────┐
+   │ Render server (govil-scraper.onrender.com)         │
+   │   • SQLite task queue (nadlan_tasks table)         │
+   │   • central deals CSV (nadlan_deals_master.csv)    │
+   │   • atomic claim / stale-task recovery             │
+   └────────┬────────────────────┬──────────────────────┘
+            │                    │
+        bulk-claim            bulk-result
+            │                    │
+   ┌────────▼─────┐    ┌─────────▼─────┐    ┌───────────────┐
+   │  worker #1   │    │   worker #2   │ …  │   worker #N   │
+   │ nadlan_worker│    │ nadlan_worker │    │ nadlan_worker │
+   │ Playwright   │    │ Playwright    │    │ Playwright    │
+   └──────────────┘    └───────────────┘    └───────────────┘
+```
+
+**One-time setup (admin, on the server side)**
+
+```bash
+# Upload parcels.csv and have the server enqueue every status=מוסדר row
+# as a pending task. Idempotent — safe to re-upload.
+curl -F file=@parcels.csv -F filter_status=מוסדר \
+     https://govil-scraper.onrender.com/api/nadlan/bulk-queue
+# → {"inserted": 748500, "skipped": 0, "filter_status": "מוסדר", ...}
+```
+
+**On every helper machine** — double-click `run_nadlan_worker.bat`
+(Windows) or run the Python script directly. The launcher checks
+Python is installed, auto-installs `requests` + Playwright +
+Chromium on first run, then connects to the queue:
+
+```bash
+# Minimal — defaults to https://govil-scraper.onrender.com
+python nadlan_worker.py
+
+# Or specify
+python nadlan_worker.py --server https://my-server --worker-id home-pc
+```
+
+**Monitoring** — public counts:
+
+```bash
+curl https://govil-scraper.onrender.com/api/nadlan/bulk-status
+# → {"pending": 600000, "claimed": 12, "done": 148488,
+#    "failed": 0, "total": 748500, "deals_collected": 1187420}
+```
+
+**Download the merged CSV** (admin only):
+
+```bash
+# Returns the central nadlan_deals_master.csv
+curl -O -b cookie.jar https://govil-scraper.onrender.com/api/nadlan/bulk-deals.csv
+```
+
+**Failure semantics** (matches the standalone `bulk_nadlan.py`):
+
+- A worker hitting `ERR_INTERNET_DISCONNECTED` / `ERR_TIMED_OUT` /
+  `Timeout exceeded` reports the task as **transient** — server returns
+  it to `pending` so another worker (or the same one after backoff)
+  retries it.
+- Real errors (parsing crashes, `ValueError`, etc.) are reported as
+  **permanent** — the task moves to `failed` and won't be retried.
+- A worker that crashes mid-task leaves its claim in `claimed` state.
+  After 10 minutes the server's stale-reset releases it back to
+  `pending` — no operator intervention needed.
+
 ---
 
 ## HTTP API reference
@@ -271,6 +350,23 @@ Lightweight Render-friendly endpoints (no Playwright on the server):
 | `GET` | `/api/nadlan/parcel-info/<gush>/<chelka>` | Proxy to nadlan `/deal-info`. Returns parcel-level metadata `{base_level, neigh_id, neigh_name, parcel_id, setl_id, setl_name}`. No reCAPTCHA needed. |
 | `GET` | `/api/nadlan/settlements` | Cached catalog of all 1,509 Israeli settlements (`setl_types.json`). 24-hour TTL, falls back to stale on upstream error. |
 | `POST` | `/api/nadlan/notify-trigger` | Idempotent webhook (rate-limited 60/h/IP). Records a trigger event in an in-memory ring buffer. Used by the daily GitHub Actions cron. |
+| `GET` | `/api/nadlan/bulk-status` | Aggregate counts of the distributed queue: `{pending, claimed, done, failed, total, deals_collected}`. |
+
+### Nadlan distributed bulk endpoints
+
+Used by `nadlan_worker.py` to coordinate parallel scraping. Worker
+endpoints are unauthenticated (each request carries `worker_id`); admin
+endpoints require Google OAuth2 session.
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `POST` | `/api/nadlan/bulk-queue` | admin | Multipart upload of `parcels.csv`. Inserts each row as a pending task. Optional `filter_status` form field (e.g. `מוסדר`). Idempotent. |
+| `POST` | `/api/nadlan/bulk-claim` | worker | Body `{worker_id, count}` → `{tasks: [...]}`. Atomic; never returns a task already claimed by another worker. |
+| `POST` | `/api/nadlan/bulk-result/<parcel_id>` | worker | Multipart deals CSV + `worker_id` form field. Server appends rows to `nadlan_deals_master.csv` and marks the task done. |
+| `POST` | `/api/nadlan/bulk-fail/<parcel_id>` | worker | Form `{worker_id, error, transient}`. Transient → returns to `pending`; permanent → marked `failed`. |
+| `GET` | `/api/nadlan/bulk-deals.csv` | admin | Download the central deals CSV. |
+| `POST` | `/api/nadlan/bulk-reset-stale` | admin | Force-recover claimed-but-stuck tasks (default >10min). |
+| `POST` | `/api/nadlan/bulk-clear` | admin | Drop all queued tasks. Optional `clear_deals=true` also wipes the CSV. |
 
 ### Admin endpoints (Google OAuth2 session)
 
@@ -385,12 +481,19 @@ verifies a JWT from GitHub's public JWKS).
 - **`test_validation.py`** — Phase A–E suite. Covers in-memory logic,
   single-parcel scrape, bulk-run smoke, resume correctness, and edge
   cases. Designed to run before a nationwide scrape.
+- **`test_distributed.py`** — Integration tests for the distributed
+  queue. Proves: (a) `nadlan_create_tasks` is idempotent, (b) two
+  workers claiming concurrently never get overlapping tasks, (c)
+  transient/permanent fail-state transitions are correct, (d)
+  `reset_stale` recovers crashed-worker claims, (e) full HTTP
+  round-trip via Flask test client.
 - **`quality_check.py`** — post-run quality report on a completed
   batch. Coverage, hit rate, schema, anomalies, geographic and time
   distribution.
 
 ```bash
 python tests/nadlan/test_validation.py
+python tests/nadlan/test_distributed.py
 python tests/nadlan/quality_check.py downloads/batch1.csv parcels_batch1.csv
 ```
 
@@ -409,8 +512,9 @@ older smoke tools for the gov.il scraper itself.
 ├── archive_engine.py               Incremental archive (gov.il)
 ├── nadlan_api.py                   Single-parcel nadlan scraper (Playwright)
 ├── nadlan_incremental_engine.py    Settlement-level nadlan bootstrap + delta
-├── nadlan_api_routes.py            Public HTTP helpers (parcel-info, settlements, trigger)
-├── bulk_nadlan.py                  Bulk parcel scrape CLI (with checkpoint)
+├── nadlan_api_routes.py            Public HTTP helpers + distributed bulk queue
+├── bulk_nadlan.py                  Bulk parcel scrape CLI (with checkpoint, single-machine)
+├── nadlan_worker.py                Distributed bulk worker (multi-machine)
 ├── incremental_nadlan_daily.py     Daily nadlan incremental CLI
 ├── run_single_parcel.py            One-shot single-parcel CLI
 ├── catalog/
@@ -429,7 +533,8 @@ older smoke tools for the gov.il scraper itself.
 │   └── nadlan-daily.yml            Daily trigger ping
 ├── run_worker.bat                  Windows launcher — Flask worker
 ├── run_over_worker.bat             Windows launcher — OVER worker
-├── run_nadlan.bat                  Windows launcher — nadlan tools menu
+├── run_nadlan.bat                  Windows launcher — nadlan tools menu (single/bulk/daily)
+├── run_nadlan_worker.bat           Windows launcher — distributed worker (auto-installs deps)
 ├── render.yaml                     Render service config
 ├── Dockerfile                      Container build
 ├── requirements.txt                Python deps

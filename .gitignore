@@ -24,6 +24,7 @@ tmp/
 # nadlan scraper artifacts (large or runtime)
 parcels.csv
 parcels_batch*.csv
+parcels_for_distributed_upload.csv
 gush_*.csv
 batch*_failed_parcels.txt
 still_failed*.txt
