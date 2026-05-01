@@ -27,6 +27,7 @@ class PageType(Enum):
     TRADITIONAL_COLLECTOR = "traditional_collector"
     CONTENT_PAGE = "content_page"  # /he/pages/{name} — React SPA backed by ContentPageWebApi
     NADLAN_PARCEL = "nadlan_parcel"  # nadlan.gov.il single (gush, chelka) deal history
+    GOVMAP_LAYER = "govmap_layer"  # govmap.gov.il GIS layer via OGC WFS (see govmap_engine)
     UNKNOWN = "unknown"
 
 
@@ -58,6 +59,14 @@ class ScrapeResult:
     page_type: PageType = PageType.UNKNOWN
     column_headers: List[str] = field(default_factory=list)
     warning: Optional[str] = None
+    # GovMap-only fields. Populated by govmap_engine; default values are
+    # ignored by all other page types and by export_csv/export_excel.
+    features: List = field(default_factory=list)        # list[govmap_engine.Feature]
+    layer_id: str = ""
+    bbox_itm: tuple = field(default_factory=tuple)
+    bbox_wgs84: tuple = field(default_factory=tuple)
+    geometry_type: str = ""
+    srs: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +327,12 @@ def parse_gov_url(url: str) -> ParsedURL:
     path = parsed.path.rstrip("/")
     params = parse_qs(parsed.query)
     host = (parsed.hostname or "").lower()
+
+    # GovMap.gov.il GIS layer: ?lay=<id>(&c=x,y or &bbox=...)
+    if host.endswith("govmap.gov.il"):
+        # Lazy import to avoid loading pyproj/wfs deps for non-govmap users
+        from govmap_engine import parse_govmap_url
+        return parse_govmap_url(url, params)
 
     # Nadlan.gov.il parcel page: ?view=kparcel_all&id=<gush>-<chelka>
     if host.endswith("nadlan.gov.il"):
@@ -625,6 +640,10 @@ class GovILScraper:
             return self._scrape_content_page(parsed)
         elif parsed.page_type == PageType.NADLAN_PARCEL:
             return self._scrape_nadlan(parsed)
+        elif parsed.page_type == PageType.GOVMAP_LAYER:
+            from govmap_engine import scrape_govmap
+            return scrape_govmap(self.session, parsed,
+                                 progress_callback=self.progress)
         else:
             raise InvalidURLError(f"סוג דף לא נתמך: {parsed.page_type}")
 

@@ -112,6 +112,18 @@ CREATE INDEX IF NOT EXISTS idx_nadlan_state ON nadlan_tasks(state);
 CREATE INDEX IF NOT EXISTS idx_nadlan_claimed ON nadlan_tasks(claimed_at);
 """
 
+# Idempotent column adds for upgrading older DBs to the GovMap-aware schema.
+GEO_COLUMNS = [
+    ("layer_id",      "TEXT DEFAULT ''"),
+    ("layer_label",   "TEXT DEFAULT ''"),
+    ("bbox_itm",      "TEXT DEFAULT ''"),
+    ("bbox_wgs84",    "TEXT DEFAULT ''"),
+    ("geometry_type", "TEXT DEFAULT ''"),
+    ("feature_count", "INTEGER DEFAULT 0"),
+    ("srs",           "TEXT DEFAULT 'ITM'"),
+    ("geojson_path",  "TEXT DEFAULT ''"),
+]
+
 
 class CollectionStore:
     """Multi-process-safe SQLite store for collections, files, and tasks.
@@ -134,6 +146,7 @@ class CollectionStore:
                     conn.executescript(TASKS_SCHEMA_SQL)
                     conn.executescript(ARCHIVES_SCHEMA_SQL)
                     conn.executescript(NADLAN_TASKS_SCHEMA_SQL)
+                    self._migrate_geo_columns(conn)
                     conn.commit()
                 break
             except sqlite3.OperationalError as e:
@@ -143,6 +156,15 @@ class CollectionStore:
                     logger.warning("DB init retry %d: %s", attempt + 1, e)
                 else:
                     raise
+
+    def _migrate_geo_columns(self, conn):
+        """Add any missing geo columns (govmap support) to an existing
+        collections table. Idempotent — safe to call on every startup."""
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(collections)")}
+        for name, decl in GEO_COLUMNS:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE collections ADD COLUMN {name} {decl}")
+                logger.info("Migrated: added collections.%s", name)
 
     @contextmanager
     def _connect(self):
@@ -175,6 +197,15 @@ class CollectionStore:
         csv_path: str = "",
         excel_path: str = "",
         warning: str = "",
+        # GovMap-only geo fields (defaults are no-ops for non-govmap callers)
+        layer_id: str = "",
+        layer_label: str = "",
+        bbox_itm: str = "",
+        bbox_wgs84: str = "",
+        geometry_type: str = "",
+        feature_count: int = 0,
+        srs: str = "ITM",
+        geojson_path: str = "",
     ) -> dict:
         """Persist a completed scrape. Paths should be relative to base_dir."""
         now = datetime.now().isoformat(timespec="seconds")
@@ -184,7 +215,7 @@ class CollectionStore:
         size = self._calc_files_size(collection_id)
         if size == 0:
             # Fallback: scan disk directly
-            for rel in (zip_path, csv_path, excel_path):
+            for rel in (zip_path, csv_path, excel_path, geojson_path):
                 if rel:
                     abs_path = os.path.join(self.base_dir, rel)
                     if os.path.exists(abs_path):
@@ -202,15 +233,21 @@ class CollectionStore:
                    (id, source_url, collector_name, page_type, scrape_date,
                     record_count, attachment_count, downloaded_count,
                     column_headers, zip_path, csv_path, excel_path,
-                    size_bytes, warning)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    size_bytes, warning,
+                    layer_id, layer_label, bbox_itm, bbox_wgs84,
+                    geometry_type, feature_count, srs, geojson_path)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (collection_id, source_url, collector_name, page_type, now,
                  record_count, attachment_count, downloaded_count,
-                 headers_json, zip_path, csv_path, excel_path, size, warning),
+                 headers_json, zip_path, csv_path, excel_path, size, warning,
+                 layer_id, layer_label, bbox_itm, bbox_wgs84,
+                 geometry_type, feature_count, srs, geojson_path),
             )
             conn.commit()
         logger.info("Saved collection %s (%s, %d records, %.1f MB)",
-                     collection_id, collector_name, record_count, size / 1e6)
+                     collection_id, collector_name,
+                     feature_count or record_count, size / 1e6)
         return self.get_collection(collection_id)
 
     # ---- Collection Read -----------------------------------------------------

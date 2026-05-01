@@ -67,6 +67,9 @@ app.register_blueprint(auth_bp)
 from nadlan_api_routes import nadlan_api_bp
 app.register_blueprint(nadlan_api_bp)
 
+from govmap_api_routes import govmap_api_bp
+app.register_blueprint(govmap_api_bp)
+
 # --- Rate limiting ---
 limiter = Limiter(
     get_remote_address,
@@ -181,12 +184,22 @@ def _run_scrape_job(job_id: str, url: str, download_files: bool):
         os.makedirs(job_dir, exist_ok=True)
         handler = FileHandler(session, output_dir=job_dir)
 
-        # Export CSV + Excel
-        _update_progress(job_id, Phase.EXPORTING, 0, 2, "מייצא CSV...")
+        # Export CSV + Excel (+ GeoJSON for GovMap)
+        _update_progress(job_id, Phase.EXPORTING, 0, 3, "מייצא CSV...")
         csv_path = handler.export_csv(result)
-        _update_progress(job_id, Phase.EXPORTING, 1, 2, "מייצא Excel...")
+        _update_progress(job_id, Phase.EXPORTING, 1, 3, "מייצא Excel...")
         excel_path = handler.export_excel(result)
-        _update_progress(job_id, Phase.EXPORTING, 2, 2, "הייצוא הושלם!")
+        # GovMap layers also get a GeoJSON. Detect via the .features field
+        # populated by govmap_engine.scrape_govmap.
+        geojson_path = ""
+        is_govmap = bool(getattr(result, "features", None))
+        if is_govmap:
+            _update_progress(job_id, Phase.EXPORTING, 2, 3, "מייצא GeoJSON...")
+            geojson_path = handler.export_geojson(result)
+            handler.write_manifest(result, {
+                "csv": csv_path, "excel": excel_path, "geojson": geojson_path,
+            })
+        _update_progress(job_id, Phase.EXPORTING, 3, 3, "הייצוא הושלם!")
 
         # Download attachments
         attachment_paths = []
@@ -225,6 +238,19 @@ def _run_scrape_job(job_id: str, url: str, download_files: bool):
 
         # Persist to SQLite for the collections API
         try:
+            geo_kwargs = {}
+            if is_govmap:
+                geo_kwargs = {
+                    "layer_id": getattr(result, "layer_id", ""),
+                    "layer_label": result.collector_name.split("__")[0],
+                    "bbox_itm": ",".join(str(x) for x in result.bbox_itm) if result.bbox_itm else "",
+                    "bbox_wgs84": ",".join(str(x) for x in result.bbox_wgs84) if result.bbox_wgs84 else "",
+                    "geometry_type": getattr(result, "geometry_type", ""),
+                    "feature_count": result.total_count,
+                    "srs": getattr(result, "srs", "ITM"),
+                    "geojson_path": (os.path.relpath(geojson_path, TEMP_DIR)
+                                     if geojson_path else ""),
+                }
             store.save_collection(
                 collection_id=job_id,
                 source_url=url,
@@ -238,6 +264,7 @@ def _run_scrape_job(job_id: str, url: str, download_files: bool):
                 csv_path=os.path.relpath(csv_path, TEMP_DIR),
                 excel_path=os.path.relpath(excel_path, TEMP_DIR),
                 warning=result.warning or "",
+                **geo_kwargs,
             )
             store.cleanup_oldest(max_bytes=800_000_000)
         except Exception as e:
@@ -517,6 +544,14 @@ def get_collection(cid):
         "size_bytes": coll["size_bytes"],
         "file_count": len(files),
         "rows": preview_rows,
+        # GovMap-only fields (empty / 0 for non-govmap collections)
+        "layer_id": coll.get("layer_id", ""),
+        "layer_label": coll.get("layer_label", ""),
+        "bbox_itm": coll.get("bbox_itm", ""),
+        "bbox_wgs84": coll.get("bbox_wgs84", ""),
+        "geometry_type": coll.get("geometry_type", ""),
+        "feature_count": coll.get("feature_count", 0),
+        "srs": coll.get("srs", ""),
     }
     return jsonify(resp)
 
@@ -592,6 +627,23 @@ def download_collection_excel(cid):
     name = f"{coll['collector_name']}.xlsx"
     return send_file(excel_abs, as_attachment=True, download_name=name,
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+@app.route("/api/collections/<cid>/geojson")
+def download_collection_geojson(cid):
+    """Download the GeoJSON file (WGS84) for a GovMap-layer collection."""
+    coll = store.get_collection(cid)
+    if not coll:
+        return jsonify({"error": "אוסף לא נמצא"}), 404
+
+    gj_rel = coll.get("geojson_path", "")
+    gj_abs = os.path.join(TEMP_DIR, gj_rel) if gj_rel else ""
+    if not gj_abs or not os.path.exists(gj_abs):
+        return jsonify({"error": "קובץ GeoJSON לא נמצא"}), 404
+
+    name = f"{coll['collector_name']}.geojson"
+    return send_file(gj_abs, as_attachment=True, download_name=name,
+                     mimetype="application/geo+json")
 
 
 # ---------------------------------------------------------------------------
@@ -692,9 +744,23 @@ def upload_collection():
         # Remove the upload ZIP itself — we store files individually
         os.remove(zip_tmp)
 
+        # If the uploader produced a manifest.json (govmap workers do),
+        # parse it for geo metadata.
+        manifest = {}
+        for root, _dirs, filenames in os.walk(job_dir):
+            if "manifest.json" in filenames:
+                try:
+                    with open(os.path.join(root, "manifest.json"),
+                              encoding="utf-8") as mf:
+                        manifest = json.load(mf) or {}
+                except Exception as e:
+                    logger.warning("Bad manifest.json on upload: %s", e)
+                break
+
         # Scan extracted files and register them
         csv_path = ""
         excel_path = ""
+        geojson_path = ""
         record_count = 0
         column_headers = []
         file_records = []
@@ -714,6 +780,12 @@ def upload_collection():
                     category = "excel"
                     if not excel_path:
                         excel_path = full
+                elif ext == "geojson":
+                    category = "geojson"
+                    if not geojson_path:
+                        geojson_path = full
+                elif fname == "manifest.json":
+                    category = "manifest"
                 else:
                     category = "attachment"
 
@@ -749,20 +821,36 @@ def upload_collection():
         if file_records:
             store.save_files_bulk(collection_id, file_records)
 
+        # Geo fields from manifest (govmap-only); fall back to empties
+        geo_kwargs = {}
+        if manifest:
+            geo_kwargs = {
+                "layer_id": manifest.get("layer_id", ""),
+                "layer_label": manifest.get("collector_name", "").split("__")[0],
+                "bbox_itm": ",".join(str(x) for x in (manifest.get("bbox_itm") or [])),
+                "bbox_wgs84": ",".join(str(x) for x in (manifest.get("bbox_wgs84") or [])),
+                "geometry_type": manifest.get("geometry_type", ""),
+                "feature_count": int(manifest.get("feature_count", 0)),
+                "srs": manifest.get("srs", "ITM"),
+                "geojson_path": (os.path.relpath(geojson_path, TEMP_DIR).replace("\\", "/")
+                                 if geojson_path else ""),
+            }
+
         # Save collection metadata
         store.save_collection(
             collection_id=collection_id,
             source_url=source_url,
             collector_name=collector_name,
-            page_type="upload",
-            record_count=record_count,
+            page_type=manifest.get("page_type", "upload"),
+            record_count=manifest.get("feature_count", record_count),
             attachment_count=attachment_count,
             downloaded_count=attachment_count,
             column_headers=column_headers,
             zip_path="",
             csv_path=os.path.relpath(csv_path, TEMP_DIR).replace("\\", "/") if csv_path else "",
             excel_path=os.path.relpath(excel_path, TEMP_DIR).replace("\\", "/") if excel_path else "",
-            warning="",
+            warning=manifest.get("warning", ""),
+            **geo_kwargs,
         )
         store.cleanup_oldest(max_bytes=800_000_000)
 

@@ -1,0 +1,87 @@
+{
+  "_comment": "GovMap layers — VERIFIED entries are sourced from the GovMap WFS GetCapabilities response and have been confirmed to return data. UNVERIFIED entries are educated guesses; see docs/govmap_api.md for the runbook to add new layers. The WFS endpoint is https://www.govmap.gov.il/api/geoserver/wfs and layers are queried by `type_name` (e.g. govmap:layer_220826).",
+
+  "layers": [
+    {
+      "id": "FIRE_AREAS_ORDERS",
+      "label_he": "צווי שטחי אש (אזורי אימוני אש)",
+      "label_en": "Fire training zone orders",
+      "type_name": "govmap:layer_220826",
+      "endpoint_kind": "wfs",
+      "geometry_type": "MultiPolygon",
+      "out_fields": ["order_name", "order_num", "order_type", "responsibl", "responsi_1", "contacts"],
+      "default_bbox": null,
+      "notes": "VERIFIED 2026-05: 199 features country-wide. Fields include שם הצו, מספר הצו, סוג הצו, מתא\"ם אחראי, פיקוד אחראי, הערות (contact)."
+    },
+    {
+      "id": "FIRE_AREAS",
+      "label_he": "שטחי אש",
+      "label_en": "Fire areas",
+      "type_name": "govmap:layer_fire_areas",
+      "endpoint_kind": "wfs",
+      "geometry_type": "Polygon",
+      "out_fields": ["*"],
+      "notes": "VERIFIED 2026-05: present in WFS GetCapabilities. Semantic-name layer."
+    },
+    {
+      "id": "FIRE_STATIONS",
+      "label_he": "תחנות כיבוי אש",
+      "label_en": "Fire stations",
+      "type_name": "govmap:layer_fire_stations",
+      "endpoint_kind": "wfs",
+      "geometry_type": "Point",
+      "out_fields": ["*"],
+      "notes": "VERIFIED 2026-05: present in WFS GetCapabilities."
+    },
+    {
+      "id": "FIRE_ADMIN",
+      "label_he": "אזורי שירותי כבאות",
+      "label_en": "Fire & rescue admin zones",
+      "type_name": "govmap:layer_fire_admin",
+      "endpoint_kind": "wfs",
+      "geometry_type": "Polygon",
+      "out_fields": ["*"],
+      "notes": "VERIFIED 2026-05: present in WFS GetCapabilities."
+    },
+    {
+      "id": "FIRE_FREQUENCY",
+      "label_he": "תדירות שריפות (סביבה)",
+      "label_en": "Fire frequency (environment)",
+      "type_name": "govmap:layer_sviva_fire_frequency",
+      "endpoint_kind": "wfs",
+      "geometry_type": "Polygon",
+      "out_fields": ["*"],
+      "notes": "VERIFIED 2026-05: present in WFS GetCapabilities."
+    },
+    {
+      "id": "DISTRICT_BORDERS",
+      "label_he": "גבולות מחוז",
+      "label_en": "District borders",
+      "type_name": "govmap:layer_district_border",
+      "endpoint_kind": "wfs",
+      "geometry_type": "Polygon",
+      "out_fields": ["*"],
+      "notes": "VERIFIED 2026-05: present in WFS GetCapabilities."
+    },
+    {
+      "id": "NATURE_RESERVE_ORDERS",
+      "label_he": "צווי שמורות טבע",
+      "label_en": "Nature reserve orders",
+      "type_name": "govmap:layer_nature_reserves_orders",
+      "endpoint_kind": "wfs",
+      "geometry_type": "Polygon",
+      "out_fields": ["*"],
+      "notes": "VERIFIED 2026-05: present in WFS GetCapabilities."
+    },
+    {
+      "id": "DEAD_SEA_BORDERS",
+      "label_he": "גבולות ים המלח",
+      "label_en": "Dead Sea borders",
+      "type_name": "govmap:layer_dead_sea_borders",
+      "endpoint_kind": "wfs",
+      "geometry_type": "Polygon",
+      "out_fields": ["*"],
+      "notes": "VERIFIED 2026-05: present in WFS GetCapabilities."
+    }
+  ]
+}

@@ -1,14 +1,16 @@
 """
-File Handler — CSV/Excel export, attachment download, ZIP packaging.
+File Handler — CSV/Excel/GeoJSON export, attachment download, ZIP packaging.
 All exports use utf-8-sig for Hebrew compatibility in Excel.
 """
 
 import csv
+import json
 import os
 import re
 import logging
 import tempfile
 import zipfile
+from datetime import datetime
 from typing import List, Optional, Callable
 
 from openpyxl import Workbook
@@ -234,6 +236,10 @@ class FileHandler:
                     category = "csv"
                 elif ext == "xlsx":
                     category = "excel"
+                elif ext == "geojson":
+                    category = "geojson"
+                elif ext == "json" and fname == "manifest.json":
+                    category = "manifest"
                 else:
                     category = "attachment"
 
@@ -245,3 +251,68 @@ class FileHandler:
                     "rel_path": rel,
                 })
         return records
+
+    # ---- GovMap-only exports (no-op for non-GovMap results) -------------
+
+    def export_geojson(self, result: ScrapeResult) -> str:
+        """Emit a FeatureCollection in WGS84.
+
+        Reads result.features (populated by govmap_engine for GOVMAP_LAYER
+        scrapes; empty list for other page types so this method is safe to
+        call unconditionally — but a no-op file is still written, which is
+        rarely what you want; check `result.features` before calling).
+        """
+        filename = sanitize_filename(result.collector_name) + ".geojson"
+        filepath = os.path.join(self.output_dir, filename)
+
+        fc = {
+            "type": "FeatureCollection",
+            "name": result.collector_name,
+            "crs": {
+                "type": "name",
+                "properties": {"name": "urn:ogc:def:crs:OGC:1.3:CRS84"},
+            },
+            "metadata": {
+                "layer_id": getattr(result, "layer_id", ""),
+                "bbox_itm": list(result.bbox_itm) if result.bbox_itm else None,
+                "bbox_wgs84": list(result.bbox_wgs84) if result.bbox_wgs84 else None,
+                "geometry_type": getattr(result, "geometry_type", ""),
+                "feature_count": result.total_count,
+                "scraped_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            },
+            "features": [
+                {"type": "Feature",
+                 "geometry": f.geometry,
+                 "properties": f.properties}
+                for f in (result.features or [])
+            ],
+        }
+        with open(filepath, "w", encoding="utf-8") as fh:
+            json.dump(fc, fh, ensure_ascii=False)
+        logger.info("GeoJSON exported: %s (%d features)",
+                    filepath, len(result.features or []))
+        return filepath
+
+    def write_manifest(self, result: ScrapeResult, files: dict) -> str:
+        """Write a sidecar manifest.json the upload endpoint reads to
+        populate geo columns in the collections table.
+        """
+        path = os.path.join(self.output_dir, "manifest.json")
+        manifest = {
+            "layer_id": getattr(result, "layer_id", ""),
+            "collector_name": result.collector_name,
+            "page_type": (result.page_type.value
+                          if hasattr(result.page_type, "value")
+                          else str(result.page_type)),
+            "bbox_itm": list(result.bbox_itm) if result.bbox_itm else None,
+            "bbox_wgs84": list(result.bbox_wgs84) if result.bbox_wgs84 else None,
+            "geometry_type": getattr(result, "geometry_type", ""),
+            "feature_count": result.total_count,
+            "srs": getattr(result, "srs", ""),
+            "warning": result.warning or "",
+            "files": {k: os.path.relpath(v, self.output_dir).replace("\\", "/")
+                      for k, v in files.items() if v},
+        }
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh, ensure_ascii=False, indent=2)
+        return path

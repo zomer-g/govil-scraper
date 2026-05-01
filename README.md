@@ -2,7 +2,7 @@
 
 A multi-component scraping platform for Israeli government open data.
 
-The repo holds **three cooperating subsystems**:
+The repo holds these cooperating subsystems:
 
 1. **gov.il collector scraper** — extracts structured data from `gov.il`
    DynamicCollectors, traditional Collectors, and React `/he/pages/...`
@@ -18,6 +18,12 @@ The repo holds **three cooperating subsystems**:
 4. **Distributed bulk-nadlan worker pool** — server-coordinated queue
    so multiple machines can scrape the 1M+ parcels in parallel. Atomic
    task claims, central CSV aggregation, automatic stale-task recovery.
+5. **GovMap GIS layer scraper** — pulls geospatial features from
+   `govmap.gov.il`'s public OGC WFS at `/api/geoserver/wfs`. Outputs
+   GeoJSON (WGS84) + CSV/Excel + manifest. Supports country-wide and
+   BBOX-narrowed scrapes; layer-name and URL-based triggers; Leaflet UI
+   for drawing the BBOX visually. See
+   [GovMap GIS layers](#govmap-gis-layers) below.
 
 The Flask app is deployed on Render at
 [`https://govil-scraper.onrender.com`](https://govil-scraper.onrender.com).
@@ -29,12 +35,14 @@ desktop).
 ## Table of contents
 
 - [Architecture](#architecture)
+- [Supported sources](#supported-sources)
 - [Quick start (local dev)](#quick-start-local-dev)
 - [Running the workers locally](#running-the-workers-locally)
   - [govil-scraper worker](#1-govil-scraper-worker-runs-flask-tasks)
   - [OVER worker](#2-over-worker-tracked-datasets-on-overorgil)
   - [nadlan tools](#3-nadlan-tools-real-estate-deals)
   - [Distributed bulk-nadlan worker pool](#4-distributed-bulk-nadlan-worker-pool)
+- [GovMap GIS layers](#govmap-gis-layers)
 - [HTTP API reference](#http-api-reference)
 - [Environment variables](#environment-variables)
 - [Deployment](#deployment-render)
@@ -79,12 +87,32 @@ desktop).
                   └──────────────────────────────────────┘
 ```
 
+## Supported sources
+
+The scraper auto-detects what to do based on the URL host:
+
+| Source | URL pattern | Backend |
+|---|---|---|
+| **gov.il DynamicCollectors** | `/he/departments/dynamiccollectors/<name>` | `scraper_engine._scrape_dynamic` |
+| **gov.il Collectors** (traditional) | `/he/collectors/<name>` | `scraper_engine._scrape_traditional` |
+| **gov.il Pages** (React SPA) | `/he/pages/<name>` | `scraper_engine._scrape_content_page` |
+| **nadlan.gov.il parcel deals** | `?view=kparcel_all&id=<gush>-<chelka>` | `scraper_engine._scrape_nadlan` (Playwright) |
+| **govmap.gov.il GIS layers** | `?lay=<layerId>` | `govmap_engine.scrape_govmap` (OGC WFS) |
+
+All flow through the same `/api/scrape` endpoint and produce the same
+`ScrapeResult` shape; see [GovMap GIS layers](#govmap-gis-layers) below
+for what's special about geospatial output (additional `.geojson` file).
+
 **Key abstractions** (file ↦ purpose):
 
 | File | Purpose |
 |------|---------|
 | [`app.py`](app.py) | Flask web app: UI, admin API, worker queue, archives. Hosted on Render. |
-| [`scraper_engine.py`](scraper_engine.py) | Core gov.il scraper. URL parsing, page-type dispatch, pagination. |
+| [`scraper_engine.py`](scraper_engine.py) | Core scraper: URL parsing, page-type dispatch, pagination. Routes govmap URLs to `govmap_engine`. |
+| [`govmap_engine.py`](govmap_engine.py) | GovMap GIS scraper via the public OGC WFS at `/api/geoserver/wfs`. Loads `layers.json`. |
+| [`govmap_api_routes.py`](govmap_api_routes.py) | Blueprint: `/api/govmap/layers`, `/api/govmap/preview-bbox`. |
+| [`coords.py`](coords.py) | ITM (EPSG:2039) ↔ WGS84 ↔ Web Mercator transforms (pyproj). |
+| [`wfs_client.py`](wfs_client.py) | Thin OGC WFS 2.0 REST client (used by `govmap_engine`). |
 | [`archive_engine.py`](archive_engine.py) | Incremental archive (bootstrap + delta) for traditional collectors. |
 | [`nadlan_api.py`](nadlan_api.py) | Playwright-driven nadlan single-parcel scraper. |
 | [`nadlan_incremental_engine.py`](nadlan_incremental_engine.py) | Settlement-level nadlan bootstrap + daily incremental. |
@@ -312,6 +340,97 @@ curl -O -b cookie.jar https://govil-scraper.onrender.com/api/nadlan/bulk-deals.c
 
 ---
 
+## GovMap GIS layers
+
+govmap.gov.il is the public GIS portal of the Survey of Israel. It
+exposes a public OGC WFS 2.0 endpoint at `/api/geoserver/wfs` that we
+hit directly — no auth, no API key, no third-party SDK.
+
+### URL pattern
+
+Paste any `https://www.govmap.gov.il/?lay=<id>` URL into the URL textbox
+on the scrape tab — the dispatcher routes it to `govmap_engine`. The UI
+also offers a dedicated **מפה (GovMap)** tab with a Leaflet map for
+drawing a BBOX visually.
+
+Examples:
+
+```
+# Whole country (199 features)
+https://www.govmap.gov.il/?lay=220826
+
+# Same layer, narrowed to a Tel Aviv area BBOX (auto-converted to ITM):
+https://www.govmap.gov.il/?lay=220826&bbox_wgs84=34.7,32.0,34.9,32.2
+
+# Or with explicit ITM bbox (xmin,ymin,xmax,ymax):
+https://www.govmap.gov.il/?lay=220826&bbox=170000,640000,200000,670000
+```
+
+### Output
+
+Each GovMap scrape produces three files in the collection (in addition
+to the existing CSV/Excel):
+
+- **`<name>.geojson`** — `FeatureCollection` in WGS84 (the canonical
+  spatial artefact; opens in QGIS/Leaflet/Mapbox).
+- **`<name>.csv`** — flat attribute table; geometry encoded as ITM WKT
+  in the `_geometry_wkt` column for fidelity.
+- **`<name>.xlsx`** — same as CSV with RTL formatting.
+- **`manifest.json`** — sidecar with `layer_id`, `bbox_itm`, `bbox_wgs84`,
+  `geometry_type`, `feature_count`, `srs`. Read by the upload endpoint
+  to populate the new geo columns of the `collections` table.
+
+Download via:
+```
+GET /api/collections/<id>/geojson    # → application/geo+json
+GET /api/collections/<id>/csv
+GET /api/collections/<id>/excel
+GET /api/collections/<id>/download   # → ZIP with all of the above
+```
+
+### Layer catalog
+
+Curated layers live in [`layers.json`](layers.json) at the repo root.
+Override at deploy time with `GOVMAP_LAYERS_FILE=/path/to/custom.json`.
+Adding a new layer:
+
+```python
+from scraper_engine import GovILSession
+from wfs_client import WFSClient
+s = GovILSession(); s.warm()
+c = WFSClient(s)
+print(c.hits("govmap:layer_<numeric_id>"))           # confirm > 0
+print(c.describe_feature_type("govmap:layer_<id>"))  # confirm fields
+```
+
+Then add an entry to `layers.json`:
+```json
+{
+  "id": "MY_LAYER", "label_he": "...", "label_en": "...",
+  "type_name": "govmap:layer_<id>", "endpoint_kind": "wfs",
+  "geometry_type": "Polygon", "out_fields": ["*"], "notes": "..."
+}
+```
+
+### Quirks
+
+- WFS 2.0 `startIndex` parameter is **rejected** by GovMap's GeoServer
+  (HTTP 400). `wfs_client.iter_features` paginates via
+  `CQL_FILTER=objectid > <last_id> ORDER BY objectid` instead.
+- Default WFS GeoJSON output is in EPSG:3857; we explicitly request
+  `srsName=EPSG:4326` to get WGS84.
+- Layer `220826` (`גזרי שטחי אש` — IDF firing-zone orders) returns
+  199 `MultiPolygon` features country-wide as of 2026-05.
+- **Privacy:** several GovMap layers expose personal contact info of
+  public officials in their `contacts` field. Use `Layer.out_fields`
+  in `layers.json` to whitelist only what you want before publishing
+  to OVER.
+
+See [`docs/govmap_api.md`](docs/govmap_api.md) for the full
+reverse-engineering runbook.
+
+---
+
 ## HTTP API reference
 
 Base URL (production): `https://govil-scraper.onrender.com`
@@ -336,10 +455,128 @@ Auth is enforced via three decorators ([`auth.py`](auth.py)):
 | `GET` | `/api/collections/<cid>` | Collection metadata + records. |
 | `GET` | `/api/collections/<cid>/csv` | Download CSV. |
 | `GET` | `/api/collections/<cid>/excel` | Download Excel. |
+| `GET` | `/api/collections/<cid>/geojson` | Download GeoJSON (WGS84) for GovMap layer collections. |
 | `GET` | `/api/collections/<cid>/files` | Manifest of attachments. |
 | `GET` | `/api/collections/<cid>/files/<filename>` | Single attachment. |
 | `GET` | `/api/collections/<cid>/download` | Full ZIP (CSV + attachments). |
 | `GET` | `/api/files` | Search across all collections (60/min). |
+
+### GovMap GIS layer endpoints
+
+Built-in helpers for scraping geospatial data from `govmap.gov.il`.
+The catalog and preview are public and rate-limited; the layer-name
+scrape trigger is admin-only.
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/api/govmap/layers` | public | List the curated layer catalog (`layers.json`). 60/min. |
+| `POST` | `/api/govmap/preview-bbox` | public | Fast count probe before a real scrape. 30/min. |
+| `POST` | `/api/govmap/scrape` | admin | **Trigger a scrape by layer name**. 5/min. |
+| `GET` | `/api/collections/<cid>/geojson` | public | Download the GeoJSON file (WGS84) of a collection. |
+
+#### `POST /api/govmap/scrape` — scrape by layer name
+
+The simplest way to trigger a GovMap scrape: send the layer's `id`
+(or numeric WFS id like `"220826"`) and the system handles everything.
+No URL construction, no BBOX math.
+
+**Request:**
+```http
+POST /api/govmap/scrape
+Cookie: session=...        # admin Google SSO
+Content-Type: application/json
+
+{
+  "layer":      "FIRE_AREAS_ORDERS",
+  "bbox_wgs84": [34.7, 32.0, 34.9, 32.2],   // optional
+  "mode":       "auto"                      // "auto" | "server" | "worker"
+}
+```
+
+**Response:**
+```http
+202 Accepted
+{
+  "job_id": "a1b2c3d4e5f6",
+  "url":    "https://www.govmap.gov.il/?lay=220826&bbox_wgs84=34.7,32.0,34.9,32.2",
+  "layer":  "FIRE_AREAS_ORDERS",
+  "mode":   "server"
+}
+```
+
+Then stream progress via `GET /api/progress/{job_id}` (SSE).
+
+**curl example:**
+```bash
+# 1. Get the layer catalog
+curl https://govil-scraper.onrender.com/api/govmap/layers \
+  | jq '.layers[] | {id, label_he, geometry_type}'
+
+# 2. Probe the count (no auth needed)
+curl -X POST https://govil-scraper.onrender.com/api/govmap/preview-bbox \
+  -H 'Content-Type: application/json' \
+  -d '{"layer":"FIRE_AREAS_ORDERS"}'
+# → {"layer":"FIRE_AREAS_ORDERS", "count": 199}
+
+# 3. Trigger the scrape (admin session cookie required)
+curl -X POST https://govil-scraper.onrender.com/api/govmap/scrape \
+  -b "session=$ADMIN_COOKIE" \
+  -H 'Content-Type: application/json' \
+  -d '{"layer":"FIRE_AREAS_ORDERS"}'
+# → {"job_id":"a1b2c3d4e5f6", "url":"...", "mode":"server"}
+
+# 4. Stream progress
+curl -N https://govil-scraper.onrender.com/api/progress/a1b2c3d4e5f6
+
+# 5. When complete, download the GeoJSON
+curl https://govil-scraper.onrender.com/api/collections/a1b2c3d4e5f6/geojson \
+  > fire_areas.geojson
+```
+
+**Python example:**
+```python
+import requests
+
+s = requests.Session()
+s.cookies.update({"session": ADMIN_SESSION_COOKIE})
+
+# Whole-country scrape of fire training zones
+r = s.post("https://govil-scraper.onrender.com/api/govmap/scrape",
+           json={"layer": "FIRE_AREAS_ORDERS"})
+job_id = r.json()["job_id"]
+
+# Wait for completion (poll the status endpoint)
+import time
+while True:
+    status = s.get(f"https://govil-scraper.onrender.com/api/status/{job_id}").json()
+    print(status.get("phase"), status.get("message"))
+    if status.get("phase") in ("complete", "error"):
+        break
+    time.sleep(2)
+
+# Download the GeoJSON
+gj = s.get(f"https://govil-scraper.onrender.com/api/collections/{job_id}/geojson")
+with open("fire_areas.geojson", "wb") as f:
+    f.write(gj.content)
+```
+
+#### Body schema for `/api/govmap/scrape`
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `layer` | string | yes | Either an `id` from `/api/govmap/layers` (e.g. `"FIRE_AREAS_ORDERS"`), or a numeric WFS id (e.g. `"220826"`). Unknown numeric ids are auto-synthesized — useful for layers you found via DevTools but haven't added to `layers.json` yet. |
+| `bbox` | `[xmin, ymin, xmax, ymax]` | no | ITM coordinates (EPSG:2039). Leave out for whole-country scrape (capped by `GOVMAP_MAX_FEATURES`). |
+| `bbox_wgs84` | `[lon_min, lat_min, lon_max, lat_max]` | no | WGS84 — auto-converted server-side. Mutually exclusive with `bbox`. |
+| `mode` | `"auto" \| "server" \| "worker"` | no | Default `auto` — picks `worker` if any worker has heart-beated within 60s, else `server`. |
+
+#### Response codes for `/api/govmap/scrape`
+
+| Code | Meaning |
+|---|---|
+| `202` | Job accepted; poll `/api/progress/{job_id}` for status. |
+| `400` | Missing/invalid `layer`, bad numeric values in `bbox`, or unknown `mode`. |
+| `403` | Not signed in as an admin. |
+| `429` | Server-mode concurrent-job cap reached, or rate limit (5/min). |
 
 ### Public nadlan helpers
 

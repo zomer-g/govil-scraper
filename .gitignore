@@ -30,3 +30,11 @@ batch*_failed_parcels.txt
 still_failed*.txt
 downloads/
 worker_status.txt
+
+# runtime / scratch artifacts
+scraped_data/
+worker_data/
+collections.db
+collections.db-*
+_doc_test*/
+_*.py

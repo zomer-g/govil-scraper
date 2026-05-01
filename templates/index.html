@@ -6,6 +6,8 @@
     <title>Gov.il Scraper</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.rtl.min.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css">
     <style>
         body {
             font-family: 'Segoe UI', Tahoma, Arial, sans-serif;
@@ -119,6 +121,14 @@
                 </button>
             </li>
             {% endif %}
+            {% if is_admin %}
+            <li class="nav-item">
+                <button class="nav-link" data-bs-toggle="tab" data-bs-target="#govmapTab" type="button"
+                        onclick="GovMapUI.activate()">
+                    <i class="bi bi-geo-alt"></i> מפה (GovMap)
+                </button>
+            </li>
+            {% endif %}
             <li class="nav-item">
                 <button class="nav-link {% if not is_admin %}active{% endif %}" data-bs-toggle="tab" data-bs-target="#collectionsTab" type="button">
                     <i class="bi bi-collection"></i> אוספים
@@ -156,7 +166,14 @@
                         <input type="url" class="form-control form-control-lg" id="urlInput"
                                placeholder="https://www.gov.il/he/departments/dynamiccollectors/..."
                                required>
-                        <div class="form-text">הדבק כתובת של דף DynamicCollectors / Collectors מאתר gov.il, או כתובת חלקה ב-nadlan.gov.il (?view=kparcel_all&id=&lt;גוש&gt;-&lt;חלקה&gt;)</div>
+                        <div class="form-text">
+                            כתובות נתמכות:
+                            <ul class="mb-0 small">
+                                <li>gov.il — דפי DynamicCollectors / Collectors / Pages</li>
+                                <li>nadlan.gov.il — חלקה (?view=kparcel_all&amp;id=&lt;גוש&gt;-&lt;חלקה&gt;)</li>
+                                <li>govmap.gov.il — שכבת GIS (?lay=&lt;מספר שכבה&gt;) — או השתמשו בלשונית <strong>מפה</strong> למעלה</li>
+                            </ul>
+                        </div>
                     </div>
                     <div class="d-flex align-items-center justify-content-between flex-wrap gap-2">
                         <div class="d-flex align-items-center gap-3">
@@ -220,6 +237,12 @@
                         <a href="#" class="example-url text-decoration-none"
                            data-url="https://www.nadlan.gov.il/?view=kparcel_all&id=31314-2&page=deals">
                             nadlan — עסקאות נדל"ן בגוש 31314 חלקה 2 (פסגת זאב, ירושלים)
+                        </a>
+                    </li>
+                    <li>
+                        <a href="#" class="example-url text-decoration-none"
+                           data-url="https://www.govmap.gov.il/?lay=220826">
+                            govmap — שטחי אש (199 פוליגונים של אזורי אימוני אש בארץ)
                         </a>
                     </li>
                 </ul>
@@ -341,6 +364,64 @@
         </div>
 
         </div><!-- /scrapeTab -->
+        {% endif %}
+
+        <!-- ============ GOVMAP TAB ============ -->
+        {% if is_admin %}
+        <div class="tab-pane fade" id="govmapTab">
+            <div class="card mb-3">
+                <div class="card-body p-3">
+                    <div class="row g-3">
+                        <div class="col-lg-8">
+                            <div id="govmapMap" style="height: 480px; border:1px solid #dee2e6; border-radius:8px;"></div>
+                            <div class="form-text mt-2">
+                                <i class="bi bi-info-circle"></i>
+                                ציירו תיבה (rectangle) על המפה כדי לסמן את אזור הסריקה.
+                                ללא תיבה — תיסרק כל השכבה (אם תחת התקרה <code>GOVMAP_MAX_FEATURES</code>).
+                            </div>
+                        </div>
+                        <div class="col-lg-4">
+                            <label class="form-label fw-bold">
+                                <i class="bi bi-layers"></i> שכבת מידע
+                            </label>
+                            <select id="govmapLayerSelect" class="form-select mb-2">
+                                <option value="">— טוען שכבות —</option>
+                            </select>
+                            <div id="govmapLayerMeta" class="small text-muted mb-3"></div>
+
+                            <label class="form-label fw-bold">
+                                <i class="bi bi-bounding-box"></i> תיבת חיפוש
+                            </label>
+                            <div id="govmapBboxDisplay" class="small text-muted mb-2"
+                                 style="font-family: monospace; direction: ltr; text-align: left;">
+                                — לא נבחרה תיבה (יסרוק את כל השכבה) —
+                            </div>
+                            <div class="d-flex gap-2 mb-3">
+                                <button class="btn btn-sm btn-outline-secondary" id="govmapClearBbox">
+                                    <i class="bi bi-x-circle"></i> נקה
+                                </button>
+                                <button class="btn btn-sm btn-outline-info" id="govmapPreviewCount">
+                                    <i class="bi bi-search"></i> ספירה מקדימה
+                                </button>
+                            </div>
+                            <div id="govmapPreviewResult" class="small mb-3"></div>
+
+                            <label class="form-label fw-bold">מצב הרצה</label>
+                            <select id="govmapMode" class="form-select form-select-sm mb-3">
+                                <option value="auto">אוטומטי</option>
+                                <option value="server">שרת</option>
+                                <option value="worker">עובד מרוחק</option>
+                            </select>
+
+                            <button id="govmapSubmit" class="btn btn-primary w-100" disabled>
+                                <i class="bi bi-cloud-download"></i> התחל סריקה
+                            </button>
+                            <div id="govmapStatus" class="small mt-2 text-muted"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
         {% endif %}
 
         <!-- ============ COLLECTIONS TAB ============ -->
@@ -574,6 +655,83 @@ Fields:
                         <small class="text-muted">מחיקת אוסף (מנהל בלבד)</small>
                     </div>
 
+                    <h6 class="fw-bold mb-3 mt-4">
+                        <i class="bi bi-geo-alt"></i> שכבות GIS — GovMap
+                    </h6>
+                    <p class="text-muted small mb-3">
+                        סריקה של שכבות גיאוגרפיות מ-<code>govmap.gov.il</code> דרך OGC WFS.
+                        ניתן גם להדביק כתובת <code>https://www.govmap.gov.il/?lay=&lt;id&gt;</code>
+                        ב-<code>/api/scrape</code> הרגיל. כל סריקה מפיקה גם <code>.geojson</code>
+                        בנוסף ל-CSV/Excel.
+                    </p>
+
+                    <div class="api-endpoint">
+                        <div class="d-flex align-items-center gap-2 mb-1">
+                            <span class="api-method get">GET</span>
+                            <span class="api-path">/api/govmap/layers</span>
+                        </div>
+                        <small class="text-muted d-block">קטלוג שכבות מאומתות (id, type_name, geometry_type, label_he, notes). 60 בקשות/דקה.</small>
+                        <pre class="mt-2 mb-0 small" style="background:#f0f0f0;padding:8px;border-radius:6px;direction:ltr;text-align:left;">{
+  "layers": [
+    {
+      "id": "FIRE_AREAS_ORDERS",
+      "label_he": "צווי שטחי אש (אזורי אימוני אש)",
+      "type_name": "govmap:layer_220826",
+      "geometry_type": "MultiPolygon",
+      "out_fields": ["order_name", "order_num", ...],
+      "notes": "VERIFIED 2026-05: 199 features country-wide..."
+    }, ...
+  ]
+}</pre>
+                    </div>
+
+                    <div class="api-endpoint">
+                        <div class="d-flex align-items-center gap-2 mb-1">
+                            <span class="api-method post">POST</span>
+                            <span class="api-path">/api/govmap/preview-bbox</span>
+                        </div>
+                        <small class="text-muted d-block">בדיקת ספירת פיצ'רים לפני סריקה. ציבורי, 30 בקשות/דקה. ללא BBOX = כל הארץ.</small>
+                        <pre class="mt-2 mb-0 small" style="background:#f0f0f0;padding:8px;border-radius:6px;direction:ltr;text-align:left;">Body: {
+  "layer": "FIRE_AREAS_ORDERS",         // id or numeric WFS id ("220826")
+  "bbox":  [xmin, ymin, xmax, ymax],    // optional, ITM (EPSG:2039)
+  "srs":   "ITM"                        // or "WGS84"
+}
+Response: { "layer": "FIRE_AREAS_ORDERS", "count": 199 }</pre>
+                    </div>
+
+                    <div class="api-endpoint">
+                        <div class="d-flex align-items-center gap-2 mb-1">
+                            <span class="api-method post">POST</span>
+                            <span class="api-path">/api/govmap/scrape</span>
+                        </div>
+                        <small class="text-muted d-block">
+                            <strong>סריקה מהירה לפי שם שכבה</strong> — מנהל בלבד, 5 בקשות/דקה.
+                            המערכת בונה כתובת <code>govmap.gov.il/?lay=…</code> סינתטית, מפעילה את הצינור הסטנדרטי
+                            (כולל ייצוא CSV+Excel+GeoJSON) ומחזירה <code>job_id</code> למעקב דרך
+                            <code>/api/progress/{job_id}</code>.
+                        </small>
+                        <pre class="mt-2 mb-0 small" style="background:#f0f0f0;padding:8px;border-radius:6px;direction:ltr;text-align:left;">Body: {
+  "layer":      "FIRE_AREAS_ORDERS",       // required - id or "220826"
+  "bbox":       [xmin, ymin, xmax, ymax],  // optional, ITM
+  "bbox_wgs84": [lon_min, lat_min, lon_max, lat_max],  // optional, auto-ITM
+  "mode":       "auto"                     // "auto" | "server" | "worker"
+}
+Response (202): {
+  "job_id": "a1b2c3d4e5f6",
+  "url":    "https://www.govmap.gov.il/?lay=220826",
+  "layer":  "FIRE_AREAS_ORDERS",
+  "mode":   "server"
+}</pre>
+                    </div>
+
+                    <div class="api-endpoint">
+                        <div class="d-flex align-items-center gap-2 mb-1">
+                            <span class="api-method get">GET</span>
+                            <span class="api-path">/api/collections/{id}/geojson</span>
+                        </div>
+                        <small class="text-muted">הורדת ה-GeoJSON של אוסף שכבת GovMap (WGS84). פתיחה ב-QGIS / Leaflet / Mapbox.</small>
+                    </div>
+
                 </div>
             </div>
         </div>
@@ -636,6 +794,9 @@ Fields:
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+    <script src="/static/js/govmap.js"></script>
     <script>
     const PHASE_LABELS = {
         initializing: 'מאתחל...',
