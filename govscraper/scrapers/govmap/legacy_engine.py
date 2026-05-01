@@ -37,10 +37,31 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULT_MAX_FEATURES = int(os.environ.get("GOVMAP_MAX_FEATURES", "100000"))
-DEFAULT_LAYERS_FILE = os.environ.get(
-    "GOVMAP_LAYERS_FILE",
-    os.path.join(os.path.dirname(__file__), "layers.json"),
-)
+
+
+def _find_layers_json() -> str:
+    """Locate layers.json. Tries (in order): GOVMAP_LAYERS_FILE env var,
+    sibling of this file, project root (when this lives at govscraper/scrapers/govmap/),
+    cwd. Returns the first existing path, else the in-package fallback (which
+    load_layer_catalog will report as missing)."""
+    env = os.environ.get("GOVMAP_LAYERS_FILE")
+    if env:
+        return env
+    here = os.path.dirname(os.path.abspath(__file__))
+    # Walk up to project root (3 levels: govscraper/scrapers/govmap → root)
+    repo_root = os.path.abspath(os.path.join(here, "..", "..", ".."))
+    candidates = [
+        os.path.join(here, "layers.json"),
+        os.path.join(repo_root, "layers.json"),
+        os.path.join(os.getcwd(), "layers.json"),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]  # original default; load_layer_catalog logs the miss
+
+
+DEFAULT_LAYERS_FILE = _find_layers_json()
 
 
 # ---------------------------------------------------------------------------
