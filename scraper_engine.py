@@ -1358,3 +1358,15 @@ class GovILScraper:
                     ))
 
         return attachments
+
+
+# ---------------------------------------------------------------------------
+# snake_case aliases (phase F)
+# Old class names use the all-caps "IL" suffix (`GovILSession`, `GovILScraper`,
+# `GovILScraperError`). PEP-8 treats two-letter abbreviations as acronyms so
+# the correct casing is `Il`. Both spellings remain importable until phase G;
+# new code should prefer the snake_case spellings.
+# ---------------------------------------------------------------------------
+GovIlSession = GovILSession
+GovIlScraper = GovILScraper
+GovIlScraperError = GovILScraperError

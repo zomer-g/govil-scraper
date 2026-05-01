@@ -24,3 +24,37 @@ distinct entities. The refactor preserves all four; do not collapse them.
 # Scraper IDs (registry keys)
 
 `govil` · `datagovil` · `nadlan` · `govmap`
+
+# External-API field constants (`_fields.py`)
+
+Each scraper has a `_fields.py` module that pins the wire-format strings
+exposed by its remote API. These are camelCase / PascalCase / lowercase
+mixed because that's what the upstream services emit. They are **not**
+Python identifiers we're free to rename; only the constant *holding* them
+is snake_case.
+
+| Scraper | File | Examples |
+|---|---|---|
+| govil | [govscraper/scrapers/govil/_fields.py](../govscraper/scrapers/govil/_fields.py) | `DynamicTemplateID`, `From`, `officeId`, `CollectorType` |
+| datagovil | [govscraper/scrapers/datagovil/_fields.py](../govscraper/scrapers/datagovil/_fields.py) | `q`, `rows`, `start`, `resource_id`, `offset`, `limit`, `filters` |
+| nadlan | [govscraper/scrapers/nadlan/_fields.py](../govscraper/scrapers/nadlan/_fields.py) | `dealDate`, `assetId`, `settlementCode`, `priceSM` |
+| govmap | [govscraper/scrapers/govmap/_fields.py](../govscraper/scrapers/govmap/_fields.py) | `typeNames`, `outputFormat`, `bbox`, `srsName` |
+| over.org.il | [govscraper/worker/publishers/_contract.py](../govscraper/worker/publishers/_contract.py) | `tracked_dataset_id`, `metadata_modified`, `version_number`, `"נתוני הסורק"` |
+
+# snake_case aliases for legacy class names
+
+`scraper_engine.py` historically used the all-caps `IL` suffix
+(`GovILScraper`, `GovILSession`). PEP-8 treats two-letter
+abbreviations as acronyms — the correct casing is `Il`.
+
+Both spellings are importable from `scraper_engine`:
+
+| Legacy | Canonical (phase F+) |
+|---|---|
+| `GovILSession` | `GovIlSession` |
+| `GovILScraper` | `GovIlScraper` |
+| `GovILScraperError` | `GovIlScraperError` |
+
+The old spellings will be removed in phase G's deletion of
+`scraper_engine.py` (it becomes a re-export shim from
+`govscraper.scrapers.govil`).
