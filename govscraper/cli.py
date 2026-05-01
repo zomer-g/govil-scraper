@@ -60,9 +60,47 @@ def _cmd_worker(args: argparse.Namespace) -> int:
 
 
 def _cmd_scrape(args: argparse.Namespace) -> int:
-    print(f"[govscraper] `scrape {args.url}` not yet wired in phase A", file=sys.stderr)
-    print("[govscraper] use `python local_scrape.py --url ...` for now", file=sys.stderr)
-    return 2
+    """One-shot scrape against any registered scraper. Prints a JSON summary
+    of the result so it's pipeable into jq."""
+    import json
+    from govscraper import scrapers as _scrapers  # noqa: F401  registers
+    from govscraper.scrapers import dispatch
+    from govscraper.scrapers.base import (
+        CkanCatalogResult, GeoFeatureResult, TabularResult,
+    )
+    from govscraper.types import Progress
+
+    hit = dispatch(args.url)
+    if hit is None:
+        print(f"[govscraper] no registered scraper handles {args.url}", file=sys.stderr)
+        return 2
+    cls, parsed = hit
+
+    def show(p: Progress) -> None:
+        line = f"  [{p.phase}] {p.current}/{p.total} {p.message}".rstrip()
+        print(line, file=sys.stderr)
+
+    print(f"[govscraper] dispatching to {cls.id}", file=sys.stderr)
+    scraper = cls()  # type: ignore[call-arg]
+    result = scraper.fetch(parsed, progress=show)
+
+    if isinstance(result, TabularResult):
+        summary = {"kind": "tabular", "rows": len(result.rows),
+                   "fields": [f["name"] for f in result.fields[:10]],
+                   "attachments": len(result.attachments),
+                   "warning": result.warning}
+    elif isinstance(result, GeoFeatureResult):
+        summary = {"kind": "geo", "features": len(result.features),
+                   "geometry_type": result.geometry_type,
+                   "warning": result.warning}
+    elif isinstance(result, CkanCatalogResult):
+        summary = {"kind": "ckan_catalog", "datasets": len(result.datasets),
+                   "resources": len(result.resources),
+                   "rows_by_resource": {k: len(v) for k, v in result.rows_by_resource.items()}}
+    else:
+        summary = {"kind": "unknown"}
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0
 
 
 def _cmd_bulk_nadlan(args: argparse.Namespace) -> int:
