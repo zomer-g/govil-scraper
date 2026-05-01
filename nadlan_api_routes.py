@@ -72,7 +72,13 @@ import time
 import requests
 from flask import Blueprint, jsonify, request, send_file
 
-from auth import is_admin
+from auth import is_admin, _check_worker_key
+
+
+def _admin_or_worker() -> bool:
+    """Admin auth check that also accepts the worker key — convenient for
+    CLI flows where an operator can't easily get an OAuth session cookie."""
+    return is_admin() or _check_worker_key()
 
 logger = logging.getLogger(__name__)
 
@@ -324,8 +330,8 @@ def bulk_queue():
     Multipart form: file=<parcels.csv>. Each row must have at least
     gush, chelka. Idempotent (rows with existing parcel_id are skipped).
     """
-    if not is_admin():
-        return jsonify({"error": "admin required"}), 403
+    if not _admin_or_worker():
+        return jsonify({"error": "admin or worker key required"}), 403
     upload = request.files.get("file")
     if not upload:
         return jsonify({"error": "no file"}), 400
@@ -424,8 +430,8 @@ def bulk_status():
 @nadlan_api_bp.route("/bulk-reset-stale", methods=["POST"])
 def bulk_reset_stale():
     """Admin: force-reset claimed-but-stuck tasks (>10min) to pending."""
-    if not is_admin():
-        return jsonify({"error": "admin required"}), 403
+    if not _admin_or_worker():
+        return jsonify({"error": "admin or worker key required"}), 403
     timeout = int(request.form.get("timeout_seconds") or 600)
     n = _get_store().nadlan_reset_stale(timeout_seconds=timeout)
     return jsonify({"reset": n})
@@ -434,8 +440,8 @@ def bulk_reset_stale():
 @nadlan_api_bp.route("/bulk-clear", methods=["POST"])
 def bulk_clear():
     """Admin: drop all queued tasks. Use for testing / fresh restart."""
-    if not is_admin():
-        return jsonify({"error": "admin required"}), 403
+    if not _admin_or_worker():
+        return jsonify({"error": "admin or worker key required"}), 403
     n = _get_store().nadlan_clear()
     # Optionally rotate the deals CSV so a fresh run starts empty.
     if (request.form.get("clear_deals") or "").lower() == "true":
@@ -448,8 +454,8 @@ def bulk_clear():
 @nadlan_api_bp.route("/bulk-deals.csv", methods=["GET"])
 def bulk_deals_csv():
     """Download the central deals CSV (admin only — file may be large)."""
-    if not is_admin():
-        return jsonify({"error": "admin required"}), 403
+    if not _admin_or_worker():
+        return jsonify({"error": "admin or worker key required"}), 403
     path = _deals_csv_path()
     if not os.path.exists(path):
         return jsonify({"error": "no deals collected yet"}), 404
