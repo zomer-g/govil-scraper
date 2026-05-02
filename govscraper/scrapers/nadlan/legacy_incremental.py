@@ -193,26 +193,44 @@ class NadlanBrowser:
     def __enter__(self):
         from playwright.sync_api import sync_playwright
         self._pw = sync_playwright().start()
-        # Use real Chrome (not Chromium) so the 2026-05-02 token-verify gate
-        # accepts our reCAPTCHA Enterprise score. See legacy_api._launch_browser.
-        args = ["--disable-blink-features=AutomationControlled"]
-        try:
-            self._browser = self._pw.chromium.launch(
-                channel="chrome", headless=self.headless, args=args)
-        except Exception as e:
-            logger.warning("real Chrome unavailable (%s) — falling back to Chromium. "
-                           "token-verify likely to fail. Run "
-                           "'python -m playwright install chrome' to fix.", e)
-            self._browser = self._pw.chromium.launch(
-                headless=self.headless, args=args)
-        self._ctx = self._browser.new_context(
-            locale="he-IL",
-            viewport={"width": 1280, "height": 900},
-        )
-        self._ctx.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
-        )
-        self._page = self._ctx.new_page()
+        # Prefer CDP attach to the user's already-warmed Chrome (high
+        # recaptcha enterprise score). See run_chrome_for_nadlan.bat.
+        # Fall back to a fresh Chrome launch if CDP isn't available.
+        cdp = os.environ.get("NADLAN_CHROME_CDP", "http://localhost:9222")
+        cdp_attached = False
+        if cdp and cdp.lower() not in ("0", "false", "off", ""):
+            try:
+                self._browser = self._pw.chromium.connect_over_cdp(
+                    cdp, timeout=5000)
+                cdp_attached = True
+                logger.info("nadlan: connected to existing Chrome at %s", cdp)
+            except Exception as e:
+                logger.info("nadlan: no Chrome at %s (%s) — launching fresh",
+                            cdp, e)
+        if not cdp_attached:
+            args = ["--disable-blink-features=AutomationControlled"]
+            try:
+                self._browser = self._pw.chromium.launch(
+                    channel="chrome", headless=self.headless, args=args)
+            except Exception as e:
+                logger.warning("real Chrome unavailable (%s) — falling back to Chromium. "
+                               "token-verify likely to fail.", e)
+                self._browser = self._pw.chromium.launch(
+                    headless=self.headless, args=args)
+        if cdp_attached and self._browser.contexts:
+            self._ctx = self._browser.contexts[0]
+            self._page = (self._ctx.pages[0]
+                          if self._ctx.pages else self._ctx.new_page())
+        else:
+            self._ctx = self._browser.new_context(
+                locale="he-IL",
+                viewport={"width": 1280, "height": 900},
+            )
+            self._ctx.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+            )
+            self._page = self._ctx.new_page()
+        self._cdp_attached = cdp_attached
         # Warm up the SPA so recaptcha boots once + a human signal so it
         # scores us above the bot threshold.
         self._page.goto("https://www.nadlan.gov.il/",
@@ -223,7 +241,7 @@ class NadlanBrowser:
 
     def __exit__(self, *_):
         try:
-            if self._browser:
+            if self._browser and not getattr(self, "_cdp_attached", False):
                 self._browser.close()
         finally:
             if self._pw:
@@ -440,12 +458,12 @@ class NadlanBrowser:
         if not recap:
             return None
 
-        # Step 2: POST to /token-verify
+        # Step 2: POST to /token-verify (matching SPA's content-type=text/plain)
         try:
             resp = self._page.request.post(
                 "https://api.nadlan.gov.il/token-verify",
                 data=json.dumps({"token": recap}).encode("utf-8"),
-                headers={"content-type": "application/json"},
+                headers={"content-type": "text/plain"},
                 timeout=20_000,
             )
         except Exception as e:
@@ -454,7 +472,12 @@ class NadlanBrowser:
             return None
         if resp.status != 200:
             if log:
-                logger.warning("setl %s: /token-verify HTTP %d", setl_code, resp.status)
+                try:
+                    err_body = resp.text()[:200]
+                except Exception:
+                    err_body = "<no body>"
+                logger.warning("setl %s: /token-verify HTTP %d body=%s",
+                                setl_code, resp.status, err_body)
             return None
         try:
             tv_body = resp.json()
