@@ -452,16 +452,16 @@ class NadlanBrowser:
         # token spent after fetch_number=1 and rejects every subsequent JWT
         # with the same token (HTTP 405). To paginate, we mint a fresh
         # token from the page's own grecaptcha runtime for each page.
-        # Find recaptcha site key. Multiple lookup paths because the SPA
-        # loads recaptcha dynamically and the script tag may be absent.
+        # Find recaptcha site key. The SPA loads recaptcha with
+        # ?render=explicit (manual mode) and passes the real site key into
+        # grecaptcha.execute() at call time. So the script-tag URL is NOT
+        # the site key — we have to dig.
         site_key = self._page.evaluate("""
             () => {
-                // 1. recaptcha script tag with ?render=
-                for (const s of document.querySelectorAll('script[src]')) {
-                    const m = s.src.match(/recaptcha[^"]*[?&]render=([^&"]+)/);
-                    if (m) return m[1];
-                }
-                // 2. ___grecaptcha_cfg global (deep walk)
+                const isSiteKey = (s) => typeof s === 'string'
+                    && /^6L[A-Za-z0-9_-]{30,}$/.test(s);
+
+                // 1. ___grecaptcha_cfg global (deep walk)
                 try {
                     const cfg = window.___grecaptcha_cfg;
                     if (cfg && cfg.clients) {
@@ -472,17 +472,29 @@ class NadlanBrowser:
                             if (!o || typeof o !== 'object' || seen.has(o)) continue;
                             seen.add(o);
                             for (const k in o) {
-                                if (k === 'sitekey' && typeof o[k] === 'string') return o[k];
+                                if (isSiteKey(o[k])) return o[k];
                                 if (typeof o[k] === 'object') stack.push(o[k]);
                             }
                         }
                     }
                 } catch (e) {}
+
+                // 2. Scan inline scripts and HTML for the 6L... pattern
+                const html = document.documentElement.outerHTML;
+                const m = html.match(/['"`](6L[A-Za-z0-9_-]{30,})['"`]/);
+                if (m) return m[1];
+
+                // 3. Walk all <iframe src=...> looking for k= param
+                for (const f of document.querySelectorAll('iframe[src]')) {
+                    const km = f.src.match(/[?&]k=(6L[A-Za-z0-9_-]+)/);
+                    if (km) return km[1];
+                }
+
                 return null;
             }
         """)
         logger.info("setl %s: recaptcha site_key=%s", setl_code,
-                    site_key[:20] + "..." if site_key else "NOT FOUND")
+                    site_key[:30] + "..." if site_key else "NOT FOUND")
 
         for fetch_num in range(2, total_fetch + 1):
             new_payload = dict(payload)
