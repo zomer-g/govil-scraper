@@ -38,6 +38,8 @@ goto INSTALL_CHROMIUM
 echo Ensuring Chromium is installed...
 python -m playwright install chromium >nul 2>nul
 if errorlevel 1 goto CHROMIUM_FAILED
+echo Ensuring real Chrome is installed (required since nadlan 2026-05-02 update)...
+python -m playwright install chrome >nul 2>nul
 goto CONFIGURE
 
 :CONFIGURE
