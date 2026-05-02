@@ -388,41 +388,77 @@ class NadlanBrowser:
         url = captured_request["url"]
         headers = captured_request["headers"] or {}
 
+        # reCAPTCHA Enterprise tokens are single-use: the server marks the
+        # token spent after fetch_number=1 and rejects every subsequent JWT
+        # with the same token (HTTP 405). To paginate, we mint a fresh
+        # token from the page's own grecaptcha runtime for each page.
+        site_key = self._page.evaluate("""
+            () => {
+                const s = document.querySelector('script[src*="recaptcha/enterprise.js"]');
+                if (!s) return null;
+                const m = s.src.match(/render=([^&]+)/);
+                return m ? m[1] : null;
+            }
+        """)
+        if not site_key:
+            logger.warning("setl %s: could not find reCAPTCHA site key — pagination "
+                           "will likely fail", setl_code)
+
         for fetch_num in range(2, total_fetch + 1):
             new_payload = dict(payload)
             new_payload["fetch_number"] = fetch_num
+
+            # Mint a fresh recaptcha token so the JWT passes server-side
+            # token-verify. Action is unknown — try the common SPA values.
+            if site_key and "token" in new_payload:
+                try:
+                    fresh = self._page.evaluate(
+                        """async (siteKey) => {
+                            return await grecaptcha.enterprise.execute(
+                                siteKey, {action: 'submit'});
+                        }""",
+                        site_key,
+                    )
+                    if fresh:
+                        new_payload["token"] = fresh
+                except Exception as e:
+                    logger.warning("setl %s fetch=%d: grecaptcha.execute failed: %s",
+                                    setl_code, fetch_num, e)
+
             try:
-                new_token = _sign_reversed_jwt(header, new_payload)
+                new_jwt = _sign_reversed_jwt(header, new_payload)
             except Exception as e:
                 logger.warning("setl %s: re-sign failed at fetch=%d: %s",
                                 setl_code, fetch_num, e)
                 return False
 
-            body = json.dumps({"##": new_token})
-            # Use Playwright's APIRequestContext which inherits cookies from
-            # the page session but is not subject to in-page CORS preflight.
-            # In-page fetch() to api.nadlan.gov.il from www.nadlan.gov.il
-            # was failing with "TypeError: Failed to fetch" (CORS preflight).
+            body = json.dumps({"##": new_jwt})
+            # In-page fetch via page.evaluate runs inside the SPA's JS
+            # context, so the browser handles Origin/Referer naturally and
+            # the fetch is treated identically to the SPA's own first call.
             try:
-                resp = self._page.request.post(
-                    url,
-                    data=body.encode("utf-8"),
-                    headers={
-                        "content-type": "text/plain",
-                        "origin": "https://www.nadlan.gov.il",
-                        "referer": "https://www.nadlan.gov.il/",
-                    },
-                    timeout=30000,
+                resp_status, response_text = self._page.evaluate(
+                    """async ({url, body}) => {
+                        const r = await fetch(url, {
+                            method: 'POST',
+                            headers: {'content-type': 'text/plain'},
+                            body: body,
+                            credentials: 'include',
+                            mode: 'cors',
+                        });
+                        const t = await r.text();
+                        return [r.status, t];
+                    }""",
+                    {"url": url, "body": body},
                 )
             except Exception as e:
                 logger.warning("setl %s fetch=%d: request failed: %s",
                                 setl_code, fetch_num, e)
                 return False
-            if resp.status != 200:
+            if resp_status != 200:
                 logger.warning("setl %s fetch=%d: HTTP %d — stopping pagination",
-                                setl_code, fetch_num, resp.status)
+                                setl_code, fetch_num, resp_status)
                 return False
-            response_text = resp.text()
             # response_text is base64+gzip wrapper
             try:
                 decoded = json.loads(
