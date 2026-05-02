@@ -394,15 +394,19 @@ class NadlanBrowser:
         # token from the page's own grecaptcha runtime for each page.
         site_key = self._page.evaluate("""
             () => {
-                const s = document.querySelector('script[src*="recaptcha/enterprise.js"]');
+                const s = document.querySelector('script[src*="recaptcha"]');
                 if (!s) return null;
                 const m = s.src.match(/render=([^&]+)/);
                 return m ? m[1] : null;
             }
         """)
-        if not site_key:
-            logger.warning("setl %s: could not find reCAPTCHA site key — pagination "
-                           "will likely fail", setl_code)
+        logger.info("setl %s: recaptcha site_key=%s", setl_code,
+                    site_key[:20] + "..." if site_key else "NOT FOUND")
+        # Diagnostic: log original token length + sample so we can see if
+        # fresh tokens are even being substituted.
+        orig_token = payload.get("token") or ""
+        logger.info("setl %s: original token len=%d, sample=%s",
+                    setl_code, len(orig_token), orig_token[:30])
 
         for fetch_num in range(2, total_fetch + 1):
             new_payload = dict(payload)
@@ -414,13 +418,24 @@ class NadlanBrowser:
                 try:
                     fresh = self._page.evaluate(
                         """async (siteKey) => {
-                            return await grecaptcha.enterprise.execute(
-                                siteKey, {action: 'submit'});
+                            try {
+                                if (typeof grecaptcha === 'undefined') return {err: 'grecaptcha undef'};
+                                if (!grecaptcha.enterprise) return {err: 'no enterprise'};
+                                const t = await grecaptcha.enterprise.execute(
+                                    siteKey, {action: 'submit'});
+                                return {token: t};
+                            } catch (e) {
+                                return {err: String(e)};
+                            }
                         }""",
                         site_key,
                     )
-                    if fresh:
-                        new_payload["token"] = fresh
+                    if fetch_num == 2:
+                        logger.info("setl %s: grecaptcha result=%s", setl_code,
+                                    {k: (v[:30] + "..." if isinstance(v, str) and len(v) > 30 else v)
+                                     for k, v in (fresh or {}).items()})
+                    if fresh and fresh.get("token"):
+                        new_payload["token"] = fresh["token"]
                 except Exception as e:
                     logger.warning("setl %s fetch=%d: grecaptcha.execute failed: %s",
                                     setl_code, fetch_num, e)
