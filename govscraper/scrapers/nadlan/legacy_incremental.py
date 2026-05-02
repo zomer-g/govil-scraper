@@ -371,6 +371,14 @@ class NadlanBrowser:
             logger.warning("setl %s: could not decode JWT template: %s", setl_code, e)
             return False
 
+        # Diagnostic: log what fields are in the JWT so we know what to
+        # change when paginating. The first time through this gives us a
+        # one-line schema log; subsequent fetches stay quiet.
+        logger.info("setl %s: JWT header keys=%s, payload keys=%s",
+                    setl_code, list(header.keys()), list(payload.keys()))
+        logger.debug("setl %s: full payload=%s", setl_code,
+                     json.dumps(payload, ensure_ascii=False)[:500])
+
         url = captured_request["url"]
         headers = captured_request["headers"] or {}
 
