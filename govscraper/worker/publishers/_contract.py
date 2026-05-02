@@ -20,6 +20,7 @@ PATH_PROGRESS = "/api/worker/progress/{task_id}"
 PATH_FAIL = "/api/worker/fail/{task_id}"
 PATH_UPLOAD_ZIP = "/api/worker/upload-zip/{tracked_dataset_id}"
 PATH_UPLOAD_CSV = "/api/worker/upload-csv/{tracked_dataset_id}"
+PATH_UPLOAD_GEOJSON = "/api/worker/upload-geojson/{tracked_dataset_id}"
 PATH_PUSH_VERSION = "/api/worker/push-version"
 
 # ---------------------------------------------------------------------------
@@ -56,6 +57,16 @@ CSV_COMPRESSION_VALUE = "gzip"
 CSV_GZIP_LEVEL = 6
 
 # ---------------------------------------------------------------------------
+# Multipart fields — upload-geojson  (added 2026-05-02)
+# ---------------------------------------------------------------------------
+
+GEOJSON_FILE_FIELD = "file"
+GEOJSON_MIME = "application/geo+json"
+GEOJSON_FORM_VERSION_NUMBER = "version_number"
+GEOJSON_FORM_RESOURCE_NAME = "resource_name"
+TIMEOUT_UPLOAD_GEOJSON = 600
+
+# ---------------------------------------------------------------------------
 # push-version JSON body
 # ---------------------------------------------------------------------------
 
@@ -68,6 +79,7 @@ PV_SCRAPE_METADATA = "scrape_metadata"
 PV_ZIP_RESOURCE_ID = "zip_resource_id"
 PV_ZIP_RESOURCE_IDS = "zip_resource_ids"
 PV_CSV_RESOURCE_IDS = "csv_resource_ids"
+PV_GEOJSON_RESOURCE_IDS = "geojson_resource_ids"  # added 2026-05-02
 PV_SCRAPER_CONFIG_PATCH = "scraper_config_patch"
 PV_SKIP_VERSION = "skip_version"
 
@@ -84,6 +96,7 @@ SM_SCRAPE_DURATION_SECONDS = "scrape_duration_seconds"
 SM_TOTAL_ITEMS = "total_items"
 SM_TOTAL_FILES = "total_files"
 SM_SCRAPER_VERSION = "scraper_version"
+SM_DATASET_TITLE_HE = "dataset_title_he"  # added 2026-05-02 — over.org.il updates tracked_dataset.title
 SCRAPER_VERSION_VALUE = "1.0.0"
 
 # Frozen Hebrew resource name. The push-version body always emits exactly

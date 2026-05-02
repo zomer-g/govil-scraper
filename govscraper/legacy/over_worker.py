@@ -237,6 +237,74 @@ class OverWorkerClient:
             logger.exception("ZIP upload error: %s", e)
         return None
 
+    def upload_geojson(self, tracked_dataset_id: str, version_number: int,
+                       geojson_bytes: bytes, resource_name: str,
+                       filename: str | None = None,
+                       max_attempts: int = 3) -> str | None:
+        """Upload a GeoJSON FeatureCollection via multipart to
+        /api/worker/upload-geojson. Returns the odata resource_id (which
+        the caller passes back via push_version's `geojson_resource_ids`).
+
+        Per the over.org.il contract added 2026-05-02 the endpoint exposes
+        the file as a CKAN resource with `format=GeoJSON` (not as a ZIP
+        attachment), so downloaders see a directly-renderable geo file
+        alongside the CSV. `resource_name` is optional — defaults to the
+        filename without `.geojson`.
+
+        Retries with backoff on 5xx/connection errors. Returns None on
+        unrecoverable failure; caller can still publish the CSV resource
+        without the GeoJSON.
+        """
+        import io, time as _time
+        if not geojson_bytes:
+            logger.warning("upload_geojson: empty payload — skipping")
+            return None
+
+        fname = filename or f"{resource_name}.geojson"
+
+        last_err = ""
+        for attempt in range(1, max_attempts + 1):
+            try:
+                files = {"file": (fname, io.BytesIO(geojson_bytes),
+                                 "application/geo+json")}
+                data = {"version_number": str(version_number)}
+                if resource_name:
+                    data["resource_name"] = resource_name
+                import requests
+                resp = requests.post(
+                    self._url(f"/api/worker/upload-geojson/{tracked_dataset_id}"),
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    files=files,
+                    data=data,
+                    timeout=600,
+                )
+                if resp.status_code == 200:
+                    result = resp.json()
+                    logger.info("GeoJSON uploaded → resource_id=%s, size=%d KB",
+                                result.get("resource_id"),
+                                result.get("size", 0) // 1024)
+                    return result.get("resource_id")
+                last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                if resp.status_code >= 500 and attempt < max_attempts:
+                    wait = 5 * attempt
+                    logger.warning("GeoJSON upload attempt %d/%d got %d — retrying in %ds",
+                                   attempt, max_attempts, resp.status_code, wait)
+                    _time.sleep(wait)
+                    continue
+                logger.error("GeoJSON upload failed (attempt %d/%d): %s",
+                             attempt, max_attempts, last_err)
+                break
+            except Exception as e:
+                last_err = str(e)
+                if attempt < max_attempts:
+                    wait = 5 * attempt
+                    logger.warning("GeoJSON upload attempt %d/%d raised: %s — retrying in %ds",
+                                   attempt, max_attempts, last_err, wait)
+                    _time.sleep(wait)
+                    continue
+                logger.exception("GeoJSON upload error after %d attempts: %s", attempt, e)
+        return None
+
     def upload_csv(self, tracked_dataset_id: str, version_number: int,
                    csv_bytes: bytes, resource_name: str, row_count: int,
                    fields: list | None = None,
@@ -319,17 +387,37 @@ class OverWorkerClient:
                      zip_resource_id: str | None = None,
                      zip_resource_ids: list[str] | None = None,
                      csv_resource_ids: dict[str, str] | None = None,
+                     geojson_resource_ids: list[str] | None = None,
                      scraper_config_patch: dict | None = None,
+                     dataset_title_he: str | None = None,
                      skip_version: bool = False) -> dict:
         """Push scraped data as a new version to over.org.il.
         zip_resource_id: single ZIP (legacy). zip_resource_ids: list of parts (preferred).
         csv_resource_ids: maps resource_name -> odata resource_id when records were
             uploaded out-of-band via /api/worker/upload-csv (used for very large record
             sets that would exceed the 100MB JSON push limit). When provided for a
-            resource, send empty `records` for it."""
+            resource, send empty `records` for it.
+        geojson_resource_ids: list of resource_ids returned by
+            /api/worker/upload-geojson — over.org.il publishes them as CKAN
+            resources with format=GeoJSON. Added 2026-05-02 for govmap.
+        dataset_title_he: optional Hebrew title hint sent inside scrape_metadata.
+            over.org.il uses it to update tracked_dataset.title only when the
+            current title is still the auto-generated default (e.g.
+            "GovMap layer 200541"). User-edited titles are preserved.
+        """
         # If a resource has a pre-uploaded CSV, drop its records from the JSON
         # to keep the payload small (the server uses the uploaded file instead).
         records_for_resource = [] if (csv_resource_ids and "נתוני הסורק" in csv_resource_ids) else records
+
+        scrape_metadata: dict = {
+            "source_url": source_url,
+            "scrape_duration_seconds": round(duration_seconds, 1),
+            "total_items": len(records),
+            "total_files": len(attachments),
+            "scraper_version": "1.0.0",
+        }
+        if dataset_title_he:
+            scrape_metadata["dataset_title_he"] = dataset_title_he
 
         payload = {
             "tracked_dataset_id": tracked_dataset_id,
@@ -344,13 +432,7 @@ class OverWorkerClient:
                 }
             ],
             "attachments": attachments,
-            "scrape_metadata": {
-                "source_url": source_url,
-                "scrape_duration_seconds": round(duration_seconds, 1),
-                "total_items": len(records),
-                "total_files": len(attachments),
-                "scraper_version": "1.0.0",
-            },
+            "scrape_metadata": scrape_metadata,
         }
         if zip_resource_ids:
             payload["zip_resource_ids"] = zip_resource_ids
@@ -358,6 +440,8 @@ class OverWorkerClient:
             payload["zip_resource_id"] = zip_resource_id
         if csv_resource_ids:
             payload["csv_resource_ids"] = csv_resource_ids
+        if geojson_resource_ids:
+            payload["geojson_resource_ids"] = geojson_resource_ids
         if scraper_config_patch is not None:
             payload["scraper_config_patch"] = scraper_config_patch
         if skip_version:

@@ -48,6 +48,7 @@ def test_endpoint_paths_match_legacy_source():
         C.PATH_FAIL.replace("/{task_id}", "/"),
         C.PATH_UPLOAD_ZIP.replace("/{tracked_dataset_id}", "/"),
         C.PATH_UPLOAD_CSV.replace("/{tracked_dataset_id}", "/"),
+        C.PATH_UPLOAD_GEOJSON.replace("/{tracked_dataset_id}", "/"),
         C.PATH_PUSH_VERSION,
     ]
     for p in expected_paths:
@@ -81,6 +82,7 @@ def test_push_version_payload_keys_match_legacy_source():
         C.PV_ZIP_RESOURCE_ID,
         C.PV_ZIP_RESOURCE_IDS,
         C.PV_CSV_RESOURCE_IDS,
+        C.PV_GEOJSON_RESOURCE_IDS,
         C.PV_SCRAPER_CONFIG_PATCH,
         C.PV_SKIP_VERSION,
         C.RES_NAME,
@@ -93,6 +95,7 @@ def test_push_version_payload_keys_match_legacy_source():
         C.SM_TOTAL_ITEMS,
         C.SM_TOTAL_FILES,
         C.SM_SCRAPER_VERSION,
+        C.SM_DATASET_TITLE_HE,
     ]:
         assert f'"{k}"' in src, f"push-version key {k!r} missing from over_worker.py"
 
@@ -122,6 +125,9 @@ def test_publisher_calls_legacy_client_with_correct_args():
             return None
 
         def upload_zip(self, *a, **kw):
+            return None
+
+        def upload_geojson(self, *a, **kw):
             return None
 
     pub = OverOrgPublisher(api_key="x", _client=FakeClient())

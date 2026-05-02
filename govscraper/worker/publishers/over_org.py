@@ -74,6 +74,8 @@ class OverOrgPublisher:
         duration_s: float,
         *,
         extra_zip_resource_ids: list[str] | None = None,
+        extra_geojson_resource_ids: list[str] | None = None,
+        dataset_title_he: str | None = None,
     ) -> PublishOutcome:
         if not task.tracked_dataset_id:
             raise ValueError("over.org.il publish requires Task.tracked_dataset_id")
@@ -103,9 +105,11 @@ class OverOrgPublisher:
                 csv_resource_ids = {C.PRIMARY_RESOURCE_NAME: resource_id}
 
         # Phase D facade still doesn't handle attachment-zip rotation; the
-        # `extra_zip_resource_ids` arg is the seam used by `_publish_geo`
-        # to surface the GeoJSON resource alongside the CSV.
+        # `extra_zip_resource_ids` arg is reserved for future use. govmap
+        # GeoJSON now travels via `extra_geojson_resource_ids` → the
+        # dedicated /upload-geojson endpoint added 2026-05-02.
         zip_resource_ids: list[str] = list(extra_zip_resource_ids or [])
+        geojson_resource_ids: list[str] = list(extra_geojson_resource_ids or [])
 
         push_result = self._client.push_version(
             tracked_dataset_id=task.tracked_dataset_id,
@@ -116,6 +120,8 @@ class OverOrgPublisher:
             duration_seconds=duration_s,
             zip_resource_ids=zip_resource_ids or None,
             csv_resource_ids=csv_resource_ids,
+            geojson_resource_ids=geojson_resource_ids or None,
+            dataset_title_he=dataset_title_he,
         )
         return PublishOutcome(success=True, message=str(push_result.get("message", "ok")), refs=push_result)
 
@@ -127,22 +133,29 @@ class OverOrgPublisher:
     ) -> PublishOutcome:
         """Publish a GovMap layer scrape to over.org.il.
 
-        We send TWO resources so over.org.il exposes both the queryable
-        tabular form AND the lossless geometry:
+        Sends TWO CKAN resources — the tabular form for datastore indexing
+        AND the lossless geometry as a directly-renderable GeoJSON file:
 
-        1. CSV (primary, for CKAN datastore indexing) — properties +
-           `geometry_wkt` column. Sent inline via push_version's records.
-        2. GeoJSON ZIP (attached resource) — a single .geojson file inside
-           a ZIP, uploaded via upload-zip → returns a resource_id that we
-           reference in `zip_resource_ids` of push_version. Filename inside
-           the ZIP uses the layer caption (e.g. "גבולות ישובים בשטחי איו\\"ש.geojson")
-           rather than the numeric layer ID, so downloaders see what the
-           file actually contains.
+        1. CSV (primary)
+           - properties + `geometry_wkt` column (un-prefixed name; CKAN
+             reserves `_`-prefix for internal columns).
+           - records sent inline via push_version's `records` field.
+
+        2. GeoJSON (secondary)
+           - WGS84 FeatureCollection.
+           - Uploaded via the dedicated POST /api/worker/upload-geojson/<id>
+             endpoint (added 2026-05-02 in OVER) — returns a resource_id
+             that we pass through `geojson_resource_ids` in push_version.
+             over.org.il publishes it as a CKAN resource with format=GeoJSON.
+           - Earlier the GeoJSON went via upload-zip → zip_resource_ids;
+             that path is replaced because the ZIP wrapper made the file
+             non-discoverable as geo-data on the consumer side.
+
+        Also surfaces `dataset_title_he` (the layer caption from GovMap's
+        catalog) inside scrape_metadata so OVER can update the dataset
+        title from "GovMap layer 200541" to "גבולות ישובים בשטחי איו\\"ש".
         """
         # ---- 1. Build the flattened tabular form for the CSV resource ---
-        # NOTE: column name is `geometry_wkt` (no underscore prefix) — CKAN
-        # datastore_create rejects `_geometry_wkt` with HTTP 409 because
-        # leading underscores collide with CKAN's reserved column namespace.
         from ...geo.coords import geom_to_wkt
         rows: list[dict] = []
         for feat in result.features or []:
@@ -151,20 +164,30 @@ class OverOrgPublisher:
             row["geometry_wkt"] = geom_to_wkt(geom) if geom else ""
             rows.append(row)
 
-        # ---- 2. Build + upload the GeoJSON ZIP -------------------------
-        geojson_zip_resource_id: str | None = None
-        try:
-            geojson_zip_resource_id = self._upload_geojson_zip(task, result)
-        except Exception as e:
-            # Never fail the publish over the secondary GeoJSON — the CSV
-            # path is the primary obligation. Log and proceed.
+        # ---- 2. Upload the GeoJSON directly (skip if no features) ------
+        geojson_resource_id: str | None = None
+        if result.features:
+            try:
+                geojson_resource_id = self._upload_geojson(task, result)
+            except Exception as e:
+                # Never fail the publish over the secondary GeoJSON — the CSV
+                # is the primary obligation. Log and continue.
+                import logging
+                logging.getLogger(__name__).warning(
+                    "GeoJSON upload failed for task %s: %s. "
+                    "Continuing with CSV-only publish.", task.task_id, e
+                )
+        else:
             import logging
-            logging.getLogger(__name__).warning(
-                "GeoJSON resource upload failed for task %s: %s. "
-                "Continuing with CSV-only publish.", task.task_id, e
+            logging.getLogger(__name__).info(
+                "Empty FeatureCollection for task %s — skipping GeoJSON upload",
+                task.task_id,
             )
 
-        # ---- 3. Push the version with the CSV inline + the GeoJSON ZIP --
+        # ---- 3. Resolve the layer caption for dataset_title_he --------
+        dataset_title_he = self._resolve_dataset_title(result)
+
+        # ---- 4. Push the version with the CSV + GeoJSON resource_id ---
         flat = TabularResult(
             rows=rows,
             fields=_fields_from_rows(rows),
@@ -176,23 +199,26 @@ class OverOrgPublisher:
         )
         return self._publish_tabular(
             task, flat, duration_s,
-            extra_zip_resource_ids=([geojson_zip_resource_id]
-                                    if geojson_zip_resource_id else None),
+            extra_geojson_resource_ids=([geojson_resource_id]
+                                        if geojson_resource_id else None),
+            dataset_title_he=dataset_title_he,
         )
 
-    def _upload_geojson_zip(
+    def _upload_geojson(
         self,
         task: Task,
         result: GeoFeatureResult,
     ) -> str | None:
-        """Pack the FeatureCollection into a ZIP and upload via /upload-zip.
+        """Build a WGS84 FeatureCollection and upload via /upload-geojson.
 
-        The ZIP contains a single `<layer_caption>.geojson` file. Returns the
-        over.org.il resource_id, or None if the upload returned no ID.
+        The over.org.il backend (added 2026-05-02) exposes the upload as a
+        CKAN resource with format=GeoJSON, name=<resource_name>. We pass
+        the layer caption as resource_name so the resource appears
+        self-describing (not numeric-id-based).
         """
+        import json as _json
         import os
         import tempfile
-        import zipfile
 
         from ...io import geojson_writer
         from ...io.sanitize import sanitize_filename
@@ -208,19 +234,45 @@ class OverOrgPublisher:
                 bbox_wgs84=result.bbox_wgs84,
                 geometry_type=result.geometry_type,
             )
-            base = sanitize_filename(layer_label)
-            zip_path = os.path.join(tmp, f"{base}.geojson.zip")
-            # Use the layer caption as the in-zip filename so downloaders see
-            # a self-describing name, not "200541.geojson".
-            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                zf.write(geojson_path, arcname=os.path.basename(geojson_path))
+            with open(geojson_path, "rb") as f:
+                geojson_bytes = f.read()
 
-            return self._client.upload_zip(
+            base = sanitize_filename(layer_label)
+            return self._client.upload_geojson(
                 tracked_dataset_id=task.tracked_dataset_id,
                 version_number=1,
-                zip_path=zip_path,
-                attachment_count=1,
+                geojson_bytes=geojson_bytes,
+                resource_name=layer_label,
+                filename=f"{base}.geojson",
             )
+
+    def _resolve_dataset_title(
+        self,
+        result: GeoFeatureResult,
+    ) -> str | None:
+        """Return the GovMap catalog caption for the layer, or None.
+
+        Tries in order: result.layer_label (already populated by
+        resolve_layer when the URL matches a known layer), then a fresh
+        catalog lookup by layer_id. Returns None when neither is usable —
+        OVER then leaves the existing tracked_dataset.title untouched.
+        """
+        # Already resolved by resolve_layer (layers.json hit OR online catalog)
+        candidate = (result.layer_label or "").strip()
+        if candidate and candidate.lower() != (result.layer_id or "").lower():
+            # Skip placeholder labels like "LAYER_200541" that == layer_id
+            return candidate
+
+        # Fallback: try the online catalog
+        try:
+            from ...scrapers.govmap import catalog_fetch
+            entry = catalog_fetch.lookup_layer(result.layer_id)
+            if entry:
+                cap = (entry.get("caption") or "").strip()
+                return cap or None
+        except Exception:
+            pass
+        return None
 
     def _publish_ckan(
         self,
