@@ -237,6 +237,82 @@ class OverWorkerClient:
             logger.exception("ZIP upload error: %s", e)
         return None
 
+    def _resolve_govmap_layer_caption(self, result) -> str | None:
+        """Return the Hebrew caption for a GovMap layer, or None.
+
+        Order of attempts:
+          1. result.collector_name — set by govmap_engine.scrape_govmap to
+             the resolved Layer.label_he. Skipped if it looks like a
+             placeholder ("LAYER_NNNNNN" or "שכבה NNNNNN").
+          2. Online catalog lookup by result.layer_id via
+             govscraper.scrapers.govmap.catalog_fetch.
+
+        Returns None when neither yields a non-placeholder caption — OVER
+        then leaves tracked_dataset.title untouched.
+        """
+        layer_id = (getattr(result, "layer_id", "") or "").strip()
+        candidate = (getattr(result, "collector_name", "") or "").strip()
+
+        # Strip a "__<timestamp>" suffix that scrape_govmap appends in some
+        # paths, then normalise.
+        if "__" in candidate:
+            candidate = candidate.split("__", 1)[0].strip()
+
+        is_placeholder = (
+            not candidate
+            or candidate.upper() == f"LAYER_{layer_id.upper()}"
+            or candidate == f"שכבה {layer_id}"
+        )
+        if not is_placeholder:
+            return candidate
+
+        if not layer_id:
+            return None
+
+        # Fallback: live online catalog lookup
+        try:
+            from govscraper.scrapers.govmap import catalog_fetch
+            entry = catalog_fetch.lookup_layer(layer_id)
+            if entry:
+                cap = (entry.get("caption") or "").strip()
+                return cap or None
+        except Exception as e:
+            logger.warning("GovMap catalog lookup for %s failed: %s", layer_id, e)
+        return None
+
+    def _upload_govmap_geojson(self, tracked_dataset_id: str, result,
+                               layer_caption: str) -> str | None:
+        """Build a WGS84 FeatureCollection and POST it to /upload-geojson.
+
+        Returns the resource_id from the OVER response, or None when the
+        upload failed (caller logs and continues).
+        """
+        from govscraper.io import geojson_writer
+        from govscraper.io.sanitize import sanitize_filename
+        import os, tempfile
+
+        with tempfile.TemporaryDirectory(prefix="ovr_geojson_") as tmp:
+            geojson_path = geojson_writer.write_feature_collection(
+                output_dir=tmp,
+                name=layer_caption,
+                features=getattr(result, "features", []) or [],
+                layer_id=getattr(result, "layer_id", ""),
+                bbox_itm=getattr(result, "bbox_itm", None) or None,
+                bbox_wgs84=getattr(result, "bbox_wgs84", None) or None,
+                geometry_type=getattr(result, "geometry_type", ""),
+            )
+            with open(geojson_path, "rb") as f:
+                geojson_bytes = f.read()
+
+            base = sanitize_filename(layer_caption)
+            return self.upload_geojson(
+                tracked_dataset_id=tracked_dataset_id,
+                version_number=1,
+                geojson_bytes=geojson_bytes,
+                resource_name=layer_caption,
+                filename=f"{base}.geojson",
+            )
+
     def upload_geojson(self, tracked_dataset_id: str, version_number: int,
                        geojson_bytes: bytes, resource_name: str,
                        filename: str | None = None,
@@ -1029,6 +1105,40 @@ class OverWorkerClient:
                     self.report_failure(task_id, msg, phase="uploading")
                     return
 
+            # ---- GovMap layer extras ---------------------------------------
+            # When the scrape produced a geo-layer ScrapeResult (features list
+            # populated by govmap_engine.scrape_govmap), upload the lossless
+            # GeoJSON as its own CKAN resource via /upload-geojson, and pass
+            # the layer caption as `dataset_title_he` so OVER updates the
+            # dataset title from "GovMap layer NNNNNN" to the real name.
+            geojson_resource_ids: list[str] = []
+            dataset_title_he: str | None = None
+            features = getattr(result, "features", None) or []
+            if features:
+                # 1. Resolve the Hebrew layer caption — used both as the
+                #    GeoJSON resource name and as the dataset_title_he hint.
+                layer_caption = self._resolve_govmap_layer_caption(result)
+                if layer_caption:
+                    dataset_title_he = layer_caption
+
+                # 2. Serialise the FeatureCollection and upload it.
+                try:
+                    self.report_progress(task_id, "uploading", 0, 1,
+                                         "מעלה GeoJSON...")
+                    rid = self._upload_govmap_geojson(
+                        tracked_dataset_id=tracked_dataset_id,
+                        result=result,
+                        layer_caption=layer_caption or "layer",
+                    )
+                    if rid:
+                        geojson_resource_ids.append(rid)
+                except Exception as e:
+                    # Never fail the task over the secondary GeoJSON path.
+                    logger.warning(
+                        "GeoJSON upload failed for task %s: %s. "
+                        "Continuing with CSV-only publish.", task_id, e
+                    )
+
             self.report_progress(task_id, "exporting", 1, 1, "שולח נתונים לשרת...")
 
             duration = time.time() - start_time
@@ -1041,6 +1151,8 @@ class OverWorkerClient:
                 duration_seconds=duration,
                 zip_resource_ids=zip_resource_ids or None,
                 csv_resource_ids=csv_resource_ids,
+                geojson_resource_ids=geojson_resource_ids or None,
+                dataset_title_he=dataset_title_he,
             )
             logger.info("Task %s completed: %s", task_id, push_result.get("message"))
 
