@@ -99,7 +99,12 @@ def fetch_parcel_deals(gush, chelka,
         # __enter__/__exit__ directly leaks state on Python 3.14 → asyncio
         # loop conflict on the next call from the same process.
         with sync_playwright() as pw:
-            br = pw.chromium.launch(headless=headless)
+            # NOTE (2026-05-02 fix): nadlan rolled out a /token-verify
+            # gate that scores reCAPTCHA Enterprise tokens; vanilla Chromium
+            # gets scored too low and verification rejects with HTTP 400. Real
+            # Chrome (`channel="chrome"`) passes. Falls back to Chromium if
+            # Chrome isn't installed (rare on Windows but possible on CI).
+            br = _launch_browser(pw, headless=headless)
             try:
                 return _fetch_with_browser(
                     gush, chelka, br, progress,
@@ -113,6 +118,42 @@ def fetch_parcel_deals(gush, chelka,
     return _fetch_with_browser(
         gush, chelka, browser, progress,
         nav_timeout_ms, data_timeout_s)
+
+
+def _warmup_human_signal(page):
+    """Move the mouse and scroll a bit so reCAPTCHA Enterprise scores us
+    as human and the second /token-verify call passes (200 'ok:true')
+    instead of being rejected with HTTP 400 on every retry.
+    """
+    import random as _rnd
+    try:
+        for _ in range(6):
+            x = _rnd.randint(150, 1100)
+            y = _rnd.randint(150, 800)
+            page.mouse.move(x, y, steps=_rnd.randint(5, 15))
+            page.wait_for_timeout(_rnd.randint(150, 400))
+        page.mouse.wheel(0, 350)
+        page.wait_for_timeout(800)
+    except Exception as e:
+        # Warmup is best-effort — never fail the scrape over it.
+        logger.debug("warmup gesture failed: %s", e)
+
+
+def _launch_browser(pw, headless: bool):
+    """Try real Chrome first, fall back to Chromium if not installed.
+
+    Real Chrome bypasses nadlan's token-verify check that flags Chromium
+    as bot. Add --disable-blink-features=AutomationControlled so the
+    `navigator.webdriver` flag isn't set even on Chrome.
+    """
+    args = ["--disable-blink-features=AutomationControlled"]
+    try:
+        return pw.chromium.launch(channel="chrome", headless=headless, args=args)
+    except Exception as e:
+        logger.warning("nadlan: real Chrome unavailable (%s) — falling back to Chromium. "
+                       "Token-verify likely to fail. Run "
+                       "'python -m playwright install chrome' to fix.", e)
+        return pw.chromium.launch(headless=headless, args=args)
 
 
 def _fetch_with_browser(gush, chelka, browser, progress,
@@ -131,6 +172,11 @@ def _fetch_with_browser(gush, chelka, browser, progress,
 
     ctx = browser.new_context(locale="he-IL",
                               viewport={"width": 1280, "height": 900})
+    # Mask the most obvious automation flag — defence in depth on top of the
+    # `--disable-blink-features=AutomationControlled` launch arg.
+    ctx.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+    )
     try:
         page = ctx.new_page()
 
@@ -158,6 +204,11 @@ def _fetch_with_browser(gush, chelka, browser, progress,
 
         page.on("response", on_response)
         page.goto(url, wait_until="domcontentloaded", timeout=nav_timeout_ms)
+
+        # User-behaviour warmup so reCAPTCHA Enterprise gives a passing score.
+        # The first /token-verify usually fails (400); the SPA retries after
+        # a few seconds and the second one passes once the user looks "real".
+        _warmup_human_signal(page)
 
         deadline = time.time() + data_timeout_s
         while state["total_rows"] is None and time.time() < deadline:
