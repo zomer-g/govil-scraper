@@ -73,6 +73,25 @@ CREATE INDEX IF NOT EXISTS idx_nadlan_claimed ON nadlan_tasks(claimed_at);
 """
 
 
+_NADLAN_SETTLEMENT_TASKS_DDL = """
+CREATE TABLE IF NOT EXISTS nadlan_settlement_tasks (
+    setl_code     TEXT PRIMARY KEY,
+    setl_name     TEXT DEFAULT '',
+    population    INTEGER DEFAULT 0,
+    state         TEXT DEFAULT 'pending',
+    worker_id     TEXT DEFAULT '',
+    deals_count   INTEGER DEFAULT 0,
+    total_fetch   INTEGER DEFAULT 0,   -- pages reported by API on page 1
+    error         TEXT DEFAULT '',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    claimed_at    TIMESTAMPTZ,
+    completed_at  TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_nadlan_setl_state ON nadlan_settlement_tasks(state);
+CREATE INDEX IF NOT EXISTS idx_nadlan_setl_claimed ON nadlan_settlement_tasks(claimed_at);
+"""
+
+
 _NADLAN_DEALS_DDL = """
 CREATE TABLE IF NOT EXISTS nadlan_deals (
     id              BIGSERIAL PRIMARY KEY,
@@ -178,6 +197,7 @@ class PgStore:
         with self._lock, self._conn() as conn, conn.cursor() as cur:
             cur.execute(_NADLAN_TASKS_DDL)
             cur.execute(_NADLAN_DEALS_DDL)
+            cur.execute(_NADLAN_SETTLEMENT_TASKS_DDL)
             conn.commit()
 
     # --- nadlan_tasks ----------------------------------------------------
@@ -404,6 +424,146 @@ class PgStore:
                     for row in chunk:
                         w.writerow(row)
                     yield buf.getvalue().encode("utf-8-sig")
+
+    # --- nadlan_settlement_tasks ---------------------------------------
+
+    def settlement_create_tasks(self, settlements: list[dict]) -> dict:
+        """Bulk-insert settlement tasks. Idempotent.
+
+        ``settlements`` rows must include ``setl_code``; ``setl_name`` and
+        ``population`` are stored for visibility.
+        """
+        if not settlements:
+            return {"inserted": 0, "skipped": 0}
+        prepared = []
+        for s in settlements:
+            code = str(s.get("setl_code") or s.get("SETL_CODE") or "").strip()
+            if not code:
+                continue
+            prepared.append((
+                code,
+                str(s.get("setl_name") or s.get("SETL_NAME") or ""),
+                int(s.get("population") or s.get("POPULATION") or 0 or 0),
+            ))
+        if not prepared:
+            return {"inserted": 0, "skipped": len(settlements)}
+        with self._lock, self._conn() as conn, conn.cursor() as cur:
+            cur.executemany(
+                """INSERT INTO nadlan_settlement_tasks
+                   (setl_code, setl_name, population)
+                   VALUES (%s, %s, %s)
+                   ON CONFLICT (setl_code) DO NOTHING""",
+                prepared,
+            )
+            inserted = cur.rowcount
+            conn.commit()
+        return {"inserted": inserted, "skipped": len(settlements) - inserted}
+
+    def settlement_claim_tasks(self, worker_id: str, count: int = 1) -> list[dict]:
+        if count < 1:
+            return []
+        with self._lock, self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """WITH picked AS (
+                       SELECT setl_code FROM nadlan_settlement_tasks
+                       WHERE state = 'pending'
+                       ORDER BY population DESC NULLS LAST, created_at
+                       FOR UPDATE SKIP LOCKED
+                       LIMIT %s
+                   )
+                   UPDATE nadlan_settlement_tasks t
+                   SET state = 'claimed',
+                       worker_id = %s,
+                       claimed_at = NOW()
+                   FROM picked
+                   WHERE t.setl_code = picked.setl_code
+                   RETURNING t.*""",
+                (count, worker_id),
+            )
+            rows = cur.fetchall()
+            conn.commit()
+        for r in rows:
+            for k in ("created_at", "claimed_at", "completed_at"):
+                if r.get(k):
+                    r[k] = r[k].isoformat()
+        return list(rows)
+
+    def settlement_complete_task(self, setl_code: str,
+                                  deals_count: int,
+                                  total_fetch: int = 0) -> bool:
+        with self._lock, self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """UPDATE nadlan_settlement_tasks
+                   SET state = 'done', deals_count = %s, total_fetch = %s,
+                       completed_at = NOW(), error = ''
+                   WHERE setl_code = %s""",
+                (int(deals_count or 0), int(total_fetch or 0), setl_code),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+    def settlement_fail_task(self, setl_code: str, error: str,
+                              transient: bool) -> bool:
+        with self._lock, self._conn() as conn, conn.cursor() as cur:
+            if transient:
+                cur.execute(
+                    """UPDATE nadlan_settlement_tasks
+                       SET state = 'pending', worker_id = '',
+                           claimed_at = NULL, error = %s
+                       WHERE setl_code = %s""",
+                    (str(error)[:500], setl_code),
+                )
+            else:
+                cur.execute(
+                    """UPDATE nadlan_settlement_tasks
+                       SET state = 'failed', completed_at = NOW(),
+                           error = %s
+                       WHERE setl_code = %s""",
+                    (str(error)[:500], setl_code),
+                )
+            conn.commit()
+            return cur.rowcount > 0
+
+    def settlement_reset_stale(self, timeout_seconds: int = 1800) -> int:
+        """Default 30 min — settlements with many pages take longer than parcels."""
+        with self._lock, self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """UPDATE nadlan_settlement_tasks
+                   SET state = 'pending', worker_id = '', claimed_at = NULL
+                   WHERE state = 'claimed'
+                     AND claimed_at < NOW() - make_interval(secs => %s)""",
+                (timeout_seconds,),
+            )
+            conn.commit()
+            return cur.rowcount
+
+    def settlement_status(self) -> dict:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT state, COUNT(*) AS c FROM nadlan_settlement_tasks GROUP BY state"
+            )
+            counts = {r["state"]: r["c"] for r in cur.fetchall()}
+            cur.execute(
+                "SELECT COALESCE(SUM(deals_count), 0) AS t "
+                "FROM nadlan_settlement_tasks"
+            )
+            total_deals = cur.fetchone()["t"]
+        total = sum(counts.values())
+        return {
+            "pending": counts.get("pending", 0),
+            "claimed": counts.get("claimed", 0),
+            "done":    counts.get("done", 0),
+            "failed":  counts.get("failed", 0),
+            "total":   total,
+            "deals_collected": int(total_deals or 0),
+        }
+
+    def settlement_clear(self) -> int:
+        with self._lock, self._conn() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM nadlan_settlement_tasks")
+            n = cur.rowcount
+            conn.commit()
+            return n
 
 
 # Module-level singleton (lazy)

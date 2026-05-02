@@ -552,3 +552,136 @@ def bulk_deals_csv():
     return send_file(path, mimetype="text/csv",
                      as_attachment=True,
                      download_name="nadlan_deals_master.csv")
+
+
+# ===========================================================================
+# Settlement-level distributed queue (Phase A — full pagination per setl)
+# ===========================================================================
+
+def _require_pg():
+    try:
+        from pg_store import get_pg_store
+        pg = get_pg_store()
+    except Exception:
+        pg = None
+    if pg is None:
+        return None, (jsonify({"error": "Postgres backend required"}), 501)
+    return pg, None
+
+
+@nadlan_api_bp.route("/settlement-seed", methods=["POST"])
+def settlement_seed():
+    """Admin: seed the queue with all 1,509 settlements from data.gov.il.
+
+    Idempotent — safe to call multiple times. Pulls the catalog from
+    data.nadlan.gov.il/api/index/setl_types.json (no auth needed).
+    """
+    if not _admin_or_worker():
+        return jsonify({"error": "admin or worker key required"}), 403
+    pg, err = _require_pg()
+    if err: return err
+
+    try:
+        r = requests.get(
+            "https://data.nadlan.gov.il/api/index/setl_types.json",
+            timeout=30,
+        )
+        r.raise_for_status()
+        catalog = r.json()
+    except Exception as e:
+        return jsonify({"error": f"failed to fetch catalog: {e}"}), 502
+
+    # The catalog is a dict {setl_code: {SETL_NAME, POPULATION, ...}}.
+    settlements = []
+    if isinstance(catalog, dict):
+        for code, meta in catalog.items():
+            settlements.append({
+                "setl_code": str(code),
+                "setl_name": (meta or {}).get("SETL_NAME", ""),
+                "population": (meta or {}).get("POPULATION", 0),
+            })
+    elif isinstance(catalog, list):
+        for entry in catalog:
+            settlements.append({
+                "setl_code": str(entry.get("setl_code") or
+                                  entry.get("SETL_CODE") or
+                                  entry.get("id") or ""),
+                "setl_name": entry.get("SETL_NAME") or
+                              entry.get("setl_name") or "",
+                "population": entry.get("POPULATION", 0),
+            })
+
+    result = pg.settlement_create_tasks(settlements)
+    logger.info("settlement-seed: %s", result)
+    return jsonify({**result, "catalog_size": len(settlements)})
+
+
+@nadlan_api_bp.route("/settlement-claim", methods=["POST"])
+def settlement_claim():
+    """Worker: atomically claim up to N settlements ordered by population desc."""
+    body = request.get_json(silent=True) or {}
+    worker_id = str(body.get("worker_id") or "").strip()
+    count = int(body.get("count") or 1)
+    if not worker_id:
+        return jsonify({"error": "worker_id required"}), 400
+    pg, err = _require_pg()
+    if err: return err
+    pg.settlement_reset_stale(timeout_seconds=1800)
+    tasks = pg.settlement_claim_tasks(worker_id, count)
+    return jsonify({"tasks": tasks, "claimed": len(tasks)})
+
+
+@nadlan_api_bp.route("/settlement-result/<setl_code>", methods=["POST"])
+def settlement_result(setl_code):
+    """Worker: upload deals scraped for one settlement. Multipart CSV.
+
+    Form fields: worker_id, deals_count, total_fetch (informational).
+    """
+    worker_id = (request.form.get("worker_id") or "").strip()
+    if not worker_id:
+        return jsonify({"error": "worker_id required"}), 400
+    pg, err = _require_pg()
+    if err: return err
+
+    rows: list[dict] = []
+    upload = request.files.get("file")
+    if upload:
+        text = upload.read().decode("utf-8-sig", errors="replace")
+        rows = list(_csv.DictReader(io.StringIO(text)))
+
+    appended = pg.append_deals(rows) if rows else 0
+    total_fetch = int(request.form.get("total_fetch") or 0)
+    pg.settlement_complete_task(setl_code, deals_count=appended,
+                                 total_fetch=total_fetch)
+    return jsonify({"appended": appended, "task_state": "done"})
+
+
+@nadlan_api_bp.route("/settlement-fail/<setl_code>", methods=["POST"])
+def settlement_fail(setl_code):
+    worker_id = (request.form.get("worker_id") or "").strip()
+    error = (request.form.get("error") or "")[:500]
+    transient_flag = (request.form.get("transient") or "true").lower() != "false"
+    if not worker_id:
+        return jsonify({"error": "worker_id required"}), 400
+    pg, err = _require_pg()
+    if err: return err
+    pg.settlement_fail_task(setl_code, error, transient=transient_flag)
+    return jsonify({"recorded": True, "transient": transient_flag})
+
+
+@nadlan_api_bp.route("/settlement-status", methods=["GET"])
+def settlement_status():
+    """Public aggregate counts for the settlement queue."""
+    pg, err = _require_pg()
+    if err: return err
+    return jsonify(pg.settlement_status())
+
+
+@nadlan_api_bp.route("/settlement-clear", methods=["POST"])
+def settlement_clear():
+    if not _admin_or_worker():
+        return jsonify({"error": "admin or worker key required"}), 403
+    pg, err = _require_pg()
+    if err: return err
+    n = pg.settlement_clear()
+    return jsonify({"cleared": n})

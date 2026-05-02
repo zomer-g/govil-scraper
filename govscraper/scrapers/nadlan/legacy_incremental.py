@@ -37,6 +37,8 @@ existing dispatch):
 import base64
 import csv
 import gzip
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -45,6 +47,43 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional, Tuple
 
 import requests
+
+# JWT signing secret — reverse-engineered from the SPA bundle. The same one
+# legacy_api documents. Used to build pagination requests for fetch_number>1.
+_NADLAN_JWT_SECRET = "90c3e620192348f1bd46fcd9138c3c68"
+
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(s: str) -> bytes:
+    s = s.encode("ascii")
+    s += b"=" * ((4 - len(s) % 4) % 4)
+    return base64.urlsafe_b64decode(s)
+
+
+def _decode_reversed_jwt(reversed_token: str) -> Tuple[dict, dict]:
+    """Reverse a nadlan-style ``##`` payload and decode header + payload."""
+    token = reversed_token[::-1]
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise ValueError(f"invalid JWT format (parts={len(parts)})")
+    header = json.loads(_b64url_decode(parts[0]))
+    payload = json.loads(_b64url_decode(parts[1]))
+    return header, payload
+
+
+def _sign_reversed_jwt(header: dict, payload: dict,
+                        secret: str = _NADLAN_JWT_SECRET) -> str:
+    """Build a fresh nadlan-style reversed JWT for the given payload."""
+    h = _b64url_encode(json.dumps(header, separators=(",", ":")).encode())
+    p = _b64url_encode(json.dumps(payload, separators=(",", ":")).encode())
+    msg = f"{h}.{p}".encode("ascii")
+    sig = hmac.new(secret.encode("ascii"), msg, hashlib.sha256).digest()
+    s = _b64url_encode(sig)
+    forward = f"{h}.{p}.{s}"
+    return forward[::-1]
 
 from govscraper.io.archive_engine import append_to_csv, regenerate_excel_from_csv
 from govscraper.io.sanitize import sanitize_filename
@@ -108,6 +147,21 @@ def _load_settlements() -> dict:
     return r.json()
 
 
+def _warmup_human_signal(page) -> None:
+    """Mouse + scroll gestures so reCAPTCHA Enterprise gives a passing score."""
+    import random as _rnd
+    try:
+        for _ in range(8):
+            x = _rnd.randint(150, 1100)
+            y = _rnd.randint(150, 800)
+            page.mouse.move(x, y, steps=_rnd.randint(8, 20))
+            page.wait_for_timeout(_rnd.randint(120, 350))
+        page.mouse.wheel(0, 400)
+        page.wait_for_timeout(700)
+    except Exception as e:
+        logger.debug("warmup gesture failed: %s", e)
+
+
 # ---------------------------------------------------------------------------
 # Playwright session — single Chromium reused across settlements.
 # ---------------------------------------------------------------------------
@@ -139,17 +193,32 @@ class NadlanBrowser:
     def __enter__(self):
         from playwright.sync_api import sync_playwright
         self._pw = sync_playwright().start()
-        self._browser = self._pw.chromium.launch(headless=self.headless)
+        # Use real Chrome (not Chromium) so the 2026-05-02 token-verify gate
+        # accepts our reCAPTCHA Enterprise score. See legacy_api._launch_browser.
+        args = ["--disable-blink-features=AutomationControlled"]
+        try:
+            self._browser = self._pw.chromium.launch(
+                channel="chrome", headless=self.headless, args=args)
+        except Exception as e:
+            logger.warning("real Chrome unavailable (%s) — falling back to Chromium. "
+                           "token-verify likely to fail. Run "
+                           "'python -m playwright install chrome' to fix.", e)
+            self._browser = self._pw.chromium.launch(
+                headless=self.headless, args=args)
         self._ctx = self._browser.new_context(
             locale="he-IL",
             viewport={"width": 1280, "height": 900},
         )
+        self._ctx.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+        )
         self._page = self._ctx.new_page()
-        # Warm up the SPA so recaptcha boots once.
+        # Warm up the SPA so recaptcha boots once + a human signal so it
+        # scores us above the bot threshold.
         self._page.goto("https://www.nadlan.gov.il/",
                         wait_until="domcontentloaded",
                         timeout=self.nav_timeout_ms)
-        self._page.wait_for_timeout(3000)
+        _warmup_human_signal(self._page)
         return self
 
     def __exit__(self, *_):
@@ -161,54 +230,80 @@ class NadlanBrowser:
                 self._pw.stop()
 
     def fetch_settlement(self, setl_code: str, retries: int = 2) -> list[dict]:
-        """Navigate to the settlement page, capture /deal-data, return deals.
+        """Navigate to the settlement page and return ALL deals via pagination.
 
-        Returns the 500 most recent deals (fetch_number=1). If recaptcha is
-        expired (statusCode 405 in decoded body) we re-warm the SPA and retry.
+        Strategy:
+          1. ``page.goto`` triggers the SPA's first /deal-data with
+             fetch_number=1 (max 500 deals).
+          2. We capture the request body so we have a valid JWT template
+             with the right claims (signed reCAPTCHA token, etc.).
+          3. For fetch_number=2..total_fetch we re-sign the JWT with the
+             new fetch_number and POST it via ``page.evaluate(fetch(...))``
+             so the request runs in the same browser context (same cookies,
+             same session — token-verify passes once for all pages).
+          4. Items are deduped by (assetId, dealDate, row_id) across pages.
+
+        On 405 (token-verify rejected) we re-warm the SPA and retry the
+        whole settlement.
         """
         url = f"https://www.nadlan.gov.il/?view=settlement&id={setl_code}&page=deals"
 
         for attempt in range(retries + 1):
-            captured: list[bytes] = []
+            deals = []
+            seen = set()
+            captured_responses: list[bytes] = []
+            captured_request: dict = {"body": None, "url": None, "headers": None}
+            state = {"total_fetch": None, "total_rows": None}
+
+            def on_request(req):
+                if req.method == "POST" and "deal-data" in req.url:
+                    if captured_request["body"] is None:
+                        captured_request["body"] = req.post_data
+                        captured_request["url"] = req.url
+                        captured_request["headers"] = dict(req.headers)
 
             def on_response(resp):
                 if "deal-data" not in resp.url:
                     return
                 try:
-                    captured.append(resp.body())
+                    captured_responses.append(resp.body())
                 except Exception:
                     pass
 
+            self._page.on("request", on_request)
             self._page.on("response", on_response)
             try:
                 self._page.goto(url, wait_until="domcontentloaded",
                                 timeout=self.nav_timeout_ms)
+                _warmup_human_signal(self._page)
+
+                # Wait for the first /deal-data response.
                 deadline = time.time() + self.data_timeout_s
-                while not captured and time.time() < deadline:
+                while not captured_responses and time.time() < deadline:
                     self._page.wait_for_timeout(500)
-                # Allow late paginated responses to land.
                 self._page.wait_for_timeout(1500)
             finally:
                 try:
+                    self._page.remove_listener("request", on_request)
                     self._page.remove_listener("response", on_response)
                 except Exception:
                     pass
 
-            deals = []
-            saw_405 = False
-            for body in captured:
-                try:
-                    decoded = json.loads(gzip.decompress(base64.b64decode(body)))
-                except Exception as e:
-                    logger.warning("deal-data decode failed for setl %s: %s", setl_code, e)
-                    continue
-                sc = decoded.get("statusCode")
-                if sc == 405:
-                    saw_405 = True
-                    continue
-                if sc == 200:
-                    items = (decoded.get("data") or {}).get("items") or []
-                    deals.extend(items)
+            # Parse responses captured so far.
+            saw_405 = self._parse_responses(captured_responses, deals, seen, state)
+
+            # If we got data and there are more pages, paginate.
+            if deals and state["total_fetch"] and state["total_fetch"] > 1:
+                logger.info("setl %s: got %d/%d deals on page 1 (total_fetch=%d), "
+                            "paginating", setl_code, len(deals),
+                            state["total_rows"], state["total_fetch"])
+                ok = self._paginate_remaining(
+                    setl_code, captured_request, state["total_fetch"],
+                    deals, seen)
+                if not ok:
+                    logger.warning("setl %s: pagination failed at page %d, "
+                                   "returning %d deals partial",
+                                   setl_code, len(deals)//500 + 1, len(deals))
 
             if deals:
                 return deals
@@ -216,15 +311,125 @@ class NadlanBrowser:
                 # No 405 and no items — settlement is empty.
                 return []
 
-            # 405 only — refresh recaptcha and retry.
+            # 405 only — refresh recaptcha and retry the settlement.
             logger.info("recaptcha refresh on settlement %s (attempt %d)",
                         setl_code, attempt + 1)
             self._page.goto("https://www.nadlan.gov.il/",
                             wait_until="domcontentloaded",
                             timeout=self.nav_timeout_ms)
-            self._page.wait_for_timeout(4000)
+            _warmup_human_signal(self._page)
 
         return []
+
+    @staticmethod
+    def _parse_responses(bodies: list[bytes], deals: list[dict],
+                          seen: set, state: dict) -> bool:
+        """Decode captured /deal-data bodies, append unique items, return saw_405."""
+        saw_405 = False
+        for body in bodies:
+            try:
+                decoded = json.loads(gzip.decompress(base64.b64decode(body)))
+            except Exception as e:
+                logger.warning("deal-data decode failed: %s", e)
+                continue
+            sc = decoded.get("statusCode")
+            if sc == 405:
+                saw_405 = True
+                continue
+            if sc == 200:
+                data = decoded.get("data") or {}
+                if state["total_fetch"] is None:
+                    state["total_fetch"] = data.get("total_fetch")
+                    state["total_rows"] = data.get("total_rows")
+                for it in data.get("items") or []:
+                    key = (it.get("assetId"), it.get("dealDate"),
+                           it.get("row_id"))
+                    if key not in seen:
+                        seen.add(key)
+                        deals.append(it)
+        return saw_405
+
+    def _paginate_remaining(self, setl_code: str, captured_request: dict,
+                             total_fetch: int,
+                             deals: list[dict], seen: set) -> bool:
+        """Issue requests for fetch_number=2..total_fetch using the captured
+        JWT template and the page's existing reCAPTCHA session.
+
+        Returns True if all pages were fetched, False on first failure.
+        """
+        if not captured_request["body"]:
+            logger.warning("setl %s: no request template captured, can't paginate",
+                           setl_code)
+            return False
+
+        # Decode the original ## payload to learn the schema.
+        try:
+            wrapper = json.loads(captured_request["body"])
+            reversed_jwt = wrapper.get("##")
+            header, payload = _decode_reversed_jwt(reversed_jwt)
+        except Exception as e:
+            logger.warning("setl %s: could not decode JWT template: %s", setl_code, e)
+            return False
+
+        url = captured_request["url"]
+        headers = captured_request["headers"] or {}
+
+        for fetch_num in range(2, total_fetch + 1):
+            new_payload = dict(payload)
+            new_payload["fetch_number"] = fetch_num
+            try:
+                new_token = _sign_reversed_jwt(header, new_payload)
+            except Exception as e:
+                logger.warning("setl %s: re-sign failed at fetch=%d: %s",
+                                setl_code, fetch_num, e)
+                return False
+
+            body = json.dumps({"##": new_token})
+            # Send through the page so cookies + session apply.
+            response_text = self._page.evaluate(
+                """async ({url, body, headers}) => {
+                    const r = await fetch(url, {
+                        method: 'POST',
+                        body: body,
+                        headers: headers,
+                        credentials: 'include',
+                    });
+                    return await r.text();
+                }""",
+                {"url": url, "body": body,
+                 "headers": {"content-type": "text/plain",
+                             "origin": "https://www.nadlan.gov.il",
+                             "referer": "https://www.nadlan.gov.il/"}}
+            )
+            # response_text is base64+gzip wrapper
+            try:
+                decoded = json.loads(
+                    gzip.decompress(base64.b64decode(response_text))
+                )
+            except Exception as e:
+                logger.warning("setl %s fetch=%d: response decode failed: %s",
+                                setl_code, fetch_num, e)
+                return False
+            sc = decoded.get("statusCode")
+            if sc != 200:
+                logger.warning("setl %s fetch=%d: statusCode=%s — stopping pagination",
+                                setl_code, fetch_num, sc)
+                return False
+            data = decoded.get("data") or {}
+            new_items = 0
+            for it in data.get("items") or []:
+                key = (it.get("assetId"), it.get("dealDate"), it.get("row_id"))
+                if key not in seen:
+                    seen.add(key)
+                    deals.append(it)
+                    new_items += 1
+            logger.info("setl %s fetch=%d: +%d new (cumulative %d)",
+                        setl_code, fetch_num, new_items, len(deals))
+
+            # Light pacing between pages to keep reCAPTCHA happy.
+            self._page.wait_for_timeout(800)
+
+        return True
 
 
 # ---------------------------------------------------------------------------
