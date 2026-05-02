@@ -385,26 +385,30 @@ class NadlanBrowser:
                 return False
 
             body = json.dumps({"##": new_token})
-            # Send through the page so cookies + session apply. We do NOT
-            # set origin/referer ourselves — the browser sets them automatically
-            # based on the page URL, and trying to override them causes the
-            # request to be silently dropped with "Failed to fetch".
-            response_text = self._page.evaluate(
-                """async ({url, body}) => {
-                    const r = await fetch(url, {
-                        method: 'POST',
-                        body: body,
-                        headers: {'content-type': 'text/plain'},
-                        credentials: 'include',
-                        mode: 'cors',
-                    });
-                    if (!r.ok) {
-                        throw new Error('HTTP ' + r.status);
-                    }
-                    return await r.text();
-                }""",
-                {"url": url, "body": body}
-            )
+            # Use Playwright's APIRequestContext which inherits cookies from
+            # the page session but is not subject to in-page CORS preflight.
+            # In-page fetch() to api.nadlan.gov.il from www.nadlan.gov.il
+            # was failing with "TypeError: Failed to fetch" (CORS preflight).
+            try:
+                resp = self._page.request.post(
+                    url,
+                    data=body.encode("utf-8"),
+                    headers={
+                        "content-type": "text/plain",
+                        "origin": "https://www.nadlan.gov.il",
+                        "referer": "https://www.nadlan.gov.il/",
+                    },
+                    timeout=30000,
+                )
+            except Exception as e:
+                logger.warning("setl %s fetch=%d: request failed: %s",
+                                setl_code, fetch_num, e)
+                return False
+            if resp.status != 200:
+                logger.warning("setl %s fetch=%d: HTTP %d — stopping pagination",
+                                setl_code, fetch_num, resp.status)
+                return False
+            response_text = resp.text()
             # response_text is base64+gzip wrapper
             try:
                 decoded = json.loads(
