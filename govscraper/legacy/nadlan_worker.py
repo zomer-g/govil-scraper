@@ -159,7 +159,8 @@ def _build_deal_row(task: dict, deal: dict, meta: dict, worker_id: str) -> dict:
 def run(server_url: str, worker_id: str,
         idle_sleep_s: int = 30,
         max_consecutive_transient: int = 10,
-        backoff_on_outage_s: int = 120):
+        backoff_on_outage_s: int = 120,
+        per_parcel_pause_s: float = 5.0):
     """Main worker loop.
 
     - Polls server for tasks; on empty response, sleeps and retries.
@@ -263,6 +264,13 @@ def run(server_url: str, worker_id: str,
                     logger.warning("upload failed for %s: %s", parcel_id, e)
                     client.report_failure(parcel_id, f"upload error: {e}",
                                           transient=True)
+
+                # Throttle: sleeping a few seconds between parcels keeps
+                # nadlan.gov.il's reCAPTCHA Enterprise from flagging the IP.
+                # Without this, 25-30 rapid scrapes started rejecting every
+                # /token-verify with HTTP 400, returning items=[] from then on.
+                if per_parcel_pause_s > 0:
+                    time.sleep(per_parcel_pause_s)
         finally:
             try:
                 browser.close()
@@ -281,10 +289,17 @@ def main():
                     help="identifier for this worker (default: hostname)")
     ap.add_argument("--idle-sleep", type=int, default=30,
                     help="seconds to sleep when no tasks are available")
+    ap.add_argument("--pause", type=float, default=5.0,
+                    help="seconds to wait between parcels (default 5.0). "
+                         "Lower values risk reCAPTCHA Enterprise flagging "
+                         "the IP and rejecting all /token-verify requests; "
+                         "set to 0 only when running through a fresh IP.")
     args = ap.parse_args()
     if not args.server:
         ap.error("--server or NADLAN_SERVER_URL is required")
-    run(args.server.rstrip("/"), args.worker_id, idle_sleep_s=args.idle_sleep)
+    run(args.server.rstrip("/"), args.worker_id,
+        idle_sleep_s=args.idle_sleep,
+        per_parcel_pause_s=args.pause)
 
 
 if __name__ == "__main__":
