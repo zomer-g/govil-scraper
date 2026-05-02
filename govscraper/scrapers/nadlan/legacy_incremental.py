@@ -349,43 +349,56 @@ class NadlanBrowser:
                         deals.append(it)
         return saw_405
 
-    _grecaptcha_loaded = False
+    _rc_widget_id = None
 
-    def _ensure_grecaptcha_loaded(self, site_key: str) -> bool:
-        """The SPA loads recaptcha enterprise.js with ?render=explicit, which
-        registers the runtime in ``manual widget`` mode.  In that mode
-        ``grecaptcha.enterprise.execute(siteKey, ...)`` returns 'Invalid
-        site key or not loaded in api.js'.
-
-        Workaround: dynamically inject a *second* enterprise.js with
-        ``?render=<siteKey>`` so the runtime knows about our key, then
-        ``execute()`` works.  Once-per-page is enough."""
-        if self._grecaptcha_loaded:
+    def _ensure_grecaptcha_widget(self, site_key: str) -> bool:
+        """The SPA loaded enterprise.js with ?render=explicit, so
+        ``execute(siteKey, ...)`` is rejected.  Render an invisible widget
+        with our site key — the resulting widgetId works with
+        ``execute(widgetId, {action: ...})``."""
+        if self._rc_widget_id is not None:
             return True
         try:
-            ok = self._page.evaluate(
+            wid = self._page.evaluate(
                 """async (siteKey) => {
-                    const url = 'https://www.google.com/recaptcha/enterprise.js?render=' + siteKey;
-                    if (document.querySelector(`script[src="${url}"]`)) return true;
                     return await new Promise((resolve) => {
-                        const s = document.createElement('script');
-                        s.src = url;
-                        s.onload = () => {
-                            try {
-                                grecaptcha.enterprise.ready(() => resolve(true));
-                            } catch (e) { resolve(false); }
-                        };
-                        s.onerror = () => resolve(false);
-                        document.head.appendChild(s);
+                        try {
+                            grecaptcha.enterprise.ready(() => {
+                                let div = document.getElementById('rc-helper');
+                                if (!div) {
+                                    div = document.createElement('div');
+                                    div.id = 'rc-helper';
+                                    div.style.position = 'absolute';
+                                    div.style.left = '-9999px';
+                                    document.body.appendChild(div);
+                                }
+                                try {
+                                    const id = grecaptcha.enterprise.render('rc-helper', {
+                                        sitekey: siteKey,
+                                        size: 'invisible',
+                                        badge: 'bottomright',
+                                    });
+                                    resolve(id);
+                                } catch (e) {
+                                    resolve({err: String(e && e.message || e)});
+                                }
+                            });
+                        } catch (e) {
+                            resolve({err: 'ready threw: ' + String(e)});
+                        }
                     });
                 }""",
                 site_key,
             )
         except Exception as e:
-            logger.warning("recaptcha api load threw: %s", e)
+            logger.warning("recaptcha widget render threw: %s", e)
             return False
-        self._grecaptcha_loaded = bool(ok)
-        return self._grecaptcha_loaded
+        if isinstance(wid, dict) and "err" in wid:
+            logger.warning("recaptcha widget render err: %s", wid["err"])
+            return False
+        self._rc_widget_id = wid
+        logger.info("recaptcha widget rendered, id=%s", wid)
+        return True
 
     def _mint_token_verify_uuid(self, site_key: str, log: bool = False,
                                   setl_code: str = "") -> Optional[str]:
@@ -395,26 +408,26 @@ class NadlanBrowser:
 
         Returns the UUID string, or None on failure.
         """
-        if not self._ensure_grecaptcha_loaded(site_key):
+        if not self._ensure_grecaptcha_widget(site_key):
             if log:
-                logger.warning("setl %s: could not load recaptcha api with site_key",
+                logger.warning("setl %s: could not render recaptcha widget",
                                setl_code)
             return None
 
-        # Step 1: fresh recaptcha token
+        # Step 1: fresh recaptcha token via widgetId (NOT siteKey string)
         try:
             result = self._page.evaluate(
-                """async (siteKey) => {
+                """async (widgetId) => {
                     const out = {token: null, err: null};
                     try {
                         out.token = await grecaptcha.enterprise.execute(
-                            siteKey, {action: 'submit'});
+                            widgetId, {action: 'submit'});
                     } catch (e) {
                         out.err = String(e && e.message || e);
                     }
                     return out;
                 }""",
-                site_key,
+                self._rc_widget_id,
             )
         except Exception as e:
             if log:
