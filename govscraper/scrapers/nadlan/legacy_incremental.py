@@ -221,8 +221,10 @@ class NadlanBrowser:
                     headless=self.headless, args=args)
         if cdp_attached and self._browser.contexts:
             self._ctx = self._browser.contexts[0]
-            self._page = (self._ctx.pages[0]
-                          if self._ctx.pages else self._ctx.new_page())
+            # Always open a NEW tab — reusing an existing tab can inherit
+            # stuck SPA state (error modals, cached deals view) from
+            # previous runs that prevents /deal-data from re-firing.
+            self._page = self._ctx.new_page()
         else:
             self._ctx = self._browser.new_context(
                 locale="he-IL",
@@ -243,11 +245,306 @@ class NadlanBrowser:
 
     def __exit__(self, *_):
         try:
+            # Close our tab even when CDP-attached (we created it fresh).
+            if getattr(self, "_cdp_attached", False) and self._page:
+                try:
+                    self._page.close()
+                except Exception:
+                    pass
             if self._browser and not getattr(self, "_cdp_attached", False):
                 self._browser.close()
         finally:
             if self._pw:
                 self._pw.stop()
+
+    # ------------------------------------------------------------------
+    # Slice-based fetch (filter-driven, no rate-limit since SPA fetches)
+    # ------------------------------------------------------------------
+    # Phase 0 probes confirmed:
+    #   * The /deal-data API filters server-side on ``room_num`` and
+    #     ``type_order`` JWT fields. ``date_range`` is exposed via UI but
+    #     wasn't probed for JWT payload.
+    #   * Filter changes via UI clicks DON'T burn the per-IP rate limit:
+    #     6+ clicks in 30s all returned HTTP 200.
+    #   * Synthetic JWT requests via page.request.post still return 405
+    #     (only SPA's fetch flow works). So we MUST drive UI clicks.
+    #
+    # Strategy: open settlement once, walk through (room, sort) combos
+    # by clicking buttons. Each click triggers SPA's /deal-data and we
+    # capture the response.
+
+    SORT_OPTIONS = {
+        "dealDate_down":   "תאריך עסקה - סדר יורד",   # newest first (default)
+        "dealDate_up":     "תאריך עסקה - סדר עולה",   # oldest first
+        "dealAmount_down": "מחיר העסקה - סדר יורד",   # most expensive first
+        "dealAmount_up":   "מחיר העסקה - סדר עולה",   # cheapest first
+        "roomNum_down":    "מס' חדרים - סדר יורד",
+        "roomNum_up":      "מס' חדרים - סדר עולה",
+    }
+    ROOM_OPTIONS = {
+        None:     None,             # no filter (all rooms)
+        "1":      "1 חדרים",
+        "2":      "2 חדרים",
+        "3":      "3 חדרים",
+        "4":      "4 חדרים",
+        "5":      "5 חדרים",
+        "6plus":  "6+ חדרים",
+    }
+
+    def fetch_settlement_slices(self, setl_code: str,
+                                 slices: list[dict]) -> list[dict]:
+        """Open the settlement deals page once, walk through the slices
+        (each `{room_filter, sort_order}`) by clicking the corresponding
+        UI buttons, and capture the resulting /deal-data response per slice.
+
+        Returns a list of dicts mirroring `slices` plus `deals`, `total_rows`,
+        and `error` (None on success).
+
+        Each click triggers the SPA's natural /deal-data POST (HTTP 200,
+        ≤500 deals returned). Total time: ~1.5s/click + ~3s navigate setup.
+        """
+        if not slices:
+            return []
+
+        # Capture every /deal-data response so we can match by index.
+        captures: list[dict] = []
+
+        def on_response(resp):
+            if "/deal-data" not in resp.url or resp.status != 200:
+                return
+            try:
+                body = resp.body()
+            except Exception:
+                # Network event raced — body unreadable. Ignore.
+                return
+            try:
+                decoded = json.loads(gzip.decompress(base64.b64decode(body)))
+                if decoded.get("statusCode") == 200:
+                    data = decoded.get("data") or {}
+                    captures.append({
+                        "items": data.get("items") or [],
+                        "total_rows": data.get("total_rows", 0),
+                        "captured_at": time.time(),
+                    })
+            except Exception as e:
+                logger.debug("decode failed: %s", e)
+
+        page = self._page
+        page.on("response", on_response)
+        try:
+            # Cache-bust with a unique param so the SPA always re-fires
+            # /deal-data even if revisiting the same settlement code.
+            url = (f"https://www.nadlan.gov.il/?view=settlement"
+                   f"&id={setl_code}&page=deals&_n={int(time.time())}")
+            logger.info("setl %s: opening for %d slices", setl_code, len(slices))
+            page.goto(url, wait_until="domcontentloaded",
+                       timeout=self.nav_timeout_ms)
+            page.wait_for_timeout(3000)  # let SPA boot
+            # The SPA does NOT auto-fire /deal-data — it only does so after
+            # a filter button is clicked. We force a click for every slice.
+            self._dismiss_error_modal()
+
+            results: list[dict] = []
+
+            for idx, sl in enumerate(slices):
+                room = sl.get("room_filter")
+                sort = sl.get("sort_order") or "dealDate_down"
+
+                if self._dismiss_error_modal():
+                    logger.info("setl %s: dismissed error modal before slice %d",
+                                 setl_code, idx + 1)
+                    page.goto(url, wait_until="domcontentloaded",
+                               timeout=self.nav_timeout_ms)
+                    page.wait_for_timeout(2000)
+
+                # Always click rooms (even for "all"): this is the first
+                # /deal-data triggered for this slice.
+                marker_before = len(captures)
+                try:
+                    if not self._apply_room_filter(room):
+                        results.append({**sl, "deals": [], "total_rows": 0,
+                                        "error": "room_click_failed"})
+                        continue
+                    if not self._wait_for_capture(captures,
+                                                  marker_before + 1,
+                                                  timeout_s=12):
+                        results.append({**sl, "deals": [], "total_rows": 0,
+                                        "error": "room_no_response"})
+                        continue
+                    page.wait_for_timeout(800)
+
+                    # If non-default sort, click sort dropdown
+                    if sort != "dealDate_down":
+                        marker_before = len(captures)
+                        if not self._apply_sort_filter(sort):
+                            results.append({**sl, "deals": [], "total_rows": 0,
+                                            "error": "sort_click_failed"})
+                            continue
+                        if not self._wait_for_capture(captures,
+                                                      marker_before + 1,
+                                                      timeout_s=12):
+                            results.append({**sl, "deals": [], "total_rows": 0,
+                                            "error": "sort_no_response"})
+                            continue
+                        page.wait_for_timeout(3000)
+
+                    last = captures[-1] if captures else {}
+                    results.append({
+                        **sl,
+                        "deals": last.get("items", []),
+                        "total_rows": last.get("total_rows", 0),
+                        "error": None,
+                    })
+                    logger.info("setl %s slice %d/%d (room=%s, sort=%s): "
+                                "+%d deals, total=%s",
+                                setl_code, idx + 1, len(slices),
+                                room or "all", sort,
+                                len(last.get("items", [])),
+                                last.get("total_rows"))
+                except Exception as e:
+                    logger.warning("setl %s slice (%s, %s) error: %s",
+                                   setl_code, room, sort, e)
+                    results.append({**sl, "deals": [], "total_rows": 0,
+                                    "error": str(e)})
+            return results
+        finally:
+            try:
+                page.remove_listener("response", on_response)
+            except Exception:
+                pass
+
+    def _dismiss_error_modal(self) -> bool:
+        """Detect the 'שגיאה בטעינת נתונים' modal and dismiss it. Returns
+        True if a modal was dismissed."""
+        try:
+            dismissed = self._page.evaluate("""
+                () => {
+                    // Find any visible modal with the error title.
+                    const modals = document.querySelectorAll('div.modal.show');
+                    for (const m of modals) {
+                        const title = m.querySelector('h3.title, .modal-title');
+                        const titleText = title ? (title.innerText || '').trim() : '';
+                        if (titleText.includes('שגיאה') || titleText.includes('בטעינת')) {
+                            // Try clicking close button (X) first, then any 'אישור'
+                            const closeBtn = m.querySelector('button.close, [aria-label="Close"]');
+                            if (closeBtn) { closeBtn.click(); return true; }
+                            const okBtn = m.querySelector('button');
+                            if (okBtn) { okBtn.click(); return true; }
+                        }
+                    }
+                    return false;
+                }
+            """)
+            if dismissed:
+                self._page.wait_for_timeout(500)
+            return bool(dismissed)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _wait_for_capture(captures: list, target_count: int,
+                            timeout_s: float = 10) -> bool:
+        """Block until ``len(captures) >= target_count`` or timeout."""
+        deadline = time.time() + timeout_s
+        while len(captures) < target_count and time.time() < deadline:
+            time.sleep(0.3)
+        return len(captures) >= target_count
+
+    def _apply_room_filter(self, room_filter: Optional[str]) -> bool:
+        """Open the rooms dropdown via JS click, then click the desired
+        room option. Both via JS to bypass Playwright's visibility/overlay
+        checks."""
+        page = self._page
+        if room_filter is None:
+            label = "כל החדרים"
+        else:
+            label = self.ROOM_OPTIONS.get(room_filter)
+            if not label:
+                logger.warning("unknown room_filter=%s", room_filter)
+                return False
+
+        try:
+            # Step 1: open dropdown via JS click (works even if hidden behind overlay)
+            opened = page.evaluate("""
+                () => {
+                    const btn = document.querySelector('button.roomsBtn');
+                    if (!btn) return false;
+                    btn.click();
+                    return true;
+                }
+            """)
+            if not opened:
+                logger.warning("rooms dropdown btn not found")
+                return False
+            page.wait_for_timeout(500)
+
+            # Step 2: click the desired room option via JS
+            ok = page.evaluate(
+                """(label) => {
+                    const buttons = document.querySelectorAll('button.whomBtn, button.roomsBtn');
+                    for (const b of buttons) {
+                        if ((b.innerText || '').trim() === label) {
+                            b.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }""",
+                label,
+            )
+            if not ok:
+                logger.warning("room button not found: %s", label)
+                return False
+            return True
+        except Exception as e:
+            logger.warning("room click failed: %s", e)
+            return False
+
+    def _apply_sort_filter(self, sort_order: str) -> bool:
+        """Open sort dropdown + click option, all via JS."""
+        label = self.SORT_OPTIONS.get(sort_order)
+        if not label:
+            logger.warning("unknown sort_order=%s", sort_order)
+            return False
+        page = self._page
+        try:
+            opened = page.evaluate("""
+                () => {
+                    const buttons = document.querySelectorAll('button.filterBtn');
+                    for (const b of buttons) {
+                        if ((b.innerText || '').trim() === 'מיון') {
+                            b.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            """)
+            if not opened:
+                logger.warning("sort dropdown btn not found")
+                return False
+            page.wait_for_timeout(500)
+
+            ok = page.evaluate(
+                """(label) => {
+                    const buttons = document.querySelectorAll('button.dropdownBtn');
+                    for (const b of buttons) {
+                        if ((b.innerText || '').trim() === label) {
+                            b.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }""",
+                label,
+            )
+            if not ok:
+                logger.warning("sort button not found: %s", label)
+                return False
+            return True
+        except Exception as e:
+            logger.warning("sort click failed: %s", e)
+            return False
 
     def fetch_settlement(self, setl_code: str, retries: int = 2) -> list[dict]:
         """Navigate to the settlement page and return ALL deals via pagination.
