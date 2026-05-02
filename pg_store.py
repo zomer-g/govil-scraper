@@ -344,18 +344,24 @@ class PgStore:
     # --- nadlan_deals ----------------------------------------------------
 
     def append_deals(self, csv_rows: list[dict]) -> int:
-        """Insert deal rows. CSV-style keys are translated to db columns."""
+        """Insert deal rows. CSV-style keys are translated to db columns.
+
+        parcel_id is computed from gush+chelka because the schema marks it
+        NOT NULL but the worker only sends those two columns separately.
+        """
         if not csv_rows:
             return 0
+        # parcel_id first so the column list and value order line up.
+        cols = ["parcel_id"] + list(_DEAL_CSV_TO_DB.values())
         rows = []
-        cols = list(_DEAL_CSV_TO_DB.values())
-        # Stable column order for executemany
         for r in csv_rows:
-            rows.append([
-                r.get(csv_key, "")
-                for csv_key in _DEAL_CSV_TO_DB.keys()
-            ])
-        # Build the INSERT once
+            gush = (r.get("gush") or "").strip()
+            chelka = (r.get("chelka") or "").strip()
+            parcel_id = f"{gush}-{chelka}" if gush and chelka else ""
+            rows.append(
+                [parcel_id]
+                + [r.get(csv_key, "") for csv_key in _DEAL_CSV_TO_DB.keys()]
+            )
         placeholders = ", ".join(["%s"] * len(cols))
         col_list = ", ".join(cols)
         sql = (f"INSERT INTO nadlan_deals ({col_list}) "
