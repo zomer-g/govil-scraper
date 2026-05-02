@@ -433,32 +433,27 @@ class NadlanBrowser:
                 return False
 
             body = json.dumps({"##": new_jwt})
-            # In-page fetch via page.evaluate runs inside the SPA's JS
-            # context, so the browser handles Origin/Referer naturally and
-            # the fetch is treated identically to the SPA's own first call.
+            # Use Playwright's APIRequestContext (page.request) — it inherits
+            # cookies and TLS fingerprint from the page session. We pass the
+            # full set of captured headers so the request is byte-identical
+            # to what the SPA sent on fetch_number=1 (which the server
+            # accepted).
             try:
-                resp_status, response_text = self._page.evaluate(
-                    """async ({url, body}) => {
-                        const r = await fetch(url, {
-                            method: 'POST',
-                            headers: {'content-type': 'text/plain'},
-                            body: body,
-                            credentials: 'include',
-                            mode: 'cors',
-                        });
-                        const t = await r.text();
-                        return [r.status, t];
-                    }""",
-                    {"url": url, "body": body},
+                resp = self._page.request.post(
+                    url,
+                    data=body.encode("utf-8"),
+                    headers=headers,
+                    timeout=30000,
                 )
             except Exception as e:
                 logger.warning("setl %s fetch=%d: request failed: %s",
                                 setl_code, fetch_num, e)
                 return False
-            if resp_status != 200:
+            if resp.status != 200:
                 logger.warning("setl %s fetch=%d: HTTP %d — stopping pagination",
-                                setl_code, fetch_num, resp_status)
+                                setl_code, fetch_num, resp.status)
                 return False
+            response_text = resp.text()
             # response_text is base64+gzip wrapper
             try:
                 decoded = json.loads(
