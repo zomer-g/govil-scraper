@@ -677,12 +677,30 @@ class CollectionStore:
         "centroid_lat", "centroid_lon",
     )
 
+    # ---- Postgres delegation ------------------------------------------
+    # If DATABASE_URL is configured, the nadlan_* methods route through
+    # PgStore so distributed-scrape state survives Render redeploys.
+    # The collections / files / archives / generic-tasks tables stay on
+    # SQLite — they aren't critical to the long-running scrape.
+
+    @staticmethod
+    def _pg():
+        try:
+            from pg_store import get_pg_store
+            return get_pg_store()
+        except Exception as e:
+            logger.warning("pg_store unavailable: %s", e)
+            return None
+
     def nadlan_create_tasks(self, rows: list[dict]) -> dict:
         """Bulk-insert pending tasks. Existing parcel_ids are silently skipped
         via INSERT OR IGNORE (idempotent — re-running queue is safe).
 
         Returns {"inserted": N, "skipped": M}.
         """
+        pg = self._pg()
+        if pg is not None:
+            return pg.create_tasks(rows)
         now = datetime.now().isoformat(timespec="seconds")
         inserted = 0
         skipped = 0
@@ -726,6 +744,9 @@ class CollectionStore:
 
         Returns list of task dicts (may be empty if no work available).
         """
+        pg = self._pg()
+        if pg is not None:
+            return pg.claim_tasks(worker_id, count)
         if count < 1:
             return []
         now = datetime.now().isoformat(timespec="seconds")
@@ -759,6 +780,9 @@ class CollectionStore:
 
     def nadlan_complete_task(self, parcel_id: str, deals_count: int) -> bool:
         """Mark a parcel done after the worker successfully scraped it."""
+        pg = self._pg()
+        if pg is not None:
+            return pg.complete_task(parcel_id, deals_count)
         now = datetime.now().isoformat(timespec="seconds")
         with self._lock, self._connect() as conn:
             cur = conn.execute(
@@ -779,6 +803,9 @@ class CollectionStore:
         the same or another worker retries it later. ``transient=False`` (real
         bug, parsing crash) → state goes to ``failed`` and won't be retried.
         """
+        pg = self._pg()
+        if pg is not None:
+            return pg.fail_task(parcel_id, error, transient)
         now = datetime.now().isoformat(timespec="seconds")
         new_state = "pending" if transient else "failed"
         worker_id = "" if transient else None  # release on transient
@@ -803,6 +830,9 @@ class CollectionStore:
 
     def nadlan_status(self) -> dict:
         """Return aggregate counts for the queue."""
+        pg = self._pg()
+        if pg is not None:
+            return pg.status()
         with self._connect() as conn:
             counts = {r["state"]: r["c"] for r in conn.execute(
                 "SELECT state, COUNT(*) AS c FROM nadlan_tasks GROUP BY state"
@@ -824,6 +854,9 @@ class CollectionStore:
         """Return claimed tasks that have been stuck > ``timeout_seconds`` to
         ``pending`` so another worker can pick them up. Returns count reset.
         """
+        pg = self._pg()
+        if pg is not None:
+            return pg.reset_stale(timeout_seconds)
         cutoff = (datetime.now() - timedelta(seconds=timeout_seconds)
                   ).isoformat(timespec="seconds")
         with self._lock, self._connect() as conn:
@@ -838,6 +871,9 @@ class CollectionStore:
 
     def nadlan_clear(self) -> int:
         """Drop all queued tasks. Returns count cleared. (Admin / testing.)"""
+        pg = self._pg()
+        if pg is not None:
+            return pg.clear_queue()
         with self._lock, self._connect() as conn:
             cur = conn.execute("DELETE FROM nadlan_tasks")
             conn.commit()

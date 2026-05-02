@@ -307,9 +307,21 @@ def _ensure_deals_header():
 
 
 def _append_deals(rows: list[dict]) -> int:
-    """Append worker-supplied deal rows to the central CSV. Returns count written."""
+    """Append worker-supplied deal rows.
+
+    Prefers Postgres (survives redeploys). Falls back to the on-disk CSV
+    for local dev / when DATABASE_URL isn't set.
+    """
     if not rows:
         return 0
+    try:
+        from pg_store import get_pg_store
+        pg = get_pg_store()
+    except Exception:
+        pg = None
+    if pg is not None:
+        return pg.append_deals(rows)
+
     path = _deals_csv_path()
     n = 0
     with _DEALS_CSV_LOCK:
@@ -443,19 +455,49 @@ def bulk_clear():
     if not _admin_or_worker():
         return jsonify({"error": "admin or worker key required"}), 403
     n = _get_store().nadlan_clear()
-    # Optionally rotate the deals CSV so a fresh run starts empty.
+    # Optionally rotate the deals store so a fresh run starts empty.
     if (request.form.get("clear_deals") or "").lower() == "true":
-        path = _deals_csv_path()
-        if os.path.exists(path):
-            os.remove(path)
+        try:
+            from pg_store import get_pg_store
+            pg = get_pg_store()
+        except Exception:
+            pg = None
+        if pg is not None:
+            pg.clear_deals()
+        else:
+            path = _deals_csv_path()
+            if os.path.exists(path):
+                os.remove(path)
     return jsonify({"cleared": n})
 
 
 @nadlan_api_bp.route("/bulk-deals.csv", methods=["GET"])
 def bulk_deals_csv():
-    """Download the central deals CSV (admin only — file may be large)."""
+    """Download the central deals CSV (admin only — file may be large).
+
+    Streams from Postgres when DATABASE_URL is set, otherwise from the
+    on-disk CSV.
+    """
     if not _admin_or_worker():
         return jsonify({"error": "admin or worker key required"}), 403
+
+    try:
+        from pg_store import get_pg_store
+        pg = get_pg_store()
+    except Exception:
+        pg = None
+
+    if pg is not None:
+        from flask import Response
+        return Response(
+            pg.stream_deals_csv(),
+            mimetype="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition":
+                    'attachment; filename="nadlan_deals_master.csv"',
+            },
+        )
+
     path = _deals_csv_path()
     if not os.path.exists(path):
         return jsonify({"error": "no deals collected yet"}), 404
