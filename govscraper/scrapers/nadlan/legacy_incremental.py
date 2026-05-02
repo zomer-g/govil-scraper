@@ -359,13 +359,23 @@ class NadlanBrowser:
         """
         # Step 1: fresh recaptcha token
         try:
-            recap = self._page.evaluate(
+            result = self._page.evaluate(
                 """async (siteKey) => {
+                    const out = {has_grecaptcha: typeof grecaptcha !== 'undefined',
+                                 has_enterprise: false, token: null, err: null};
+                    if (!out.has_grecaptcha) return out;
+                    out.has_enterprise = !!(grecaptcha.enterprise);
+                    const ent = grecaptcha.enterprise || grecaptcha;
                     try {
-                        if (typeof grecaptcha === 'undefined') return null;
-                        const ent = grecaptcha.enterprise || grecaptcha;
-                        return await ent.execute(siteKey, {action: 'submit'});
-                    } catch (e) { return null; }
+                        // ready() ensures the runtime is initialized
+                        if (ent.ready) {
+                            await new Promise(res => ent.ready(res));
+                        }
+                        out.token = await ent.execute(siteKey, {action: 'submit'});
+                    } catch (e) {
+                        out.err = String(e && e.message || e);
+                    }
+                    return out;
                 }""",
                 site_key,
             )
@@ -373,12 +383,17 @@ class NadlanBrowser:
             if log:
                 logger.warning("setl %s: grecaptcha.execute threw: %s", setl_code, e)
             return None
-        if not recap:
-            if log:
-                logger.warning("setl %s: grecaptcha returned no token", setl_code)
-            return None
         if log:
-            logger.info("setl %s: grecaptcha minted token len=%d", setl_code, len(recap))
+            logger.info("setl %s: grecaptcha result has_grecaptcha=%s "
+                        "has_enterprise=%s token_len=%d err=%s",
+                        setl_code,
+                        result.get("has_grecaptcha"),
+                        result.get("has_enterprise"),
+                        len(result.get("token") or ""),
+                        result.get("err"))
+        recap = result.get("token") if result else None
+        if not recap:
+            return None
 
         # Step 2: POST to /token-verify
         try:
