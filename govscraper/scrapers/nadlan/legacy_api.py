@@ -124,19 +124,45 @@ def _warmup_human_signal(page):
     """Move the mouse and scroll a bit so reCAPTCHA Enterprise scores us
     as human and the second /token-verify call passes (200 'ok:true')
     instead of being rejected with HTTP 400 on every retry.
+
+    More aggressive than the original — when the same browser is reused
+    across many parcels (worker pool mode), Google's anti-bot scores the
+    fresh context lower than a fresh process. The cumulative warmup of
+    ~6s + multiple scrolls compensates and matches standalone success.
     """
     import random as _rnd
     try:
-        for _ in range(6):
+        # Phase 1: cluster of mouse moves
+        for _ in range(8):
             x = _rnd.randint(150, 1100)
             y = _rnd.randint(150, 800)
-            page.mouse.move(x, y, steps=_rnd.randint(5, 15))
-            page.wait_for_timeout(_rnd.randint(150, 400))
-        page.mouse.wheel(0, 350)
-        page.wait_for_timeout(800)
+            page.mouse.move(x, y, steps=_rnd.randint(8, 20))
+            page.wait_for_timeout(_rnd.randint(120, 350))
+        # Phase 2: scroll down
+        page.mouse.wheel(0, 400)
+        page.wait_for_timeout(700)
+        # Phase 3: more mouse + scroll up (mimics user reading)
+        for _ in range(4):
+            x = _rnd.randint(150, 1100)
+            y = _rnd.randint(150, 800)
+            page.mouse.move(x, y, steps=_rnd.randint(8, 20))
+            page.wait_for_timeout(_rnd.randint(120, 350))
+        page.mouse.wheel(0, -200)
+        page.wait_for_timeout(700)
     except Exception as e:
         # Warmup is best-effort — never fail the scrape over it.
         logger.debug("warmup gesture failed: %s", e)
+
+
+def _retry_warmup_if_no_data(page, state, retry_window_s: int = 8):
+    """If after the initial warmup we still have no /deal-data response,
+    do another round of warmup gestures to nudge the SPA into retrying
+    /token-verify. Costs nothing on parcels that already returned data."""
+    if state["total_rows"] is not None:
+        return  # already got data, no retry needed
+    logger.debug("no deal-data yet — triggering retry warmup")
+    _warmup_human_signal(page)
+    page.wait_for_timeout(retry_window_s * 1000)
 
 
 def _launch_browser(pw, headless: bool):
@@ -210,9 +236,21 @@ def _fetch_with_browser(gush, chelka, browser, progress,
         # a few seconds and the second one passes once the user looks "real".
         _warmup_human_signal(page)
 
-        deadline = time.time() + data_timeout_s
+        # First wait — give the SPA up to 12s to retry token-verify and
+        # produce a /deal-data response after our initial warmup.
+        first_window = min(12, data_timeout_s // 2)
+        deadline = time.time() + first_window
         while state["total_rows"] is None and time.time() < deadline:
             page.wait_for_timeout(500)
+
+        # If still no data, do a second round of warmup gestures and wait
+        # the remaining timeout. Empirically this rescues parcels that fail
+        # the first time when the same browser is reused across many calls.
+        if state["total_rows"] is None:
+            _retry_warmup_if_no_data(page, state, retry_window_s=8)
+            deadline = time.time() + (data_timeout_s - first_window)
+            while state["total_rows"] is None and time.time() < deadline:
+                page.wait_for_timeout(500)
 
         if state["total_rows"] is None:
             progress(message=f"לא התקבלה תשובה מ-nadlan עבור {parcel_id}")
