@@ -349,6 +349,44 @@ class NadlanBrowser:
                         deals.append(it)
         return saw_405
 
+    _grecaptcha_loaded = False
+
+    def _ensure_grecaptcha_loaded(self, site_key: str) -> bool:
+        """The SPA loads recaptcha enterprise.js with ?render=explicit, which
+        registers the runtime in ``manual widget`` mode.  In that mode
+        ``grecaptcha.enterprise.execute(siteKey, ...)`` returns 'Invalid
+        site key or not loaded in api.js'.
+
+        Workaround: dynamically inject a *second* enterprise.js with
+        ``?render=<siteKey>`` so the runtime knows about our key, then
+        ``execute()`` works.  Once-per-page is enough."""
+        if self._grecaptcha_loaded:
+            return True
+        try:
+            ok = self._page.evaluate(
+                """async (siteKey) => {
+                    const url = 'https://www.google.com/recaptcha/enterprise.js?render=' + siteKey;
+                    if (document.querySelector(`script[src="${url}"]`)) return true;
+                    return await new Promise((resolve) => {
+                        const s = document.createElement('script');
+                        s.src = url;
+                        s.onload = () => {
+                            try {
+                                grecaptcha.enterprise.ready(() => resolve(true));
+                            } catch (e) { resolve(false); }
+                        };
+                        s.onerror = () => resolve(false);
+                        document.head.appendChild(s);
+                    });
+                }""",
+                site_key,
+            )
+        except Exception as e:
+            logger.warning("recaptcha api load threw: %s", e)
+            return False
+        self._grecaptcha_loaded = bool(ok)
+        return self._grecaptcha_loaded
+
     def _mint_token_verify_uuid(self, site_key: str, log: bool = False,
                                   setl_code: str = "") -> Optional[str]:
         """Replicate the SPA's pre-deal-data token mint:
@@ -357,21 +395,20 @@ class NadlanBrowser:
 
         Returns the UUID string, or None on failure.
         """
+        if not self._ensure_grecaptcha_loaded(site_key):
+            if log:
+                logger.warning("setl %s: could not load recaptcha api with site_key",
+                               setl_code)
+            return None
+
         # Step 1: fresh recaptcha token
         try:
             result = self._page.evaluate(
                 """async (siteKey) => {
-                    const out = {has_grecaptcha: typeof grecaptcha !== 'undefined',
-                                 has_enterprise: false, token: null, err: null};
-                    if (!out.has_grecaptcha) return out;
-                    out.has_enterprise = !!(grecaptcha.enterprise);
-                    const ent = grecaptcha.enterprise || grecaptcha;
+                    const out = {token: null, err: null};
                     try {
-                        // ready() ensures the runtime is initialized
-                        if (ent.ready) {
-                            await new Promise(res => ent.ready(res));
-                        }
-                        out.token = await ent.execute(siteKey, {action: 'submit'});
+                        out.token = await grecaptcha.enterprise.execute(
+                            siteKey, {action: 'submit'});
                     } catch (e) {
                         out.err = String(e && e.message || e);
                     }
@@ -384,13 +421,8 @@ class NadlanBrowser:
                 logger.warning("setl %s: grecaptcha.execute threw: %s", setl_code, e)
             return None
         if log:
-            logger.info("setl %s: grecaptcha result has_grecaptcha=%s "
-                        "has_enterprise=%s token_len=%d err=%s",
-                        setl_code,
-                        result.get("has_grecaptcha"),
-                        result.get("has_enterprise"),
-                        len(result.get("token") or ""),
-                        result.get("err"))
+            logger.info("setl %s: grecaptcha token_len=%d err=%s",
+                        setl_code, len(result.get("token") or ""), result.get("err"))
         recap = result.get("token") if result else None
         if not recap:
             return None
