@@ -107,7 +107,7 @@ def load_layer_catalog(path: str = DEFAULT_LAYERS_FILE) -> dict:
     for entry in data.get("layers", []):
         try:
             lid = entry["id"]
-            out[lid] = Layer(
+            layer = Layer(
                 id=lid,
                 label_he=entry.get("label_he", lid),
                 label_en=entry.get("label_en", ""),
@@ -119,6 +119,13 @@ def load_layer_catalog(path: str = DEFAULT_LAYERS_FILE) -> dict:
                               if entry.get("default_bbox") else None),
                 notes=entry.get("notes", ""),
             )
+            out[lid] = layer
+            # Allow numeric govmap catalog IDs (e.g. "200541") to resolve to
+            # the same Layer. `alt_ids` are additional keys the entry should
+            # also be findable under — used to map govmap-URL `?lay=NNNNNN`
+            # primary keys to the actual `serviceLayerId` (WFS typeName).
+            for alt in entry.get("alt_ids") or []:
+                out[str(alt)] = layer
         except KeyError as e:
             logger.warning("Skipping malformed layer entry (missing %s): %s", e, entry)
     logger.info("Loaded %d GovMap layers from %s", len(out), path)
@@ -126,11 +133,42 @@ def load_layer_catalog(path: str = DEFAULT_LAYERS_FILE) -> dict:
     return out
 
 
+def _layer_from_online_catalog(numeric_id: str) -> Optional[Layer]:
+    """Look up a numeric govmap layer ID in the online catalog and return
+    a Layer with the correct WFS `serviceLayerId`. Returns None if the
+    lookup fails or the entry has no serviceLayerId. Best-effort — never
+    raises; the caller falls back to a synthetic guess.
+    """
+    try:
+        from . import catalog_fetch
+        entry = catalog_fetch.lookup_layer(numeric_id)
+    except Exception as e:
+        logger.warning("Online catalog lookup for %s failed: %s", numeric_id, e)
+        return None
+    if not entry:
+        return None
+    service_layer_id = entry.get("serviceLayerId")
+    if not service_layer_id:
+        return None
+    return Layer(
+        id=f"LAYER_{numeric_id}",
+        label_he=entry.get("caption") or f"שכבה {numeric_id}",
+        label_en=entry.get("name") or "",
+        type_name=service_layer_id,
+        geometry_type="Unknown",
+        notes=f"Resolved from GovMap online catalog (lay={numeric_id} → {service_layer_id})",
+    )
+
+
 def resolve_layer(key: str) -> Layer:
     """Find a Layer by its internal id, by WFS type name, or by parsing a
-    govmap.gov.il URL with `?lay=<id>`. Returns a synthetic Layer for
-    unknown numeric IDs so users can scrape any GovMap layer they find via
-    DevTools without first adding it to layers.json."""
+    govmap.gov.il URL with `?lay=<id>`. For numeric IDs not in the local
+    layers.json, consults GovMap's online catalog
+    (api/layers-catalog/catalog) to translate the catalog primary key into
+    the actual WFS `serviceLayerId` — e.g. lay=200541 →
+    `govmap:layer_settl_territories_wb`, NOT `govmap:layer_200541`.
+    Falls back to the synthetic name only if the online lookup fails.
+    """
     catalog = load_layer_catalog()
     if not key:
         raise ValueError("empty layer key")
@@ -161,20 +199,32 @@ def resolve_layer(key: str) -> Layer:
                 for layer in catalog.values():
                     if layer.type_name == target:
                         return layer
+                # Numeric IDs in govmap URLs are catalog primary keys, NOT
+                # WFS type names. Try the online catalog first; only fall
+                # back to the synthetic guess if that fails.
+                if first.isdigit():
+                    online = _layer_from_online_catalog(first)
+                    if online is not None:
+                        return online
                 # Synthesize for any numeric layer ID seen in URL
                 return Layer(id=f"LAYER_{first}",
                              label_he=f"שכבה {first}",
                              type_name=target,
                              geometry_type="Unknown",
-                             notes=f"Auto-generated from URL ?lay={first}")
+                             notes=f"Auto-generated from URL ?lay={first} "
+                                   f"(online catalog had no entry)")
         raise ValueError(f"No 'lay' param in URL: {key}")
 
-    # Numeric id (synthesize)
+    # Numeric id — try online catalog first
     if key.isdigit():
+        online = _layer_from_online_catalog(key)
+        if online is not None:
+            return online
         return Layer(id=f"LAYER_{key}",
                      label_he=f"שכבה {key}",
                      type_name=f"govmap:layer_{key}",
-                     geometry_type="Unknown")
+                     geometry_type="Unknown",
+                     notes=f"Synthesized — online catalog had no entry for {key}")
 
     raise ValueError(f"Unknown layer: {key!r}")
 

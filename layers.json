@@ -82,6 +82,17 @@
       "geometry_type": "Polygon",
       "out_fields": ["*"],
       "notes": "VERIFIED 2026-05: present in WFS GetCapabilities."
+    },
+    {
+      "id": "SETTL_TERRITORIES_WB",
+      "alt_ids": ["200541"],
+      "label_he": "גבולות ישובים בשטחי איו\"ש",
+      "label_en": "Settlement territories in W. Bank",
+      "type_name": "govmap:layer_settl_territories_wb",
+      "endpoint_kind": "wfs",
+      "geometry_type": "Polygon",
+      "out_fields": ["*"],
+      "notes": "VERIFIED 2026-05-02: govmap URL ?lay=200541. The numeric 200541 is the catalog primary key; the WFS typeName is govmap:layer_settl_territories_wb. Captured via GET /api/layers-catalog/catalog?lang=he with x-user-id + x-trace-id headers."
     }
   ]
 }

@@ -201,7 +201,11 @@ class GovILSession:
                 logger.error("Playwright fallback also failed: %s", e)
 
         raise CloudflareBlockError(
-            "לא ניתן להתחבר לאתר gov.il — cloudscraper נכשל לאחר מספר ניסיונות"
+            f"לא ניתן להתחבר ל-{BASE_URL} (warm-up של GovIlSession) — "
+            f"cloudscraper נכשל לאחר {max_retries} ניסיונות. "
+            f"הערה: GovIlSession מחמם תמיד מול {BASE_URL}; אם הסקרייפ בפועל "
+            f"מכוון ליעד אחר (govmap.gov.il / nadlan.gov.il), כשל ה-warm "
+            f"חוסם את כל הניסיונות הבאים."
         )
 
     # ---- HTTP methods with retry --------------------------------------------

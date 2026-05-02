@@ -112,9 +112,14 @@ class WFSClient:
             params["CQL_FILTER"] = cql_filter
         if bbox_3857:
             params["bbox"] = ",".join(str(x) for x in bbox_3857) + ",EPSG:3857"
+        logger.debug("WFS hits: GET %s params=%s", self.base, params)
         r = self.session.get_raw(self.base, params=params)
         if r.status_code != 200:
-            raise WFSError(f"hits: HTTP {r.status_code} {r.text[:200]}")
+            raise WFSError(
+                f"hits: HTTP {r.status_code} from {self.base} "
+                f"(typeNames={type_name!r}, bbox_3857={bbox_3857}). "
+                f"Body[:200]: {r.text[:200]}"
+            )
         # XML response: <wfs:FeatureCollection numberMatched="N" ...>
         root = ET.fromstring(r.content)
         n = root.attrib.get("numberMatched") or root.attrib.get("numberOfFeatures")
@@ -156,13 +161,21 @@ class WFSClient:
             params["CQL_FILTER"] = cql_filter
         if bbox_3857:
             params["bbox"] = ",".join(str(x) for x in bbox_3857) + ",EPSG:3857"
+        logger.debug("WFS GetFeature: GET %s params=%s", self.base, params)
         r = self.session.get_raw(self.base, params=params)
         if r.status_code != 200:
-            raise WFSError(f"GetFeature: HTTP {r.status_code} {r.text[:200]}")
+            raise WFSError(
+                f"GetFeature: HTTP {r.status_code} from {self.base} "
+                f"(typeNames={type_name!r}, count={count}, bbox_3857={bbox_3857}). "
+                f"Body[:200]: {r.text[:200]}"
+            )
         try:
             return r.json()
         except ValueError as e:
-            raise WFSError(f"Bad GeoJSON: {e}; body[:200]={r.text[:200]}")
+            raise WFSError(
+                f"Bad GeoJSON from {self.base} (typeNames={type_name!r}): {e}; "
+                f"body[:200]={r.text[:200]}"
+            )
 
     def iter_features(
         self,
