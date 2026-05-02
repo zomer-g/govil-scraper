@@ -449,6 +449,54 @@ def bulk_reset_stale():
     return jsonify({"reset": n})
 
 
+@nadlan_api_bp.route("/bulk-reset-zero-deals", methods=["POST"])
+def bulk_reset_zero_deals():
+    """Admin: re-queue any 'done' parcel whose deals_count is 0.
+
+    Use this after a reCAPTCHA rate-limit incident: parcels processed
+    while the IP was blocked got marked done with 0 deals incorrectly,
+    and the worker won't revisit them. Resetting state='pending' makes
+    the next worker pass scrape them again on a fresh IP.
+
+    Optional `since` form field (ISO timestamp) limits the reset to
+    parcels completed AT OR AFTER that time, so already-correct early
+    runs aren't re-scraped unnecessarily.
+    """
+    if not _admin_or_worker():
+        return jsonify({"error": "admin or worker key required"}), 403
+    try:
+        from pg_store import get_pg_store
+        pg = get_pg_store()
+    except Exception:
+        pg = None
+    if pg is None:
+        return jsonify({"error": "Postgres backend required for this endpoint"}), 501
+
+    since = (request.form.get("since") or "").strip() or None
+    with pg._lock, pg._conn() as conn, conn.cursor() as cur:
+        if since:
+            cur.execute(
+                """UPDATE nadlan_tasks
+                   SET state = 'pending', worker_id = '',
+                       claimed_at = NULL, completed_at = NULL,
+                       deals_count = 0, error = ''
+                   WHERE state = 'done' AND deals_count = 0
+                     AND completed_at >= %s""",
+                (since,),
+            )
+        else:
+            cur.execute(
+                """UPDATE nadlan_tasks
+                   SET state = 'pending', worker_id = '',
+                       claimed_at = NULL, completed_at = NULL,
+                       deals_count = 0, error = ''
+                   WHERE state = 'done' AND deals_count = 0"""
+            )
+        n = cur.rowcount
+        conn.commit()
+    return jsonify({"reset": n, "since": since})
+
+
 @nadlan_api_bp.route("/bulk-clear", methods=["POST"])
 def bulk_clear():
     """Admin: drop all queued tasks. Use for testing / fresh restart."""
