@@ -215,7 +215,8 @@ def esri_to_geojson(esri_geom: dict, esri_geometry_type: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# WKT serialisation (for CSV column "_geometry_wkt")
+# WKT serialisation (for CSV column "geometry_wkt" — un-prefixed because
+# CKAN datastore reserves leading-underscore names like "_id", "_full_text")
 # ---------------------------------------------------------------------------
 
 def _coord_str(c):

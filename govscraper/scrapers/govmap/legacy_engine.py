@@ -301,7 +301,7 @@ def _derive_columns(features: List[Feature]) -> List[str]:
         for k in f.properties.keys():
             seen.setdefault(k, None)
     columns = list(seen.keys())
-    columns.append("_geometry_wkt")
+    columns.append("geometry_wkt")  # un-prefixed: CKAN datastore reserves _-prefixed names
     return columns
 
 
@@ -426,7 +426,7 @@ def scrape_govmap(
     items: List[dict] = []
     for f in features:
         row = dict(f.properties)
-        row["_geometry_wkt"] = coords.geom_to_wkt(f.geometry_itm or {})
+        row["geometry_wkt"] = coords.geom_to_wkt(f.geometry_itm or {})
         items.append(row)
 
     return ScrapeResult(

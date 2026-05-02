@@ -10,7 +10,10 @@ Result handling:
   or inline records, attachments -> zipped, push_version emitted with
   PRIMARY_RESOURCE_NAME ("נתוני הסורק").
 - GeoFeatureResult: features -> CSV (one row per feature with geometry as WKT
-  in a "_geometry_wkt" column) so the over.org.il datastore can index them.
+  in a "geometry_wkt" column) so the over.org.il datastore can index them.
+  CKAN datastore reserves the leading-underscore namespace for internal
+  columns (_id, _full_text, …) — using `_geometry_wkt` triggers HTTP 409
+  on datastore_create, hence the un-prefixed name.
   Phase E may add a richer geo handling once over.org.il exposes a GeoJSON
   resource format; for now CSV-flattening preserves byte-identity.
 """
@@ -117,13 +120,16 @@ class OverOrgPublisher:
         result: GeoFeatureResult,
         duration_s: float,
     ) -> PublishOutcome:
-        # Flatten features to a tabular shape — properties + _geometry_wkt
+        # Flatten features to a tabular shape — properties + geometry_wkt.
+        # NOTE: column name is `geometry_wkt` (no underscore prefix) — CKAN
+        # datastore_create rejects `_geometry_wkt` with HTTP 409 because
+        # leading underscores collide with CKAN's reserved column namespace.
         from ...geo.coords import geom_to_wkt
         rows: list[dict] = []
         for feat in result.features or []:
             row = dict(feat.get("properties") or {})
             geom = feat.get("geometry")
-            row["_geometry_wkt"] = geom_to_wkt(geom) if geom else ""
+            row["geometry_wkt"] = geom_to_wkt(geom) if geom else ""
             rows.append(row)
         flat = TabularResult(
             rows=rows,

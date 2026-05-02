@@ -387,7 +387,7 @@ to the existing CSV/Excel):
 - **`<name>.geojson`** — `FeatureCollection` in WGS84 (the canonical
   spatial artefact; opens in QGIS/Leaflet/Mapbox).
 - **`<name>.csv`** — flat attribute table; geometry encoded as ITM WKT
-  in the `_geometry_wkt` column for fidelity.
+  in the `geometry_wkt` column for fidelity.
 - **`<name>.xlsx`** — same as CSV with RTL formatting.
 - **`manifest.json`** — sidecar with `layer_id`, `bbox_itm`, `bbox_wgs84`,
   `geometry_type`, `feature_count`, `srs`. Read by the upload endpoint
