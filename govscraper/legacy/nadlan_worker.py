@@ -170,7 +170,9 @@ def run(server_url: str, worker_id: str,
       returned the in-flight tasks to pending via stale-task reset.
     """
     from playwright.sync_api import sync_playwright
-    from govscraper.scrapers.nadlan.legacy_api import fetch_parcel_deals
+    from govscraper.scrapers.nadlan.legacy_api import (
+        fetch_parcel_deals, _launch_browser,
+    )
 
     client = NadlanWorkerClient(server_url, worker_id)
     consecutive_transient = 0
@@ -181,7 +183,7 @@ def run(server_url: str, worker_id: str,
     logger.info("nadlan worker '%s' starting against %s", worker_id, server_url)
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=headless)
+        browser = _launch_browser(pw, headless=headless)
         try:
             while True:
                 # Fetch one task. (We do one at a time so the stale-task reset
@@ -206,7 +208,7 @@ def run(server_url: str, worker_id: str,
                 try:
                     if not browser.is_connected():
                         logger.warning("browser disconnected — relaunching")
-                        browser = pw.chromium.launch(headless=headless)
+                        browser = _launch_browser(pw, headless=headless)
                     items, meta, warn = fetch_parcel_deals(
                         gush, chelka, browser=browser)
                 except KeyboardInterrupt:
