@@ -581,12 +581,19 @@ class NadlanBrowser:
         logger.info("setl %s: recaptcha site_key=%s", setl_code,
                     site_key[:30] + "..." if site_key else "NOT FOUND")
 
-        # PER-PAGE NAVIGATION-BASED PAGINATION
-        # The SPA UI only ever loads fetch_number=1 (no scroll/click pagination).
-        # To trigger fresh /token-verify+/deal-data pairs we re-navigate to the
-        # deals page each time and intercept the response. Then we synthesize a
-        # JWT that re-uses the captured UUID + sk + exp but bumps fetch_number.
-        for fetch_num in range(2, total_fetch + 1):
+        # PAGINATION LIMIT (discovered by probing 2026-05-02):
+        # The /deal-data endpoint rate-limits per IP at ~3 calls/minute.
+        # Each navigation fires the SPA's auto-/deal-data (fetch=1) plus
+        # our paginated call → 2 calls per pagination. After fetch=2
+        # succeeds, fetch=3+ returns 403 even with fresh UUIDs / fresh
+        # browser contexts.
+        #
+        # Practical cap: 2 pages = 1000 deals/settlement, up from 500.
+        # For settlements with >1000 total deals (Tel Aviv, Jerusalem,
+        # Haifa, etc.) historical depth requires per-parcel scraping
+        # (legacy_api.py).
+        max_fetches = min(total_fetch + 1, 3)  # fetch=2 only
+        for fetch_num in range(2, max_fetches):
             new_payload = dict(payload)
             new_payload["fetch_number"] = fetch_num
 
@@ -617,25 +624,30 @@ class NadlanBrowser:
                     except Exception:
                         pass
 
-            def on_route(route):
-                # Block the SPA's /deal-data (we'll fire our own with the
-                # right fetch_number). Allow /token-verify and everything else.
-                if "/deal-data" in route.request.url:
-                    # First record the JWT, then abort.
-                    if uuid_capture["captured_jwt"] is None:
-                        try:
-                            wrap = json.loads(route.request.post_data or "")
-                            h2, p2 = _decode_reversed_jwt(wrap.get("##"))
-                            uuid_capture["captured_jwt"] = (h2, p2)
-                            uuid_capture["fresh_headers"] = dict(route.request.headers)
-                        except Exception:
-                            pass
-                    route.abort()
-                else:
-                    route.continue_()
+            logger.info("setl %s fetch=%d: re-navigating", setl_code, fetch_num)
+            # The SPA caches its /token-verify UUID in sessionStorage and
+            # reuses it across navigations, so each UUID's 2-call quota is
+            # exhausted after one pagination. Force a fresh /token-verify
+            # by wiping storage + cookies before re-nav.
+            try:
+                self._page.evaluate("""() => {
+                    try { sessionStorage.clear(); } catch (e) {}
+                    try { localStorage.clear(); } catch (e) {}
+                }""")
+                # Also clear cookies on the api domain so any session token
+                # is dropped.
+                self._ctx.clear_cookies()
+                self._page.goto(
+                    "https://www.nadlan.gov.il/",
+                    wait_until="domcontentloaded",
+                    timeout=self.nav_timeout_ms,
+                )
+                self._page.wait_for_timeout(800)
+            except Exception:
+                pass
 
             self._page.on("response", on_response)
-            self._page.route("**/deal-data", on_route)
+            self._page.on("request", on_request)
             try:
                 self._page.goto(
                     f"https://www.nadlan.gov.il/?view=settlement&id={setl_code}"
@@ -643,13 +655,19 @@ class NadlanBrowser:
                     wait_until="domcontentloaded",
                     timeout=self.nav_timeout_ms,
                 )
+                logger.info("setl %s fetch=%d: nav complete, waiting for JWT",
+                             setl_code, fetch_num)
                 t_deadline = time.time() + 12
                 while uuid_capture["captured_jwt"] is None and time.time() < t_deadline:
                     self._page.wait_for_timeout(300)
+                logger.info("setl %s fetch=%d: jwt_captured=%s uuid=%s",
+                             setl_code, fetch_num,
+                             uuid_capture["captured_jwt"] is not None,
+                             uuid_capture["value"][:20] if uuid_capture["value"] else None)
             finally:
                 try:
                     self._page.remove_listener("response", on_response)
-                    self._page.unroute("**/deal-data", on_route)
+                    self._page.remove_listener("request", on_request)
                 except Exception:
                     pass
 
