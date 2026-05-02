@@ -385,21 +385,25 @@ class NadlanBrowser:
                 return False
 
             body = json.dumps({"##": new_token})
-            # Send through the page so cookies + session apply.
+            # Send through the page so cookies + session apply. We do NOT
+            # set origin/referer ourselves — the browser sets them automatically
+            # based on the page URL, and trying to override them causes the
+            # request to be silently dropped with "Failed to fetch".
             response_text = self._page.evaluate(
-                """async ({url, body, headers}) => {
+                """async ({url, body}) => {
                     const r = await fetch(url, {
                         method: 'POST',
                         body: body,
-                        headers: headers,
+                        headers: {'content-type': 'text/plain'},
                         credentials: 'include',
+                        mode: 'cors',
                     });
+                    if (!r.ok) {
+                        throw new Error('HTTP ' + r.status);
+                    }
                     return await r.text();
                 }""",
-                {"url": url, "body": body,
-                 "headers": {"content-type": "text/plain",
-                             "origin": "https://www.nadlan.gov.il",
-                             "referer": "https://www.nadlan.gov.il/"}}
+                {"url": url, "body": body}
             )
             # response_text is base64+gzip wrapper
             try:
