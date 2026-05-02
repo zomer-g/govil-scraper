@@ -160,7 +160,7 @@ def run(server_url: str, worker_id: str,
         idle_sleep_s: int = 30,
         max_consecutive_transient: int = 10,
         backoff_on_outage_s: int = 120,
-        per_parcel_pause_s: float = 5.0):
+        per_parcel_pause_s: float = 10.0):
     """Main worker loop.
 
     - Polls server for tasks; on empty response, sleeps and retries.
@@ -289,11 +289,12 @@ def main():
                     help="identifier for this worker (default: hostname)")
     ap.add_argument("--idle-sleep", type=int, default=30,
                     help="seconds to sleep when no tasks are available")
-    ap.add_argument("--pause", type=float, default=5.0,
-                    help="seconds to wait between parcels (default 5.0). "
+    ap.add_argument("--pause", type=float, default=10.0,
+                    help="seconds to wait between parcels (default 10.0). "
                          "Lower values risk reCAPTCHA Enterprise flagging "
-                         "the IP and rejecting all /token-verify requests; "
-                         "set to 0 only when running through a fresh IP.")
+                         "the IP and rejecting all /token-verify requests "
+                         "after ~80 successful scrapes. Empirically 10s is "
+                         "the sustained-throughput sweet spot.")
     args = ap.parse_args()
     if not args.server:
         ap.error("--server or NADLAN_SERVER_URL is required")
