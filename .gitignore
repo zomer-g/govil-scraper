@@ -25,6 +25,7 @@ tmp/
 parcels.csv
 parcels_batch*.csv
 parcels_for_distributed_upload.csv
+parcels_priority_ordered.csv
 gush_*.csv
 batch*_failed_parcels.txt
 still_failed*.txt

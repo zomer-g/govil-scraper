@@ -90,10 +90,14 @@ def main():
                           f"({elapsed:.1f}s)",
                           flush=True)
                     break
-                except requests.RequestException as e:
-                    print(f"  chunk {chunk_idx}: {e}; retry {attempt+1}", flush=True)
+                except (requests.RequestException, ValueError) as e:
+                    # ValueError catches r.json() failures when server returns
+                    # HTML error pages (502 from Render proxy on overload).
+                    print(f"  chunk {chunk_idx}: {type(e).__name__}: {str(e)[:120]}; "
+                          f"retry {attempt+1}", flush=True)
                     time.sleep(5 * (attempt + 1))
             else:
+                print(f"  chunk {chunk_idx}: gave up after 3 retries", flush=True)
                 sys.exit(1)
             if args.pause:
                 time.sleep(args.pause)

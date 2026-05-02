@@ -581,26 +581,91 @@ class NadlanBrowser:
         logger.info("setl %s: recaptcha site_key=%s", setl_code,
                     site_key[:30] + "..." if site_key else "NOT FOUND")
 
+        # PER-PAGE NAVIGATION-BASED PAGINATION
+        # The SPA UI only ever loads fetch_number=1 (no scroll/click pagination).
+        # To trigger fresh /token-verify+/deal-data pairs we re-navigate to the
+        # deals page each time and intercept the response. Then we synthesize a
+        # JWT that re-uses the captured UUID + sk + exp but bumps fetch_number.
         for fetch_num in range(2, total_fetch + 1):
             new_payload = dict(payload)
             new_payload["fetch_number"] = fetch_num
 
-            # Mint a fresh UUID via the SPA's own /token-verify dance:
-            # 1. grecaptcha.enterprise.execute(site_key) → recaptcha token
-            # 2. POST /token-verify {"token": recap} → {"ok": true, "token": UUID}
-            # 3. JWT payload['token'] := UUID
-            # The UUID is single-use server-side, hence the per-page refresh.
-            if site_key:
-                fresh_uuid = self._mint_token_verify_uuid(site_key, log=(fetch_num == 2),
-                                                          setl_code=setl_code)
-                if fresh_uuid:
-                    new_payload["token"] = fresh_uuid
-                    # Bump exp ~30s into the future (server checks freshness).
-                    new_payload["exp"] = int(time.time()) + 30
+            # 1. Capture a fresh /token-verify + /deal-data via re-navigation.
+            # ABORT the SPA's own /deal-data so we don't burn the UUID's
+            # quota — each UUID is only valid for 2 server-side calls.
+            uuid_capture = {"value": None, "sk": None, "exp": None,
+                            "deal_response": None, "captured_jwt": None,
+                            "fresh_headers": None}
+
+            def on_response(resp):
+                if "/token-verify" in resp.url and resp.status == 200:
+                    try:
+                        body = resp.json()
+                        if body.get("ok"):
+                            uuid_capture["value"] = body.get("token")
+                    except Exception:
+                        pass
+
+            def on_request(req):
+                if (req.method == "POST" and "/deal-data" in req.url
+                        and uuid_capture["captured_jwt"] is None):
+                    try:
+                        wrap = json.loads(req.post_data or "")
+                        h2, p2 = _decode_reversed_jwt(wrap.get("##"))
+                        uuid_capture["captured_jwt"] = (h2, p2)
+                        uuid_capture["fresh_headers"] = dict(req.headers)
+                    except Exception:
+                        pass
+
+            def on_route(route):
+                # Block the SPA's /deal-data (we'll fire our own with the
+                # right fetch_number). Allow /token-verify and everything else.
+                if "/deal-data" in route.request.url:
+                    # First record the JWT, then abort.
+                    if uuid_capture["captured_jwt"] is None:
+                        try:
+                            wrap = json.loads(route.request.post_data or "")
+                            h2, p2 = _decode_reversed_jwt(wrap.get("##"))
+                            uuid_capture["captured_jwt"] = (h2, p2)
+                            uuid_capture["fresh_headers"] = dict(route.request.headers)
+                        except Exception:
+                            pass
+                    route.abort()
                 else:
-                    logger.warning("setl %s fetch=%d: failed to mint fresh UUID",
-                                    setl_code, fetch_num)
-                    return False
+                    route.continue_()
+
+            self._page.on("response", on_response)
+            self._page.route("**/deal-data", on_route)
+            try:
+                self._page.goto(
+                    f"https://www.nadlan.gov.il/?view=settlement&id={setl_code}"
+                    f"&page=deals&_n={fetch_num}",
+                    wait_until="domcontentloaded",
+                    timeout=self.nav_timeout_ms,
+                )
+                t_deadline = time.time() + 12
+                while uuid_capture["captured_jwt"] is None and time.time() < t_deadline:
+                    self._page.wait_for_timeout(300)
+            finally:
+                try:
+                    self._page.remove_listener("response", on_response)
+                    self._page.unroute("**/deal-data", on_route)
+                except Exception:
+                    pass
+
+            if not uuid_capture["captured_jwt"]:
+                logger.warning("setl %s fetch=%d: SPA did not fire /deal-data on re-nav",
+                                setl_code, fetch_num)
+                return False
+
+            # Use the freshly-captured JWT payload as the template for THIS page.
+            h_fresh, p_fresh = uuid_capture["captured_jwt"]
+            new_payload = dict(p_fresh)
+            new_payload["fetch_number"] = fetch_num
+            header = h_fresh
+            # Use the fresh request headers so cookies / sec-ch-* match the
+            # session that minted this UUID.
+            request_headers = uuid_capture["fresh_headers"] or headers
 
             try:
                 new_jwt = _sign_reversed_jwt(header, new_payload)
@@ -619,7 +684,7 @@ class NadlanBrowser:
                 resp = self._page.request.post(
                     url,
                     data=body.encode("utf-8"),
-                    headers=headers,
+                    headers=request_headers,
                     timeout=30000,
                 )
             except Exception as e:
@@ -627,9 +692,24 @@ class NadlanBrowser:
                                 setl_code, fetch_num, e)
                 return False
             if resp.status != 200:
-                logger.warning("setl %s fetch=%d: HTTP %d — stopping pagination",
-                                setl_code, fetch_num, resp.status)
-                return False
+                # 403 = rate limit / token-verify failure on this attempt.
+                # Brief backoff and one retry before giving up.
+                if resp.status in (403, 429):
+                    logger.info("setl %s fetch=%d: HTTP %d — backoff 8s and retry",
+                                 setl_code, fetch_num, resp.status)
+                    self._page.wait_for_timeout(8000)
+                    try:
+                        resp = self._page.request.post(
+                            url, data=body.encode("utf-8"),
+                            headers=headers, timeout=30000)
+                    except Exception as e:
+                        logger.warning("setl %s fetch=%d: retry failed: %s",
+                                        setl_code, fetch_num, e)
+                        return False
+                if resp.status != 200:
+                    logger.warning("setl %s fetch=%d: HTTP %d — stopping pagination",
+                                    setl_code, fetch_num, resp.status)
+                    return False
             response_text = resp.text()
             # response_text is base64+gzip wrapper
             try:
@@ -656,8 +736,9 @@ class NadlanBrowser:
             logger.info("setl %s fetch=%d: +%d new (cumulative %d)",
                         setl_code, fetch_num, new_items, len(deals))
 
-            # Light pacing between pages to keep reCAPTCHA happy.
-            self._page.wait_for_timeout(800)
+            # Pacing between pages — re-navigation hits rate limit fast.
+            # 4s gives the SPA + recaptcha enough breathing room.
+            self._page.wait_for_timeout(4000)
 
         return True
 
