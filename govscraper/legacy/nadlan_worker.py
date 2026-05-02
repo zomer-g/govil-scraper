@@ -206,9 +206,18 @@ def run(server_url: str, worker_id: str,
                 chelka = task["chelka"]
 
                 try:
-                    if not browser.is_connected():
-                        logger.warning("browser disconnected — relaunching")
-                        browser = _launch_browser(pw, headless=headless)
+                    # Fresh Chrome per parcel.  Sharing one browser across
+                    # many parcels caused reCAPTCHA Enterprise to score
+                    # subsequent contexts low — token-verify rejected and
+                    # every parcel returned items=[]. Spawning a new Chrome
+                    # each time costs ~2s but matches what run_single_parcel.py
+                    # does (separate process per call) and reliably succeeds.
+                    if browser is not None:
+                        try:
+                            browser.close()
+                        except Exception:
+                            pass
+                    browser = _launch_browser(pw, headless=headless)
                     items, meta, warn = fetch_parcel_deals(
                         gush, chelka, browser=browser)
                 except KeyboardInterrupt:
