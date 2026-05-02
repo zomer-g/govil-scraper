@@ -191,7 +191,13 @@ def _fetch_with_browser(gush, chelka, browser, progress,
 
     items: list[dict] = []
     parcel_meta: dict = {}
-    state = {"total_rows": None, "total_fetch": None}
+    state = {
+        "total_rows": None, "total_fetch": None,
+        # Block-detection signals — see the on_response handler.
+        "token_verify_seen": False,
+        "token_verify_passed": False,
+        "deal_data_rejected": False,
+    }
 
     progress(current=0, total=0,
              message=f"פותח דפדפן עבור גוש {gush} חלקה {chelka}")
@@ -213,10 +219,25 @@ def _fetch_with_browser(gush, chelka, browser, progress,
                     parcel_meta.update(json.loads(resp.text()))
                 except Exception as e:
                     logger.warning("nadlan deal-info parse failed: %s", e)
+            elif u.endswith("/token-verify"):
+                # Track verification outcome so the caller can detect when
+                # reCAPTCHA Enterprise has flagged our IP. 200 with ok:true
+                # = passed. 400 / 200 with ok:false = rejected.
+                state["token_verify_seen"] = True
+                if resp.status == 200:
+                    try:
+                        body = resp.text()
+                        if '"ok":true' in body or '"ok": true' in body:
+                            state["token_verify_passed"] = True
+                    except Exception:
+                        pass
             elif u.endswith("/deal-data") and resp.status == 200:
                 try:
                     decoded = _decode(resp.text())
                     if decoded.get("statusCode") != 200:
+                        # 405 here is the rate-limit signal — verification
+                        # failed upstream so the API rejects the call.
+                        state["deal_data_rejected"] = True
                         logger.warning("nadlan deal-data statusCode=%s",
                                        decoded.get("statusCode"))
                         return
@@ -254,7 +275,15 @@ def _fetch_with_browser(gush, chelka, browser, progress,
 
         if state["total_rows"] is None:
             progress(message=f"לא התקבלה תשובה מ-nadlan עבור {parcel_id}")
-            return items, parcel_meta, None
+            # Surface a "BLOCKED" warning when our token-verify failed AND
+            # /deal-data was explicitly rejected — the caller can use this
+            # to detect rate-limit incidents and stop polling.
+            blocked = (
+                state.get("token_verify_seen") and
+                not state.get("token_verify_passed") and
+                state.get("deal_data_rejected")
+            )
+            return items, parcel_meta, ("BLOCKED" if blocked else None)
 
         page.wait_for_timeout(1500)
 

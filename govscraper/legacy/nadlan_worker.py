@@ -177,9 +177,14 @@ def run(server_url: str, worker_id: str,
 
     client = NadlanWorkerClient(server_url, worker_id)
     consecutive_transient = 0
+    consecutive_blocked = 0
     n_done = 0
     n_deals = 0
     headless = os.environ.get("NADLAN_HEADLESS", "0") == "1"
+    # After this many parcels with the BLOCKED signal in a row we stop —
+    # the IP is rate-limited and continuing just wastes time on rows that
+    # would silently store deals_count=0. Operator should rotate the IP.
+    BLOCK_DETECT_THRESHOLD = 5
 
     logger.info("nadlan worker '%s' starting against %s", worker_id, server_url)
 
@@ -248,6 +253,32 @@ def run(server_url: str, worker_id: str,
 
                 # Success — clear circuit-breaker counter
                 consecutive_transient = 0
+
+                # Block-detection: legacy_api returns warn="BLOCKED" when
+                # token-verify failed AND deal-data was rejected (statusCode
+                # 405). N in a row = our IP is rate-limited; nothing to gain
+                # by continuing — release the in-flight task and exit.
+                if warn == "BLOCKED":
+                    consecutive_blocked += 1
+                    logger.warning("[%s] BLOCKED (%d/%d consecutive). "
+                                   "reCAPTCHA Enterprise rate-limited the IP.",
+                                   parcel_id, consecutive_blocked,
+                                   BLOCK_DETECT_THRESHOLD)
+                    client.report_failure(parcel_id, "BLOCKED by token-verify",
+                                          transient=True)
+                    if consecutive_blocked >= BLOCK_DETECT_THRESHOLD:
+                        logger.error(
+                            "%d blocked parcels in a row — IP appears rate-"
+                            "limited. Stopping cleanly. Restart your router "
+                            "for a fresh IP and re-launch the worker.",
+                            consecutive_blocked)
+                        return
+                    # Skip upload + throttle, go straight to next task.
+                    if per_parcel_pause_s > 0:
+                        time.sleep(per_parcel_pause_s)
+                    continue
+                consecutive_blocked = 0  # any non-blocked parcel resets
+
                 if warn:
                     logger.warning("[%s] %s", parcel_id, warn)
 
