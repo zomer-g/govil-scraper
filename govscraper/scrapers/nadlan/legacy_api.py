@@ -166,12 +166,35 @@ def _retry_warmup_if_no_data(page, state, retry_window_s: int = 8):
 
 
 def _launch_browser(pw, headless: bool):
-    """Try real Chrome first, fall back to Chromium if not installed.
+    """Acquire a Playwright browser to drive nadlan.gov.il.
 
-    Real Chrome bypasses nadlan's token-verify check that flags Chromium
-    as bot. Add --disable-blink-features=AutomationControlled so the
-    `navigator.webdriver` flag isn't set even on Chrome.
+    Order of preference:
+      1. Connect over CDP to an already-running Chrome on
+         ``NADLAN_CHROME_CDP`` (default ``http://localhost:9222``). This
+         is the most reliable path — the user's Chrome has site engagement
+         history with nadlan so reCAPTCHA Enterprise scores us as a real
+         human. Set the env var to "0" to disable.
+      2. Launch real Chrome (``channel="chrome"``). Fresh profile, lower
+         reCAPTCHA score — typically still passes but may fail when
+         nadlan tightens the bot scoring.
+      3. Fall back to Chromium. Almost always rejected by token-verify;
+         logged as a warning.
+
+    To use option 1, the operator launches Chrome with::
+
+        chrome --remote-debugging-port=9222 --user-data-dir=...
+
+    See ``docs/nadlan_cdp_setup.md`` for the full Windows recipe.
     """
+    cdp = os.environ.get("NADLAN_CHROME_CDP", "http://localhost:9222")
+    if cdp and cdp.lower() not in ("0", "false", "off", ""):
+        try:
+            br = pw.chromium.connect_over_cdp(cdp, timeout=5000)
+            logger.info("nadlan: connected to existing Chrome at %s", cdp)
+            return br
+        except Exception as e:
+            logger.info("nadlan: no Chrome at %s (%s) — launching fresh", cdp, e)
+
     args = ["--disable-blink-features=AutomationControlled"]
     try:
         return pw.chromium.launch(channel="chrome", headless=headless, args=args)
@@ -202,13 +225,22 @@ def _fetch_with_browser(gush, chelka, browser, progress,
     progress(current=0, total=0,
              message=f"פותח דפדפן עבור גוש {gush} חלקה {chelka}")
 
-    ctx = browser.new_context(locale="he-IL",
-                              viewport={"width": 1280, "height": 900})
-    # Mask the most obvious automation flag — defence in depth on top of the
-    # `--disable-blink-features=AutomationControlled` launch arg.
-    ctx.add_init_script(
-        "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
-    )
+    # When connected over CDP, browser.contexts[0] is the user's actual
+    # context with their cookies + reCAPTCHA history — using it keeps the
+    # human-like score we get for free. When we launched a fresh browser
+    # we must create a new context.
+    cdp_attached = bool(browser.contexts) and browser.contexts[0].pages
+    own_context = not cdp_attached
+    if cdp_attached:
+        ctx = browser.contexts[0]
+    else:
+        ctx = browser.new_context(locale="he-IL",
+                                  viewport={"width": 1280, "height": 900})
+        # Mask the most obvious automation flag — defence in depth on top of
+        # the `--disable-blink-features=AutomationControlled` launch arg.
+        ctx.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+        )
     try:
         page = ctx.new_page()
 
@@ -310,7 +342,17 @@ def _fetch_with_browser(gush, chelka, browser, progress,
 
         return items, parcel_meta, warn
     finally:
-        ctx.close()
+        try:
+            page.close()
+        except Exception:
+            pass
+        # Only close the context if we created it. Closing the user's
+        # CDP-attached context would kill all their tabs.
+        if own_context:
+            try:
+                ctx.close()
+            except Exception:
+                pass
 
 
 def order_columns(items: list[dict]) -> list[str]:
