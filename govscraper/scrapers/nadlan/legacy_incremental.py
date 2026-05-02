@@ -349,6 +349,66 @@ class NadlanBrowser:
                         deals.append(it)
         return saw_405
 
+    def _mint_token_verify_uuid(self, site_key: str, log: bool = False,
+                                  setl_code: str = "") -> Optional[str]:
+        """Replicate the SPA's pre-deal-data token mint:
+
+           grecaptcha.execute → POST /token-verify → fresh UUID
+
+        Returns the UUID string, or None on failure.
+        """
+        # Step 1: fresh recaptcha token
+        try:
+            recap = self._page.evaluate(
+                """async (siteKey) => {
+                    try {
+                        if (typeof grecaptcha === 'undefined') return null;
+                        const ent = grecaptcha.enterprise || grecaptcha;
+                        return await ent.execute(siteKey, {action: 'submit'});
+                    } catch (e) { return null; }
+                }""",
+                site_key,
+            )
+        except Exception as e:
+            if log:
+                logger.warning("setl %s: grecaptcha.execute threw: %s", setl_code, e)
+            return None
+        if not recap:
+            if log:
+                logger.warning("setl %s: grecaptcha returned no token", setl_code)
+            return None
+        if log:
+            logger.info("setl %s: grecaptcha minted token len=%d", setl_code, len(recap))
+
+        # Step 2: POST to /token-verify
+        try:
+            resp = self._page.request.post(
+                "https://api.nadlan.gov.il/token-verify",
+                data=json.dumps({"token": recap}).encode("utf-8"),
+                headers={"content-type": "application/json"},
+                timeout=20_000,
+            )
+        except Exception as e:
+            if log:
+                logger.warning("setl %s: /token-verify request failed: %s", setl_code, e)
+            return None
+        if resp.status != 200:
+            if log:
+                logger.warning("setl %s: /token-verify HTTP %d", setl_code, resp.status)
+            return None
+        try:
+            tv_body = resp.json()
+        except Exception as e:
+            if log:
+                logger.warning("setl %s: /token-verify json decode failed: %s", setl_code, e)
+            return None
+        if log:
+            logger.info("setl %s: /token-verify response=%s", setl_code,
+                        json.dumps(tv_body, ensure_ascii=False)[:200])
+        if not tv_body.get("ok"):
+            return None
+        return tv_body.get("token")
+
     def _paginate_remaining(self, setl_code: str, captured_request: dict,
                              total_fetch: int,
                              deals: list[dict], seen: set) -> bool:
@@ -392,53 +452,58 @@ class NadlanBrowser:
         # token spent after fetch_number=1 and rejects every subsequent JWT
         # with the same token (HTTP 405). To paginate, we mint a fresh
         # token from the page's own grecaptcha runtime for each page.
+        # Find recaptcha site key. Multiple lookup paths because the SPA
+        # loads recaptcha dynamically and the script tag may be absent.
         site_key = self._page.evaluate("""
             () => {
-                const s = document.querySelector('script[src*="recaptcha"]');
-                if (!s) return null;
-                const m = s.src.match(/render=([^&]+)/);
-                return m ? m[1] : null;
+                // 1. recaptcha script tag with ?render=
+                for (const s of document.querySelectorAll('script[src]')) {
+                    const m = s.src.match(/recaptcha[^"]*[?&]render=([^&"]+)/);
+                    if (m) return m[1];
+                }
+                // 2. ___grecaptcha_cfg global (deep walk)
+                try {
+                    const cfg = window.___grecaptcha_cfg;
+                    if (cfg && cfg.clients) {
+                        const seen = new Set();
+                        const stack = [cfg.clients];
+                        while (stack.length) {
+                            const o = stack.pop();
+                            if (!o || typeof o !== 'object' || seen.has(o)) continue;
+                            seen.add(o);
+                            for (const k in o) {
+                                if (k === 'sitekey' && typeof o[k] === 'string') return o[k];
+                                if (typeof o[k] === 'object') stack.push(o[k]);
+                            }
+                        }
+                    }
+                } catch (e) {}
+                return null;
             }
         """)
         logger.info("setl %s: recaptcha site_key=%s", setl_code,
                     site_key[:20] + "..." if site_key else "NOT FOUND")
-        # Diagnostic: log original token length + sample so we can see if
-        # fresh tokens are even being substituted.
-        orig_token = payload.get("token") or ""
-        logger.info("setl %s: original token len=%d, sample=%s",
-                    setl_code, len(orig_token), orig_token[:30])
 
         for fetch_num in range(2, total_fetch + 1):
             new_payload = dict(payload)
             new_payload["fetch_number"] = fetch_num
 
-            # Mint a fresh recaptcha token so the JWT passes server-side
-            # token-verify. Action is unknown — try the common SPA values.
-            if site_key and "token" in new_payload:
-                try:
-                    fresh = self._page.evaluate(
-                        """async (siteKey) => {
-                            try {
-                                if (typeof grecaptcha === 'undefined') return {err: 'grecaptcha undef'};
-                                if (!grecaptcha.enterprise) return {err: 'no enterprise'};
-                                const t = await grecaptcha.enterprise.execute(
-                                    siteKey, {action: 'submit'});
-                                return {token: t};
-                            } catch (e) {
-                                return {err: String(e)};
-                            }
-                        }""",
-                        site_key,
-                    )
-                    if fetch_num == 2:
-                        logger.info("setl %s: grecaptcha result=%s", setl_code,
-                                    {k: (v[:30] + "..." if isinstance(v, str) and len(v) > 30 else v)
-                                     for k, v in (fresh or {}).items()})
-                    if fresh and fresh.get("token"):
-                        new_payload["token"] = fresh["token"]
-                except Exception as e:
-                    logger.warning("setl %s fetch=%d: grecaptcha.execute failed: %s",
-                                    setl_code, fetch_num, e)
+            # Mint a fresh UUID via the SPA's own /token-verify dance:
+            # 1. grecaptcha.enterprise.execute(site_key) → recaptcha token
+            # 2. POST /token-verify {"token": recap} → {"ok": true, "token": UUID}
+            # 3. JWT payload['token'] := UUID
+            # The UUID is single-use server-side, hence the per-page refresh.
+            if site_key:
+                fresh_uuid = self._mint_token_verify_uuid(site_key, log=(fetch_num == 2),
+                                                          setl_code=setl_code)
+                if fresh_uuid:
+                    new_payload["token"] = fresh_uuid
+                    # Bump exp ~30s into the future (server checks freshness).
+                    new_payload["exp"] = int(time.time()) + 30
+                else:
+                    logger.warning("setl %s fetch=%d: failed to mint fresh UUID",
+                                    setl_code, fetch_num)
+                    return False
 
             try:
                 new_jwt = _sign_reversed_jwt(header, new_payload)
