@@ -372,12 +372,18 @@ class NadlanBrowser:
             return False
 
         # Diagnostic: log what fields are in the JWT so we know what to
-        # change when paginating. The first time through this gives us a
-        # one-line schema log; subsequent fetches stay quiet.
+        # change when paginating. Also log URL + a non-sensitive header dump
+        # so we can spot path-based or method-mismatch issues.
         logger.info("setl %s: JWT header keys=%s, payload keys=%s",
                     setl_code, list(header.keys()), list(payload.keys()))
-        logger.debug("setl %s: full payload=%s", setl_code,
-                     json.dumps(payload, ensure_ascii=False)[:500])
+        logger.info("setl %s: captured URL=%s", setl_code, captured_request["url"])
+        _safe_hdrs = {
+            k: v for k, v in (captured_request["headers"] or {}).items()
+            if k.lower() not in ("cookie", "authorization")
+        }
+        logger.info("setl %s: captured headers keys=%s, content-type=%s",
+                    setl_code, list(_safe_hdrs.keys()),
+                    _safe_hdrs.get("content-type", _safe_hdrs.get("Content-Type")))
 
         url = captured_request["url"]
         headers = captured_request["headers"] or {}
