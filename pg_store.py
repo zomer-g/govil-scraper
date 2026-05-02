@@ -440,10 +440,16 @@ class PgStore:
             code = str(s.get("setl_code") or s.get("SETL_CODE") or "").strip()
             if not code:
                 continue
+            # Population: API may return int, str, "", None or omit it.
+            raw_pop = s.get("population") or s.get("POPULATION") or 0
+            try:
+                pop = int(raw_pop) if raw_pop not in ("", None) else 0
+            except (TypeError, ValueError):
+                pop = 0
             prepared.append((
                 code,
                 str(s.get("setl_name") or s.get("SETL_NAME") or ""),
-                int(s.get("population") or s.get("POPULATION") or 0 or 0),
+                pop,
             ))
         if not prepared:
             return {"inserted": 0, "skipped": len(settlements)}
