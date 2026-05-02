@@ -196,7 +196,9 @@ class NadlanBrowser:
         # Prefer CDP attach to the user's already-warmed Chrome (high
         # recaptcha enterprise score). See run_chrome_for_nadlan.bat.
         # Fall back to a fresh Chrome launch if CDP isn't available.
-        cdp = os.environ.get("NADLAN_CHROME_CDP", "http://localhost:9222")
+        # Use 127.0.0.1 explicitly — `localhost` resolves to ::1 first on
+        # Windows and Chrome's CDP only listens on IPv4 by default.
+        cdp = os.environ.get("NADLAN_CHROME_CDP", "http://127.0.0.1:9222")
         cdp_attached = False
         if cdp and cdp.lower() not in ("0", "false", "off", ""):
             try:
