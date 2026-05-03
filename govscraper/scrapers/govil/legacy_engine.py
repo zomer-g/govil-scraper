@@ -1125,6 +1125,48 @@ class GovILScraper:
                         category=(item.get("headTitle") or "").strip(),
                     )
 
+        # Path 3: contentSub.filesToDownload (e.g. legal_counsel,
+        # contentType="legalinfo"). Page-level groups of file metadata.
+        # Used as a fallback when contentMain has no htmlContents/faqs.
+        if not all_items:
+            files_to_download = ((first.get("contentSub") or {})
+                                 .get("filesToDownload") or {})
+            page_chapter = chapter_titles[0] if chapter_titles else name
+            for group in files_to_download.get("filesGroupItems") or []:
+                if not isinstance(group, dict):
+                    continue
+                category = (group.get("title") or "").strip()
+                for item in group.get("items") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    url = (item.get("url") or "").strip()
+                    if not url:
+                        continue
+                    absolute = url if url.startswith("http") else urljoin(BASE_URL + "/", url)
+                    display = (item.get("displayName")
+                               or item.get("fileName")
+                               or absolute).strip()
+                    row_idx = len(all_items)
+                    all_items.append({
+                        "chapter": page_chapter,
+                        "category": category,
+                        "title": display,
+                        "url": absolute,
+                    })
+                    filename = (item.get("fileName")
+                                or absolute.rsplit("/", 1)[-1]).strip()
+                    ext = (item.get("extension") or "").lower()
+                    if ext and not filename.lower().endswith(f".{ext}"):
+                        filename = f"{filename}.{ext}"
+                    if not ext and "." in filename:
+                        ext = filename.rsplit(".", 1)[-1].lower()
+                    all_attachments.append(FileAttachment(
+                        url=absolute,
+                        filename=filename,
+                        item_index=row_idx,
+                        file_type=ext,
+                    ))
+
         logger.info(
             "ContentPage %s: %d items, %d attachments across %d chapters",
             name, len(all_items), len(all_attachments), total_chapters,
