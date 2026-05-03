@@ -685,3 +685,137 @@ def settlement_clear():
     if err: return err
     n = pg.settlement_clear()
     return jsonify({"cleared": n})
+
+
+# ===================================================================
+# Settlement-slice endpoints — fine-grained scrape via filter slicing
+# ===================================================================
+
+# Ordered list of room values (None = all rooms / no filter)
+_SLICE_ROOMS = [None, "1", "2", "3", "4", "5", "6plus"]
+# Both sort directions multiplied by all rooms = 14 slices/settlement.
+# Use only dealDate sorts initially — they give us "newest 500" + "oldest
+# 500" per room which together cover the head and tail. dealAmount sorts
+# add 4 more slices/settlement that may capture middle deals via different
+# orderings — disabled by default, can be enabled when big-city coverage
+# proves insufficient.
+_SLICE_SORTS = ["dealDate_down", "dealDate_up"]
+
+
+@nadlan_api_bp.route("/slice-seed", methods=["POST"])
+def slice_seed():
+    """Admin: generate the slice cross-product (1509 × 7 rooms × 2 sorts =
+    ~21K slices) from the catalog. Idempotent — re-runs add only new
+    combos for any settlement codes added since last seed."""
+    if not _admin_or_worker():
+        return jsonify({"error": "admin or worker key required"}), 403
+    pg, err = _require_pg()
+    if err: return err
+
+    try:
+        r = requests.get(
+            "https://data.nadlan.gov.il/api/index/setl_types.json",
+            timeout=30,
+        )
+        r.raise_for_status()
+        catalog = r.json()
+    except Exception as e:
+        return jsonify({"error": f"failed to fetch catalog: {e}"}), 502
+
+    rows = []
+    if isinstance(catalog, dict):
+        for code, meta in catalog.items():
+            meta = meta or {}
+            for room in _SLICE_ROOMS:
+                for sort in _SLICE_SORTS:
+                    rows.append({
+                        "setl_code": str(code),
+                        "setl_name": meta.get("SETL_NAME", ""),
+                        "population": meta.get("POPULATION", 0),
+                        "room_filter": room,
+                        "sort_order": sort,
+                    })
+
+    result = pg.slice_create_tasks(rows)
+    logger.info("slice-seed: %s (catalog=%d settlements, "
+                "%d slices each)", result,
+                len(catalog) if isinstance(catalog, dict) else 0,
+                len(_SLICE_ROOMS) * len(_SLICE_SORTS))
+    return jsonify({
+        **result,
+        "catalog_size": len(catalog) if isinstance(catalog, dict) else 0,
+        "slices_per_settlement": len(_SLICE_ROOMS) * len(_SLICE_SORTS),
+    })
+
+
+@nadlan_api_bp.route("/slice-claim", methods=["POST"])
+def slice_claim():
+    """Worker: atomically claim N slices, sorted by population DESC and
+    grouped by setl_code so a single worker tends to get consecutive
+    slices of the same settlement."""
+    body = request.get_json(silent=True) or {}
+    worker_id = str(body.get("worker_id") or "").strip()
+    count = int(body.get("count") or 14)  # default = one settlement's worth
+    if not worker_id:
+        return jsonify({"error": "worker_id required"}), 400
+    pg, err = _require_pg()
+    if err: return err
+    pg.slice_reset_stale(timeout_seconds=1800)
+    tasks = pg.slice_claim_tasks(worker_id, count)
+    return jsonify({"tasks": tasks, "claimed": len(tasks)})
+
+
+@nadlan_api_bp.route("/slice-result/<path:slice_key>", methods=["POST"])
+def slice_result(slice_key):
+    """Worker: upload deals for one slice. Multipart CSV.
+
+    Form fields: worker_id, deals_count (optional override),
+                  total_rows (informational).
+    """
+    worker_id = (request.form.get("worker_id") or "").strip()
+    if not worker_id:
+        return jsonify({"error": "worker_id required"}), 400
+    pg, err = _require_pg()
+    if err: return err
+
+    rows: list[dict] = []
+    upload = request.files.get("file")
+    if upload:
+        text = upload.read().decode("utf-8-sig", errors="replace")
+        rows = list(_csv.DictReader(io.StringIO(text)))
+
+    appended = pg.append_deals(rows) if rows else 0
+    total_rows = int(request.form.get("total_rows") or 0)
+    pg.slice_complete_task(slice_key, deals_count=appended,
+                            total_rows=total_rows)
+    return jsonify({"appended": appended, "task_state": "done"})
+
+
+@nadlan_api_bp.route("/slice-fail/<path:slice_key>", methods=["POST"])
+def slice_fail(slice_key):
+    worker_id = (request.form.get("worker_id") or "").strip()
+    error = (request.form.get("error") or "")[:500]
+    transient_flag = (request.form.get("transient") or "true").lower() != "false"
+    if not worker_id:
+        return jsonify({"error": "worker_id required"}), 400
+    pg, err = _require_pg()
+    if err: return err
+    pg.slice_fail_task(slice_key, error, transient=transient_flag)
+    return jsonify({"recorded": True, "transient": transient_flag})
+
+
+@nadlan_api_bp.route("/slice-status", methods=["GET"])
+def slice_status():
+    pg, err = _require_pg()
+    if err: return err
+    return jsonify(pg.slice_status())
+
+
+@nadlan_api_bp.route("/slice-clear", methods=["POST"])
+def slice_clear():
+    if not _admin_or_worker():
+        return jsonify({"error": "admin or worker key required"}), 403
+    pg, err = _require_pg()
+    if err: return err
+    n = pg.slice_clear()
+    return jsonify({"cleared": n})

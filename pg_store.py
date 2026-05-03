@@ -92,6 +92,36 @@ CREATE INDEX IF NOT EXISTS idx_nadlan_setl_claimed ON nadlan_settlement_tasks(cl
 """
 
 
+_NADLAN_SETTLEMENT_SLICES_DDL = """
+CREATE TABLE IF NOT EXISTS nadlan_settlement_slices (
+    slice_key     TEXT PRIMARY KEY,            -- "<setl>:<room>:<sort>"
+    setl_code     TEXT NOT NULL,
+    setl_name     TEXT DEFAULT '',
+    population    INTEGER DEFAULT 0,
+    room_filter   TEXT,                        -- '1','2','3','4','5','6plus' or NULL
+    sort_order    TEXT NOT NULL DEFAULT 'dealDate_down',
+    state         TEXT DEFAULT 'pending',      -- pending|claimed|done|failed
+    worker_id     TEXT DEFAULT '',
+    deals_count   INTEGER DEFAULT 0,
+    total_rows    INTEGER DEFAULT 0,           -- as reported by API on this slice
+    error         TEXT DEFAULT '',
+    attempts      INTEGER DEFAULT 0,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    claimed_at    TIMESTAMPTZ,
+    completed_at  TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_nadlan_slice_state
+  ON nadlan_settlement_slices(state);
+CREATE INDEX IF NOT EXISTS idx_nadlan_slice_pending_pop
+  ON nadlan_settlement_slices(state, population DESC NULLS LAST)
+  WHERE state = 'pending';
+CREATE INDEX IF NOT EXISTS idx_nadlan_slice_setl
+  ON nadlan_settlement_slices(setl_code);
+CREATE INDEX IF NOT EXISTS idx_nadlan_slice_claimed
+  ON nadlan_settlement_slices(claimed_at);
+"""
+
+
 _NADLAN_DEALS_DDL = """
 CREATE TABLE IF NOT EXISTS nadlan_deals (
     id              BIGSERIAL PRIMARY KEY,
@@ -198,6 +228,7 @@ class PgStore:
             cur.execute(_NADLAN_TASKS_DDL)
             cur.execute(_NADLAN_DEALS_DDL)
             cur.execute(_NADLAN_SETTLEMENT_TASKS_DDL)
+            cur.execute(_NADLAN_SETTLEMENT_SLICES_DDL)
             conn.commit()
 
     # --- nadlan_tasks ----------------------------------------------------
@@ -567,6 +598,165 @@ class PgStore:
     def settlement_clear(self) -> int:
         with self._lock, self._conn() as conn, conn.cursor() as cur:
             cur.execute("DELETE FROM nadlan_settlement_tasks")
+            n = cur.rowcount
+            conn.commit()
+            return n
+
+    # --- nadlan_settlement_slices --------------------------------------
+    # Each slice = one (settlement × room × sort) tuple → one /deal-data
+    # call returning ≤500 deals. Many slices per settlement; the worker
+    # claims slices and the slice_worker drives UI clicks per slice.
+
+    def slice_create_tasks(self, slices: list[dict]) -> dict:
+        """Bulk-insert slice tasks. Each row needs:
+           setl_code, setl_name, population, room_filter, sort_order.
+        slice_key is computed from setl_code:room_filter:sort_order."""
+        if not slices:
+            return {"inserted": 0, "skipped": 0}
+        prepared = []
+        for s in slices:
+            code = str(s.get("setl_code") or "").strip()
+            if not code:
+                continue
+            room = s.get("room_filter")  # may be None for "all rooms"
+            sort = s.get("sort_order") or "dealDate_down"
+            slice_key = f"{code}:{room or '_'}:{sort}"
+            try:
+                pop = int(s.get("population") or 0)
+            except (TypeError, ValueError):
+                pop = 0
+            prepared.append((
+                slice_key, code,
+                str(s.get("setl_name") or ""),
+                pop, room, sort,
+            ))
+        if not prepared:
+            return {"inserted": 0, "skipped": len(slices)}
+        with self._lock, self._conn() as conn, conn.cursor() as cur:
+            cur.executemany(
+                """INSERT INTO nadlan_settlement_slices
+                   (slice_key, setl_code, setl_name, population,
+                    room_filter, sort_order)
+                   VALUES (%s, %s, %s, %s, %s, %s)
+                   ON CONFLICT (slice_key) DO NOTHING""",
+                prepared,
+            )
+            inserted = cur.rowcount
+            conn.commit()
+        return {"inserted": inserted, "skipped": len(slices) - inserted}
+
+    def slice_claim_tasks(self, worker_id: str, count: int = 1) -> list[dict]:
+        """Claim N pending slices, sorted by population DESC so the big
+        cities (most slices) get parallelized first.
+
+        Slices are grouped by setl_code so a single worker tends to get
+        consecutive slices of the same settlement — which lets it reuse
+        one browser session and avoids re-navigating between slices.
+        """
+        if count < 1:
+            return []
+        with self._lock, self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """WITH picked AS (
+                       SELECT slice_key FROM nadlan_settlement_slices
+                       WHERE state = 'pending'
+                       ORDER BY population DESC NULLS LAST,
+                                setl_code, sort_order, room_filter
+                       FOR UPDATE SKIP LOCKED
+                       LIMIT %s
+                   )
+                   UPDATE nadlan_settlement_slices t
+                   SET state = 'claimed',
+                       worker_id = %s,
+                       claimed_at = NOW(),
+                       attempts = attempts + 1
+                   FROM picked
+                   WHERE t.slice_key = picked.slice_key
+                   RETURNING t.*""",
+                (count, worker_id),
+            )
+            rows = cur.fetchall()
+            conn.commit()
+        for r in rows:
+            for k in ("created_at", "claimed_at", "completed_at"):
+                if r.get(k):
+                    r[k] = r[k].isoformat()
+        return list(rows)
+
+    def slice_complete_task(self, slice_key: str,
+                              deals_count: int,
+                              total_rows: int = 0) -> bool:
+        with self._lock, self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """UPDATE nadlan_settlement_slices
+                   SET state = 'done', deals_count = %s,
+                       total_rows = %s, completed_at = NOW(), error = ''
+                   WHERE slice_key = %s""",
+                (int(deals_count or 0), int(total_rows or 0), slice_key),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+    def slice_fail_task(self, slice_key: str, error: str,
+                          transient: bool) -> bool:
+        with self._lock, self._conn() as conn, conn.cursor() as cur:
+            if transient:
+                cur.execute(
+                    """UPDATE nadlan_settlement_slices
+                       SET state = 'pending', worker_id = '',
+                           claimed_at = NULL, error = %s
+                       WHERE slice_key = %s""",
+                    (str(error)[:500], slice_key),
+                )
+            else:
+                cur.execute(
+                    """UPDATE nadlan_settlement_slices
+                       SET state = 'failed', completed_at = NOW(),
+                           error = %s
+                       WHERE slice_key = %s""",
+                    (str(error)[:500], slice_key),
+                )
+            conn.commit()
+            return cur.rowcount > 0
+
+    def slice_reset_stale(self, timeout_seconds: int = 1800) -> int:
+        """Reclaim slices stuck in 'claimed' for >30min."""
+        with self._lock, self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """UPDATE nadlan_settlement_slices
+                   SET state = 'pending', worker_id = '', claimed_at = NULL
+                   WHERE state = 'claimed'
+                     AND claimed_at < NOW() - make_interval(secs => %s)""",
+                (timeout_seconds,),
+            )
+            conn.commit()
+            return cur.rowcount
+
+    def slice_status(self) -> dict:
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT state, COUNT(*) AS c FROM nadlan_settlement_slices "
+                "GROUP BY state"
+            )
+            counts = {r["state"]: r["c"] for r in cur.fetchall()}
+            cur.execute(
+                "SELECT COALESCE(SUM(deals_count), 0) AS t "
+                "FROM nadlan_settlement_slices"
+            )
+            total_deals = cur.fetchone()["t"]
+        total = sum(counts.values())
+        return {
+            "pending": counts.get("pending", 0),
+            "claimed": counts.get("claimed", 0),
+            "done":    counts.get("done", 0),
+            "failed":  counts.get("failed", 0),
+            "total":   total,
+            "deals_collected": int(total_deals or 0),
+        }
+
+    def slice_clear(self) -> int:
+        with self._lock, self._conn() as conn, conn.cursor() as cur:
+            cur.execute("DELETE FROM nadlan_settlement_slices")
             n = cur.rowcount
             conn.commit()
             return n
