@@ -335,12 +335,21 @@ class NadlanBrowser:
             page.wait_for_timeout(3500)  # SPA boot
             self._dismiss_error_modal()
 
+            consecutive_no_response = 0
             for idx, sl in enumerate(slices):
                 room = sl.get("room_filter")
                 sort = sl.get("sort_order") or "dealDate_down"
                 t0 = time.time()
                 err = None
                 marker = len(captures)
+
+                # Bail early if SPA is unresponsive: 3 consecutive no_response
+                # = the SPA's data is cached and not re-firing /deal-data.
+                # Mark remaining slices as no_response without trying.
+                if consecutive_no_response >= 3:
+                    results.append({**sl, "deals": [], "total_rows": 0,
+                                    "error": "skip_spa_unresponsive"})
+                    continue
 
                 if not self._apply_room_filter(room):
                     err = "room_click_failed"
@@ -360,6 +369,8 @@ class NadlanBrowser:
                             page.wait_for_timeout(2500)
 
                 if err:
+                    if err in ("room_no_response", "sort_no_response"):
+                        consecutive_no_response += 1
                     logger.warning("setl %s slice %d/%d (room=%s, sort=%s): %s",
                                     setl_code, idx + 1, len(slices),
                                     room or "all", sort, err)
@@ -379,6 +390,7 @@ class NadlanBrowser:
                         pass
                     continue
 
+                consecutive_no_response = 0
                 last = captures[-1] if captures else {}
                 results.append({
                     **sl,

@@ -135,6 +135,7 @@ _TRANSIENT_PATTERNS = (
 _PERMANENT_PATTERNS = (
     "room_click_failed",
     "sort_click_failed",
+    "skip_spa_unresponsive",  # SPA returned no /deal-data on 3 clicks
 )
 
 
