@@ -690,21 +690,34 @@ class PgStore:
             conn.commit()
         return {"inserted": inserted, "skipped": len(slices) - inserted}
 
-    def slice_claim_tasks(self, worker_id: str, count: int = 1) -> list[dict]:
+    def slice_claim_tasks(self, worker_id: str, count: int = 1,
+                            max_attempts: int = 3) -> list[dict]:
         """Claim N pending slices, sorted by population DESC so the big
         cities (most slices) get parallelized first.
 
         Slices are grouped by setl_code so a single worker tends to get
-        consecutive slices of the same settlement — which lets it reuse
-        one browser session and avoids re-navigating between slices.
+        consecutive slices of the same settlement.
+
+        Slices with attempts >= max_attempts are auto-marked failed and
+        excluded from future claims — guards against stuck-loop slices
+        (tiny settlements where SPA doesn't re-fire /deal-data because
+        all data is already in DOM cache).
         """
         if count < 1:
             return []
         with self._lock, self._conn() as conn, conn.cursor() as cur:
+            # First, auto-fail slices that have hit max_attempts
+            cur.execute(
+                """UPDATE nadlan_settlement_slices
+                   SET state = 'failed', completed_at = NOW(),
+                       error = 'max_attempts_exceeded'
+                   WHERE state = 'pending' AND attempts >= %s""",
+                (max_attempts,),
+            )
             cur.execute(
                 """WITH picked AS (
                        SELECT slice_key FROM nadlan_settlement_slices
-                       WHERE state = 'pending'
+                       WHERE state = 'pending' AND attempts < %s
                        ORDER BY population DESC NULLS LAST,
                                 setl_code, sort_order, room_filter
                        FOR UPDATE SKIP LOCKED
@@ -718,7 +731,7 @@ class PgStore:
                    FROM picked
                    WHERE t.slice_key = picked.slice_key
                    RETURNING t.*""",
-                (count, worker_id),
+                (max_attempts, count, worker_id),
             )
             rows = cur.fetchall()
             conn.commit()
