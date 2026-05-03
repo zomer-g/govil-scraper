@@ -15,6 +15,7 @@ proper GeoJSON dicts and not Esri JSON.
 from __future__ import annotations
 
 import logging
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Iterator, List, Optional, Tuple
@@ -22,6 +23,12 @@ from typing import Iterator, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 WFS_BASE = "https://www.govmap.gov.il/api/geoserver/wfs"
+
+# GovMap's WFS occasionally returns transient 4xx/5xx (HTTP 400 with no
+# changed input is the most common — empirically retrying after ~1s succeeds).
+# Auth/not-found responses are NOT transient and short-circuit the loop.
+_RETRY_BACKOFF_S = (1.0, 3.0, 7.0)   # delays before attempts 2, 3, 4
+_NON_RETRY_STATUSES = frozenset({401, 403, 404})
 
 # Namespace prefixes used in the WFS XML responses
 WFS_NS = {
@@ -54,6 +61,46 @@ class WFSClient:
         # Cache: type_name -> WFSLayerMetadata
         self._meta_cache: dict = {}
 
+    # ---- transport with retry ------------------------------------------
+
+    def _get_with_retry(self, url: str, params: dict, what: str = ""):
+        """GET with bounded retry+backoff for transient WFS failures.
+
+        Retries on network errors and HTTP statuses that aren't auth/not-found.
+        Returns the response object on success (any retryable status that
+        persists past the last attempt is returned as-is, so callers' existing
+        error-handling for non-200 still fires)."""
+        last_exc: Optional[Exception] = None
+        last_resp = None
+        attempts = len(_RETRY_BACKOFF_S) + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                r = self.session.get_raw(url, params=params)
+            except Exception as e:
+                last_exc = e
+                if attempt < attempts:
+                    delay = _RETRY_BACKOFF_S[attempt - 1]
+                    logger.warning("WFS %s network error (attempt %d/%d): %s — "
+                                   "retrying in %.1fs",
+                                   what or "GET", attempt, attempts, e, delay)
+                    time.sleep(delay)
+                    continue
+                raise
+            if r.status_code == 200 or r.status_code in _NON_RETRY_STATUSES:
+                return r
+            last_resp = r
+            if attempt < attempts:
+                delay = _RETRY_BACKOFF_S[attempt - 1]
+                logger.warning("WFS %s HTTP %d (attempt %d/%d) — retrying in %.1fs",
+                               what or "GET", r.status_code, attempt, attempts, delay)
+                time.sleep(delay)
+        # Exhausted: return the last non-2xx response so the caller produces
+        # the same error path it would have without retry.
+        if last_resp is not None:
+            return last_resp
+        # Network errors all the way down — re-raise the last one.
+        raise last_exc if last_exc else WFSError(f"WFS {what}: no response")
+
     # ---- type-name resolution -------------------------------------------
 
     @staticmethod
@@ -81,7 +128,8 @@ class WFSClient:
             "request": "DescribeFeatureType",
             "typeName": type_name,
         }
-        r = self.session.get_raw(self.base, params=params)
+        r = self._get_with_retry(self.base, params=params,
+                                 what=f"DescribeFeatureType {type_name}")
         if r.status_code != 200:
             raise WFSError(f"DescribeFeatureType {type_name}: HTTP {r.status_code}")
 
@@ -113,7 +161,8 @@ class WFSClient:
         if bbox_3857:
             params["bbox"] = ",".join(str(x) for x in bbox_3857) + ",EPSG:3857"
         logger.debug("WFS hits: GET %s params=%s", self.base, params)
-        r = self.session.get_raw(self.base, params=params)
+        r = self._get_with_retry(self.base, params=params,
+                                 what=f"hits {type_name}")
         if r.status_code != 200:
             raise WFSError(
                 f"hits: HTTP {r.status_code} from {self.base} "
@@ -162,7 +211,8 @@ class WFSClient:
         if bbox_3857:
             params["bbox"] = ",".join(str(x) for x in bbox_3857) + ",EPSG:3857"
         logger.debug("WFS GetFeature: GET %s params=%s", self.base, params)
-        r = self.session.get_raw(self.base, params=params)
+        r = self._get_with_retry(self.base, params=params,
+                                 what=f"GetFeature {type_name}")
         if r.status_code != 200:
             raise WFSError(
                 f"GetFeature: HTTP {r.status_code} from {self.base} "
@@ -268,7 +318,7 @@ class WFSClient:
             "version": "2.0.0",
             "request": "GetCapabilities",
         }
-        r = self.session.get_raw(self.base, params=params)
+        r = self._get_with_retry(self.base, params=params, what="GetCapabilities")
         if r.status_code != 200:
             raise WFSError(f"GetCapabilities: HTTP {r.status_code}")
         root = ET.fromstring(r.content)

@@ -66,8 +66,13 @@ import csv as _csv
 import io
 import logging
 import os
+import re
 import threading
 import time
+
+# Parcel-id format: <gush>-<chelka> with optional sub-parcel; we allow up to
+# 9 digits per component so this comfortably fits Israel's gush/chelka registry.
+_PARCEL_ID_RE = re.compile(r"^\d{1,9}-\d{1,9}(-\d{1,9})?$")
 
 import requests
 from flask import Blueprint, jsonify, request, send_file
@@ -371,6 +376,8 @@ def bulk_claim():
 
     JSON body: {worker_id: "host-1", count: 5}
     """
+    if not _admin_or_worker():
+        return jsonify({"error": "admin or worker key required"}), 403
     body = request.get_json(silent=True) or {}
     worker_id = str(body.get("worker_id") or "").strip()
     count = int(body.get("count") or 1)
@@ -398,6 +405,10 @@ def bulk_result(parcel_id):
 
     Returns {"appended": N, "task_state": "done"} on success.
     """
+    if not _admin_or_worker():
+        return jsonify({"error": "admin or worker key required"}), 403
+    if not _PARCEL_ID_RE.match(parcel_id):
+        return jsonify({"error": "invalid parcel_id format"}), 400
     worker_id = (request.form.get("worker_id") or "").strip()
     if not worker_id:
         return jsonify({"error": "worker_id required"}), 400
@@ -410,8 +421,16 @@ def bulk_result(parcel_id):
         text = upload.read().decode("utf-8-sig", errors="replace")
         rows = list(_csv.DictReader(io.StringIO(text)))
 
+    # Only the worker that *claimed* this parcel may complete it. Without this
+    # WHERE-clause guard a stranger could fast-forward any task to "done".
+    completed = _get_store().nadlan_complete_task(
+        parcel_id, deals_count=0, worker_id=worker_id)
+    if not completed:
+        return jsonify({"error": "task not claimed by this worker, "
+                                  "or already done/failed"}), 409
     appended = _append_deals(rows)
-    _get_store().nadlan_complete_task(parcel_id, deals_count=appended)
+    # Update the deals_count now that we've actually written rows.
+    _get_store().nadlan_set_deals_count(parcel_id, appended)
     return jsonify({"appended": appended, "task_state": "done"})
 
 
@@ -424,12 +443,20 @@ def bulk_fail(parcel_id):
 
     Transient failures return the task to pending so it gets retried.
     """
+    if not _admin_or_worker():
+        return jsonify({"error": "admin or worker key required"}), 403
+    if not _PARCEL_ID_RE.match(parcel_id):
+        return jsonify({"error": "invalid parcel_id format"}), 400
     worker_id = (request.form.get("worker_id") or "").strip()
     error = (request.form.get("error") or "")[:500]
     transient_flag = (request.form.get("transient") or "true").lower() != "false"
     if not worker_id:
         return jsonify({"error": "worker_id required"}), 400
-    _get_store().nadlan_fail_task(parcel_id, error, transient=transient_flag)
+    failed = _get_store().nadlan_fail_task(
+        parcel_id, error, transient=transient_flag, worker_id=worker_id)
+    if not failed:
+        return jsonify({"error": "task not claimed by this worker, "
+                                  "or already done/failed"}), 409
     return jsonify({"recorded": True, "transient": transient_flag})
 
 

@@ -76,11 +76,18 @@ def _is_transient(exc: BaseException) -> bool:
 class NadlanWorkerClient:
     """Thin HTTP client for the /api/nadlan/bulk-* endpoints."""
 
-    def __init__(self, server_url: str, worker_id: str, timeout: int = 30):
+    def __init__(self, server_url: str, worker_id: str, timeout: int = 30,
+                 api_key: str | None = None):
         self.server_url = server_url.rstrip("/")
         self.worker_id = worker_id
         self.timeout = timeout
         self.session = requests.Session()
+        # The bulk-* endpoints require X-Worker-Key (or admin OAuth).
+        # api_key falls back to the WORKER_API_KEY env var so existing setups
+        # that already export it just keep working.
+        key = api_key or os.environ.get("WORKER_API_KEY", "")
+        if key:
+            self.session.headers["X-Worker-Key"] = key
 
     def _url(self, path: str) -> str:
         return f"{self.server_url}{path}"

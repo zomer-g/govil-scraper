@@ -307,36 +307,81 @@ class PgStore:
                     r[k] = r[k].isoformat()
         return list(rows)
 
-    def complete_task(self, parcel_id: str, deals_count: int) -> bool:
+    def complete_task(self, parcel_id: str, deals_count: int,
+                       worker_id: str | None = None) -> bool:
+        with self._lock, self._conn() as conn, conn.cursor() as cur:
+            if worker_id:
+                cur.execute(
+                    """UPDATE nadlan_tasks
+                       SET state = 'done', deals_count = %s,
+                           completed_at = NOW(), error = ''
+                       WHERE parcel_id = %s
+                         AND state = 'claimed'
+                         AND worker_id = %s""",
+                    (int(deals_count or 0), parcel_id, worker_id),
+                )
+            else:
+                cur.execute(
+                    """UPDATE nadlan_tasks
+                       SET state = 'done', deals_count = %s,
+                           completed_at = NOW(), error = ''
+                       WHERE parcel_id = %s""",
+                    (int(deals_count or 0), parcel_id),
+                )
+            conn.commit()
+            return cur.rowcount > 0
+
+    def set_deals_count(self, parcel_id: str, deals_count: int) -> bool:
+        """Adjust deals_count after the actual CSV append, without state change."""
         with self._lock, self._conn() as conn, conn.cursor() as cur:
             cur.execute(
-                """UPDATE nadlan_tasks
-                   SET state = 'done', deals_count = %s,
-                       completed_at = NOW(), error = ''
-                   WHERE parcel_id = %s""",
+                "UPDATE nadlan_tasks SET deals_count = %s WHERE parcel_id = %s",
                 (int(deals_count or 0), parcel_id),
             )
             conn.commit()
             return cur.rowcount > 0
 
-    def fail_task(self, parcel_id: str, error: str, transient: bool) -> bool:
+    def fail_task(self, parcel_id: str, error: str, transient: bool,
+                   worker_id: str | None = None) -> bool:
         with self._lock, self._conn() as conn, conn.cursor() as cur:
             if transient:
-                cur.execute(
-                    """UPDATE nadlan_tasks
-                       SET state = 'pending', worker_id = '',
-                           claimed_at = NULL, error = %s
-                       WHERE parcel_id = %s""",
-                    (str(error)[:500], parcel_id),
-                )
+                if worker_id:
+                    cur.execute(
+                        """UPDATE nadlan_tasks
+                           SET state = 'pending', worker_id = '',
+                               claimed_at = NULL, error = %s
+                           WHERE parcel_id = %s
+                             AND state = 'claimed'
+                             AND worker_id = %s""",
+                        (str(error)[:500], parcel_id, worker_id),
+                    )
+                else:
+                    cur.execute(
+                        """UPDATE nadlan_tasks
+                           SET state = 'pending', worker_id = '',
+                               claimed_at = NULL, error = %s
+                           WHERE parcel_id = %s""",
+                        (str(error)[:500], parcel_id),
+                    )
             else:
-                cur.execute(
-                    """UPDATE nadlan_tasks
-                       SET state = 'failed', completed_at = NOW(),
-                           error = %s
-                       WHERE parcel_id = %s""",
-                    (str(error)[:500], parcel_id),
-                )
+                if worker_id:
+                    cur.execute(
+                        """UPDATE nadlan_tasks
+                           SET state = 'failed', completed_at = NOW(),
+                               error = %s
+                           WHERE parcel_id = %s
+                             AND state = 'claimed'
+                             AND worker_id = %s""",
+                        (str(error)[:500], parcel_id, worker_id),
+                    )
+                else:
+                    cur.execute(
+                        """UPDATE nadlan_tasks
+                           SET state = 'failed', completed_at = NOW(),
+                               error = %s
+                           WHERE parcel_id = %s""",
+                        (str(error)[:500], parcel_id),
+                    )
             conn.commit()
             return cur.rowcount > 0
 
