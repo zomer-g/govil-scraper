@@ -366,6 +366,17 @@ class NadlanBrowser:
                     results.append({**sl, "deals": [], "total_rows": 0,
                                     "error": err})
                     self._dismiss_error_modal()
+                    # Reset dropdown state by clicking outside (body)
+                    try:
+                        page.evaluate(
+                            "() => { document.body.click(); "
+                            "document.querySelectorAll('.modal-backdrop,.dropdown.show').forEach("
+                            "  (el) => { el.dispatchEvent(new MouseEvent('click',{bubbles:true})); }"
+                            "); }"
+                        )
+                        page.wait_for_timeout(500)
+                    except Exception:
+                        pass
                     continue
 
                 last = captures[-1] if captures else {}
@@ -479,18 +490,19 @@ class NadlanBrowser:
         except Exception:
             return False
 
-    @staticmethod
-    def _wait_for_capture(captures: list, target_count: int,
+    def _wait_for_capture(self, captures: list, target_count: int,
                             timeout_s: float = 10) -> bool:
-        """Block until ``len(captures) >= target_count`` or timeout."""
+        """Block until ``len(captures) >= target_count`` or timeout. Uses
+        page.wait_for_timeout to pump Playwright's event loop so the
+        on_response handler can actually fire."""
         deadline = time.time() + timeout_s
         while len(captures) < target_count and time.time() < deadline:
-            time.sleep(0.3)
+            self._page.wait_for_timeout(300)
         return len(captures) >= target_count
 
     def _apply_room_filter(self, room_filter: Optional[str]) -> bool:
-        """Open rooms dropdown via Playwright click (force=True bypasses
-        intercepts), wait for the dropdown content, click the room option."""
+        """Open rooms dropdown then click the room option. Retries up to
+        3 times because the Vue popover state is flaky between iterations."""
         if room_filter is None:
             label = "כל החדרים"
         else:
@@ -499,18 +511,30 @@ class NadlanBrowser:
                 logger.warning("unknown room_filter=%s", room_filter)
                 return False
         page = self._page
-        try:
-            # Open rooms dropdown — wait for it to fully render before
-            # clicking the option. The Vue popover animation takes ~500ms.
-            page.locator("button.roomsBtn").first.click(timeout=5000)
-            page.wait_for_timeout(900)
-            opt = page.locator(f"button.whomBtn:has-text('{label}')").first
-            opt.click(timeout=5000)
-            return True
-        except Exception as e:
-            logger.warning("room click [%s] failed: %s", label,
-                            str(e).splitlines()[0])
-            return False
+        for attempt in range(3):
+            try:
+                # Reset dropdown state — click elsewhere first
+                if attempt > 0:
+                    try:
+                        page.locator("body").click(position={"x": 10, "y": 10},
+                                                     timeout=2000)
+                        page.wait_for_timeout(500)
+                    except Exception:
+                        pass
+                page.locator("button.roomsBtn").first.click(timeout=5000)
+                page.wait_for_timeout(400)  # match working probe pattern
+                opt = page.locator(f"button.whomBtn:has-text('{label}')").first
+                opt.click(timeout=5000)
+                return True
+            except Exception as e:
+                if attempt < 2:
+                    logger.debug("room [%s] attempt %d failed, retrying",
+                                 label, attempt + 1)
+                    page.wait_for_timeout(1500)
+                else:
+                    logger.warning("room click [%s] failed after 3 attempts: %s",
+                                    label, str(e).splitlines()[0])
+        return False
 
     def _apply_sort_filter(self, sort_order: str) -> bool:
         """Open sort dropdown + click option (matches working probe pattern)."""
