@@ -30,6 +30,12 @@ WFS_BASE = "https://www.govmap.gov.il/api/geoserver/wfs"
 _RETRY_BACKOFF_S = (1.0, 3.0, 7.0)   # delays before attempts 2, 3, 4
 _NON_RETRY_STATUSES = frozenset({401, 403, 404})
 
+# Empirical hard cap on a single GovMap WFS GetFeature response.
+# Tested 2026-05-03: count=50000 → 200 (82MB, 8s); count=100000 → 500.
+# Used as the default page_size so most reasonable BBOXes finish in one
+# request — no pagination needed.
+SERVER_HARD_CAP = 50_000
+
 # Namespace prefixes used in the WFS XML responses
 WFS_NS = {
     "wfs": "http://www.opengis.net/wfs/2.0",
@@ -230,7 +236,7 @@ class WFSClient:
     def iter_features(
         self,
         type_name: str,
-        page_size: int = 5000,
+        page_size: int = SERVER_HARD_CAP,
         cql_filter: Optional[str] = None,
         bbox_3857: Optional[Tuple[float, float, float, float]] = None,
         max_features: int = 100000,
@@ -238,10 +244,18 @@ class WFSClient:
     ) -> Iterator[dict]:
         """Iterate all features for a layer.
 
-        Implementation: GovMap's WFS rejects `startIndex`, so we either:
-        - request the whole layer in one shot when total <= page_size, or
-        - paginate via CQL on `objectid > last_id` (assumes the layer has
-          an integer objectid field — true for all standard GovMap layers).
+        Implementation strategy:
+        - GovMap's WFS rejects ``startIndex`` (returns 400) and at least one
+          important layer (``layer_nadlan``) rejects ``CQL_FILTER`` entirely
+          (returns 500). The only reliable way to fetch is a single request.
+        - Server caps a single response at ~50k features (``SERVER_HARD_CAP``);
+          asking for more returns 500.
+        - When ``total ≤ page_size``: one request — fast path. This covers
+          most real BBOXes.
+        - When ``total > page_size``: try CQL pagination as a fallback for
+          layers that DO support it. If the very first paginated request
+          fails, raise a clear actionable error instead of silently looping.
+
         Yields raw GeoJSON Feature dicts.
         """
         type_name = self.normalize_type_name(type_name)
@@ -258,7 +272,8 @@ class WFSClient:
                 "Use a CQL filter or BBOX, or raise GOVMAP_MAX_FEATURES."
             )
 
-        # Fast path: fits in one request
+        # Fast path: fits in one request (covers the vast majority of cases
+        # now that page_size defaults to the server hard cap of 50k).
         if total <= page_size:
             page = self.get_features_geojson(
                 type_name=type_name,
@@ -277,10 +292,44 @@ class WFSClient:
                                   message=f"הורדו {len(feats)}/{total} פיצ'רים")
             return
 
-        # Slow path: paginate via objectid filter
+        # Slow path: total > server hard cap. Try CQL pagination — works on
+        # layers that support CQL_FILTER. If the very first request fails
+        # (e.g. layer_nadlan rejects CQL with 500), surface a clear error
+        # so the operator narrows the BBOX instead of seeing "Unknown error"
+        # after retries exhaust.
+        try:
+            first_filter = "objectid > -1"
+            if cql_filter:
+                first_filter = f"({cql_filter}) AND ({first_filter})"
+            first_page = self.get_features_geojson(
+                type_name=type_name,
+                count=page_size,
+                cql_filter=first_filter + " ORDER BY objectid",
+                bbox_3857=bbox_3857,
+            )
+        except WFSError as e:
+            raise WFSError(
+                f"BBOX מכיל {total:,} פיצ'רים בשכבה {type_name}, "
+                f"מעל הגבול של {SERVER_HARD_CAP:,} לכל קריאה, "
+                f"וסריקה במנות נכשלה (השכבה לא תומכת ב-CQL pagination). "
+                f"צמצם את ה-BBOX. מקור השגיאה: {e}"
+            ) from e
+
         emitted = 0
         last_oid = -1
-        while emitted < total:
+        feats = first_page.get("features", [])
+        while feats:
+            for f in feats:
+                yield f
+                emitted += 1
+                oid = (f.get("properties") or {}).get("objectid")
+                if isinstance(oid, int) and oid > last_oid:
+                    last_oid = oid
+            if progress_callback:
+                progress_callback(current=emitted, total=total,
+                                  message=f"הורדו {emitted}/{total} פיצ'רים")
+            if len(feats) < page_size or emitted >= total:
+                break
             page_filter = f"objectid > {last_oid}"
             if cql_filter:
                 page_filter = f"({cql_filter}) AND ({page_filter})"
@@ -291,19 +340,6 @@ class WFSClient:
                 bbox_3857=bbox_3857,
             )
             feats = page.get("features", [])
-            if not feats:
-                break
-            for f in feats:
-                yield f
-                emitted += 1
-                oid = (f.get("properties") or {}).get("objectid")
-                if isinstance(oid, int) and oid > last_oid:
-                    last_oid = oid
-            if progress_callback:
-                progress_callback(current=emitted, total=total,
-                                  message=f"הורדו {emitted}/{total} פיצ'רים")
-            if len(feats) < page_size:
-                break
 
     # ---- catalog ---------------------------------------------------------
 
