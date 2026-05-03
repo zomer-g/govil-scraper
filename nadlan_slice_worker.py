@@ -263,6 +263,30 @@ def run(server_url: str, worker_id: str,
                     consecutive_failed = 0
                 else:
                     consecutive_failed += 1
+                    # On 2 consecutive failed settlements, close + reopen
+                    # the browser tab to clear any stuck SPA state. The
+                    # underlying CDP session stays alive.
+                    if consecutive_failed == 2:
+                        logger.info("2 consecutive failed settlements — "
+                                     "refreshing browser tab")
+                        try:
+                            nb._page.close()
+                        except Exception:
+                            pass
+                        try:
+                            nb._page = nb._ctx.new_page()
+                            nb._page.goto("https://www.nadlan.gov.il/",
+                                           wait_until="domcontentloaded",
+                                           timeout=60_000)
+                            nb._page.wait_for_timeout(2000)
+                        except Exception as e:
+                            logger.warning("tab refresh failed: %s", e)
+                    # On 4 consecutive failures, force a long cooldown
+                    # (5 min) before next attempt.
+                    elif consecutive_failed == 4:
+                        logger.info("4 consecutive failed settlements — "
+                                     "cooling down 5 min")
+                        time.sleep(300)
 
                 # Per-slice upload
                 slice_n_deals = 0
