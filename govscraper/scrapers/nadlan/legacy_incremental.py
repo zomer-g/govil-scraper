@@ -293,20 +293,16 @@ class NadlanBrowser:
 
     def fetch_settlement_slices(self, setl_code: str,
                                  slices: list[dict]) -> list[dict]:
-        """Open the settlement deals page once, walk through the slices
-        (each `{room_filter, sort_order}`) by clicking the corresponding
-        UI buttons, and capture the resulting /deal-data response per slice.
+        """Open the settlement deals page ONCE, then click filters in
+        sequence — capture each /deal-data response as a slice.
 
-        Returns a list of dicts mirroring `slices` plus `deals`, `total_rows`,
-        and `error` (None on success).
-
-        Each click triggers the SPA's natural /deal-data POST (HTTP 200,
-        ≤500 deals returned). Total time: ~1.5s/click + ~3s navigate setup.
+        In-tab clicks beat per-slice navigation: probe_ui_filter_burst
+        confirmed 6+ successive filter clicks all return 200 + 500 deals
+        within one session. Re-navigation per slice was breaking session
+        state (UUID quota, recaptcha) and only the first slice succeeded.
         """
         if not slices:
             return []
-
-        # Capture every /deal-data response so we can match by index.
         captures: list[dict] = []
 
         def on_response(resp):
@@ -315,7 +311,6 @@ class NadlanBrowser:
             try:
                 body = resp.body()
             except Exception:
-                # Network event raced — body unreadable. Ignore.
                 return
             try:
                 decoded = json.loads(gzip.decompress(base64.b64decode(body)))
@@ -324,89 +319,132 @@ class NadlanBrowser:
                     captures.append({
                         "items": data.get("items") or [],
                         "total_rows": data.get("total_rows", 0),
-                        "captured_at": time.time(),
                     })
-            except Exception as e:
-                logger.debug("decode failed: %s", e)
+            except Exception:
+                pass
 
         page = self._page
         page.on("response", on_response)
+        results = []
         try:
-            # Cache-bust with a unique param so the SPA always re-fires
-            # /deal-data even if revisiting the same settlement code.
             url = (f"https://www.nadlan.gov.il/?view=settlement"
-                   f"&id={setl_code}&page=deals&_n={int(time.time())}")
+                   f"&id={setl_code}&page=deals&_n={int(time.time()*1000)}")
             logger.info("setl %s: opening for %d slices", setl_code, len(slices))
             page.goto(url, wait_until="domcontentloaded",
                        timeout=self.nav_timeout_ms)
-            page.wait_for_timeout(3000)  # let SPA boot
-            # The SPA does NOT auto-fire /deal-data — it only does so after
-            # a filter button is clicked. We force a click for every slice.
+            page.wait_for_timeout(3500)  # SPA boot
             self._dismiss_error_modal()
-
-            results: list[dict] = []
 
             for idx, sl in enumerate(slices):
                 room = sl.get("room_filter")
                 sort = sl.get("sort_order") or "dealDate_down"
+                t0 = time.time()
+                err = None
+                marker = len(captures)
 
-                if self._dismiss_error_modal():
-                    logger.info("setl %s: dismissed error modal before slice %d",
-                                 setl_code, idx + 1)
-                    page.goto(url, wait_until="domcontentloaded",
-                               timeout=self.nav_timeout_ms)
-                    page.wait_for_timeout(2000)
-
-                # Always click rooms (even for "all"): this is the first
-                # /deal-data triggered for this slice.
-                marker_before = len(captures)
-                try:
-                    if not self._apply_room_filter(room):
-                        results.append({**sl, "deals": [], "total_rows": 0,
-                                        "error": "room_click_failed"})
-                        continue
-                    if not self._wait_for_capture(captures,
-                                                  marker_before + 1,
+                if not self._apply_room_filter(room):
+                    err = "room_click_failed"
+                elif not self._wait_for_capture(captures, marker + 1,
                                                   timeout_s=12):
-                        results.append({**sl, "deals": [], "total_rows": 0,
-                                        "error": "room_no_response"})
-                        continue
-                    page.wait_for_timeout(800)
-
-                    # If non-default sort, click sort dropdown
+                    err = "room_no_response"
+                else:
+                    page.wait_for_timeout(2500)
                     if sort != "dealDate_down":
-                        marker_before = len(captures)
+                        marker = len(captures)
                         if not self._apply_sort_filter(sort):
-                            results.append({**sl, "deals": [], "total_rows": 0,
-                                            "error": "sort_click_failed"})
-                            continue
-                        if not self._wait_for_capture(captures,
-                                                      marker_before + 1,
-                                                      timeout_s=12):
-                            results.append({**sl, "deals": [], "total_rows": 0,
-                                            "error": "sort_no_response"})
-                            continue
-                        page.wait_for_timeout(3000)
+                            err = "sort_click_failed"
+                        elif not self._wait_for_capture(captures, marker + 1,
+                                                          timeout_s=12):
+                            err = "sort_no_response"
+                        else:
+                            page.wait_for_timeout(2500)
 
-                    last = captures[-1] if captures else {}
-                    results.append({
-                        **sl,
-                        "deals": last.get("items", []),
-                        "total_rows": last.get("total_rows", 0),
-                        "error": None,
-                    })
-                    logger.info("setl %s slice %d/%d (room=%s, sort=%s): "
-                                "+%d deals, total=%s",
-                                setl_code, idx + 1, len(slices),
-                                room or "all", sort,
-                                len(last.get("items", [])),
-                                last.get("total_rows"))
-                except Exception as e:
-                    logger.warning("setl %s slice (%s, %s) error: %s",
-                                   setl_code, room, sort, e)
+                if err:
+                    logger.warning("setl %s slice %d/%d (room=%s, sort=%s): %s",
+                                    setl_code, idx + 1, len(slices),
+                                    room or "all", sort, err)
                     results.append({**sl, "deals": [], "total_rows": 0,
-                                    "error": str(e)})
+                                    "error": err})
+                    self._dismiss_error_modal()
+                    continue
+
+                last = captures[-1] if captures else {}
+                results.append({
+                    **sl,
+                    "deals": last.get("items", []),
+                    "total_rows": last.get("total_rows", 0),
+                    "error": None,
+                })
+                logger.info("setl %s slice %d/%d (room=%s, sort=%s): "
+                            "+%d deals, total=%s (%.1fs)",
+                            setl_code, idx + 1, len(slices),
+                            room or "all", sort,
+                            len(last.get("items", [])),
+                            last.get("total_rows"),
+                            time.time() - t0)
             return results
+        finally:
+            try:
+                page.remove_listener("response", on_response)
+            except Exception:
+                pass
+
+    def _fetch_one_slice(self, setl_code: str,
+                          room_filter: Optional[str],
+                          sort_order: str) -> Tuple[list[dict], int]:
+        """Single-slice fetch: navigate fresh, click room (always) and sort
+        (if non-default), capture the resulting /deal-data response."""
+        captures: list[dict] = []
+
+        def on_response(resp):
+            if "/deal-data" not in resp.url or resp.status != 200:
+                return
+            try:
+                body = resp.body()
+            except Exception:
+                return
+            try:
+                decoded = json.loads(gzip.decompress(base64.b64decode(body)))
+                if decoded.get("statusCode") == 200:
+                    data = decoded.get("data") or {}
+                    captures.append({
+                        "items": data.get("items") or [],
+                        "total_rows": data.get("total_rows", 0),
+                    })
+            except Exception:
+                pass
+
+        page = self._page
+        page.on("response", on_response)
+        try:
+            url = (f"https://www.nadlan.gov.il/?view=settlement"
+                   f"&id={setl_code}&page=deals&_n={int(time.time()*1000)}")
+            page.goto(url, wait_until="domcontentloaded",
+                       timeout=self.nav_timeout_ms)
+            # SPA needs ~3s to boot Vue + render filter UI before clicks work.
+            page.wait_for_timeout(3500)
+            self._dismiss_error_modal()
+
+            marker = len(captures)
+            if not self._apply_room_filter(room_filter):
+                raise RuntimeError("room_click_failed")
+            if not self._wait_for_capture(captures, marker + 1, timeout_s=10):
+                raise RuntimeError("room_no_response")
+            page.wait_for_timeout(500)
+
+            if sort_order != "dealDate_down":
+                marker = len(captures)
+                if not self._apply_sort_filter(sort_order):
+                    raise RuntimeError("sort_click_failed")
+                if not self._wait_for_capture(captures, marker + 1,
+                                                timeout_s=10):
+                    raise RuntimeError("sort_no_response")
+                page.wait_for_timeout(500)
+
+            if not captures:
+                raise RuntimeError("no_capture")
+            last = captures[-1]
+            return last["items"], last["total_rows"]
         finally:
             try:
                 page.remove_listener("response", on_response)
@@ -451,10 +489,8 @@ class NadlanBrowser:
         return len(captures) >= target_count
 
     def _apply_room_filter(self, room_filter: Optional[str]) -> bool:
-        """Open the rooms dropdown via JS click, then click the desired
-        room option. Both via JS to bypass Playwright's visibility/overlay
-        checks."""
-        page = self._page
+        """Open rooms dropdown via Playwright click (force=True bypasses
+        intercepts), wait for the dropdown content, click the room option."""
         if room_filter is None:
             label = "כל החדרים"
         else:
@@ -462,88 +498,36 @@ class NadlanBrowser:
             if not label:
                 logger.warning("unknown room_filter=%s", room_filter)
                 return False
-
+        page = self._page
         try:
-            # Step 1: open dropdown via JS click (works even if hidden behind overlay)
-            opened = page.evaluate("""
-                () => {
-                    const btn = document.querySelector('button.roomsBtn');
-                    if (!btn) return false;
-                    btn.click();
-                    return true;
-                }
-            """)
-            if not opened:
-                logger.warning("rooms dropdown btn not found")
-                return False
-            page.wait_for_timeout(500)
-
-            # Step 2: click the desired room option via JS
-            ok = page.evaluate(
-                """(label) => {
-                    const buttons = document.querySelectorAll('button.whomBtn, button.roomsBtn');
-                    for (const b of buttons) {
-                        if ((b.innerText || '').trim() === label) {
-                            b.click();
-                            return true;
-                        }
-                    }
-                    return false;
-                }""",
-                label,
-            )
-            if not ok:
-                logger.warning("room button not found: %s", label)
-                return False
+            # Open rooms dropdown — wait for it to fully render before
+            # clicking the option. The Vue popover animation takes ~500ms.
+            page.locator("button.roomsBtn").first.click(timeout=5000)
+            page.wait_for_timeout(900)
+            opt = page.locator(f"button.whomBtn:has-text('{label}')").first
+            opt.click(timeout=5000)
             return True
         except Exception as e:
-            logger.warning("room click failed: %s", e)
+            logger.warning("room click [%s] failed: %s", label,
+                            str(e).splitlines()[0])
             return False
 
     def _apply_sort_filter(self, sort_order: str) -> bool:
-        """Open sort dropdown + click option, all via JS."""
+        """Open sort dropdown + click option (matches working probe pattern)."""
         label = self.SORT_OPTIONS.get(sort_order)
         if not label:
             logger.warning("unknown sort_order=%s", sort_order)
             return False
         page = self._page
         try:
-            opened = page.evaluate("""
-                () => {
-                    const buttons = document.querySelectorAll('button.filterBtn');
-                    for (const b of buttons) {
-                        if ((b.innerText || '').trim() === 'מיון') {
-                            b.click();
-                            return true;
-                        }
-                    }
-                    return false;
-                }
-            """)
-            if not opened:
-                logger.warning("sort dropdown btn not found")
-                return False
-            page.wait_for_timeout(500)
-
-            ok = page.evaluate(
-                """(label) => {
-                    const buttons = document.querySelectorAll('button.dropdownBtn');
-                    for (const b of buttons) {
-                        if ((b.innerText || '').trim() === label) {
-                            b.click();
-                            return true;
-                        }
-                    }
-                    return false;
-                }""",
-                label,
-            )
-            if not ok:
-                logger.warning("sort button not found: %s", label)
-                return False
+            page.locator("button.filterBtn:has-text('מיון')").first.click(timeout=5000)
+            page.wait_for_timeout(400)
+            opt = page.locator(f"button.dropdownBtn:has-text('{label}')").first
+            opt.click(timeout=5000)
             return True
         except Exception as e:
-            logger.warning("sort click failed: %s", e)
+            logger.warning("sort click [%s] failed: %s", label,
+                            str(e).splitlines()[0])
             return False
 
     def fetch_settlement(self, setl_code: str, retries: int = 2) -> list[dict]:
