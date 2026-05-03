@@ -691,8 +691,12 @@ def settlement_clear():
 # Settlement-slice endpoints — fine-grained scrape via filter slicing
 # ===================================================================
 
-# Ordered list of room values (None = all rooms / no filter)
-_SLICE_ROOMS = [None, "1", "2", "3", "4", "5", "6plus"]
+# Room values to slice on. We deliberately skip "None" (all rooms) because
+# the SPA's "כל החדרים" UI element is the dropdown TOGGLE, not a clickable
+# option — and the per-room slices below cover all classified deals anyway.
+# Unclassified deals (commercial/plots without roomNum) are missed here;
+# they're a small fraction and can be filled via per-parcel scrape later.
+_SLICE_ROOMS = ["1", "2", "3", "4", "5", "6plus"]
 # Both sort directions multiplied by all rooms = 14 slices/settlement.
 # Use only dealDate sorts initially — they give us "newest 500" + "oldest
 # 500" per room which together cover the head and tail. dealAmount sorts
@@ -819,3 +823,15 @@ def slice_clear():
     if err: return err
     n = pg.slice_clear()
     return jsonify({"cleared": n})
+
+
+@nadlan_api_bp.route("/slice-delete-room-null", methods=["POST"])
+def slice_delete_room_null():
+    """Admin one-shot: remove all room=NULL slices. They're un-scrapable
+    because 'כל החדרים' is the dropdown toggle, not a selectable option."""
+    if not _admin_or_worker():
+        return jsonify({"error": "admin or worker key required"}), 403
+    pg, err = _require_pg()
+    if err: return err
+    n = pg.slice_delete_room_null()
+    return jsonify({"deleted": n})

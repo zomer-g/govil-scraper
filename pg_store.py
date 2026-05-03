@@ -761,6 +761,18 @@ class PgStore:
             conn.commit()
             return n
 
+    def slice_delete_room_null(self) -> int:
+        """Remove all 'all rooms' slices — they can't be UI-clicked because
+        'כל החדרים' is the dropdown toggle, not a selectable option."""
+        with self._lock, self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM nadlan_settlement_slices "
+                "WHERE room_filter IS NULL"
+            )
+            n = cur.rowcount
+            conn.commit()
+            return n
+
 
 # Module-level singleton (lazy)
 _pg_store: Optional[PgStore] = None

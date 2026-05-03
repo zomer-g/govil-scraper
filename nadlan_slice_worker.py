@@ -63,8 +63,24 @@ _TRANSIENT_PATTERNS = (
     "Timeout 60000ms exceeded", "Timeout 30000ms exceeded",
     "net::ERR_", "Browser closed", "Target closed",
     "room_no_response", "sort_no_response",
-    "room_click_failed", "sort_click_failed",
 )
+# Permanent failures — never retry. The 'room=None' slices in the seeded
+# queue will hit this because "כל החדרים" is the dropdown toggle, not a
+# clickable option.
+_PERMANENT_PATTERNS = (
+    "room_click_failed",
+    "sort_click_failed",
+)
+
+
+def _classify_failure(err: str) -> tuple[bool, bool]:
+    """Returns (is_failure, is_transient)."""
+    s = str(err)
+    if any(p in s for p in _PERMANENT_PATTERNS):
+        return True, False
+    if any(p in s for p in _TRANSIENT_PATTERNS):
+        return True, True
+    return True, True  # Default to transient for unknown errors
 
 
 def _is_transient(e: BaseException) -> bool:
@@ -256,8 +272,8 @@ def run(server_url: str, worker_id: str,
                         continue
                     err = r.get("error")
                     if err:
-                        client.report_failure(sk, err, _is_transient(
-                            type("e", (), {"__str__": lambda s: err})()))
+                        _, transient = _classify_failure(err)
+                        client.report_failure(sk, err, transient)
                         continue
                     deals = r.get("deals") or []
                     flat = [_flatten_deal_for_db(d, setl_code, setl_name,
