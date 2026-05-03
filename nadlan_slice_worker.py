@@ -25,18 +25,83 @@ can reuse a single browser session for all of that settlement's slices
 (big efficiency win — one navigation, many UI clicks).
 """
 import argparse
+import atexit
 import csv
 import io
 import logging
 import os
 import socket
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 
 import requests
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Per-machine single-instance lock
+# ---------------------------------------------------------------------------
+# Multiple slice workers on the same IP just compete for the rate-limit budget
+# (no real parallelism). A lock file in the system temp dir prevents accidental
+# duplicate launches (e.g. user double-clicks the .bat while the loop wrapper
+# is already running).
+
+_LOCK_PATH = os.path.join(tempfile.gettempdir(),
+                           f"nadlan_slice_worker.{socket.gethostname()}.lock")
+
+
+def _pid_alive(pid: int) -> bool:
+    """Cross-platform PID liveness check using os.kill(pid, 0)."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # process exists, just not ours
+    except OSError:
+        return False
+    return True
+
+
+def _acquire_lock() -> bool:
+    """Returns True if we acquired the lock (no other worker is running on
+    this machine), False if another live worker holds it."""
+    try:
+        if os.path.exists(_LOCK_PATH):
+            try:
+                with open(_LOCK_PATH, "r", encoding="utf-8") as f:
+                    existing_pid = int(f.read().strip())
+            except (ValueError, OSError):
+                existing_pid = -1
+            if _pid_alive(existing_pid):
+                logger.error("another worker (PID %s) is already running on "
+                              "this machine — refusing to start. Lock file: %s",
+                              existing_pid, _LOCK_PATH)
+                return False
+            logger.info("stale lock file (PID %s not alive) — taking over",
+                         existing_pid)
+        with open(_LOCK_PATH, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+        atexit.register(_release_lock)
+        return True
+    except Exception as e:
+        logger.warning("lock acquire failed: %s — proceeding anyway", e)
+        return True
+
+
+def _release_lock():
+    try:
+        if os.path.exists(_LOCK_PATH):
+            with open(_LOCK_PATH, "r", encoding="utf-8") as f:
+                if int(f.read().strip()) == os.getpid():
+                    os.remove(_LOCK_PATH)
+    except Exception:
+        pass
 
 
 # Same field layout as the parcel-level deals (matches PgStore.append_deals).
@@ -341,12 +406,22 @@ def main():
                          help="Slices to claim per round (=1 settlement default)")
     parser.add_argument("--max-failed", type=int, default=5,
                          help="Stop after N consecutive failed settlements")
+    parser.add_argument("--allow-duplicate", action="store_true",
+                         help="Skip the per-machine lock check (DANGEROUS — "
+                              "multiple workers on same IP just compete for "
+                              "the rate-limit budget, NOT real parallelism)")
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
     logging.basicConfig(level=args.log_level.upper(),
                          format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
     sys.stdout.reconfigure(encoding="utf-8")
+
+    if not args.allow_duplicate:
+        if not _acquire_lock():
+            logger.error("EXITING — another worker is active on this machine. "
+                          "Pass --allow-duplicate to override.")
+            sys.exit(2)
 
     run(args.server, args.worker_id,
         idle_sleep_s=args.idle_sleep,
