@@ -339,24 +339,33 @@ def run(server_url: str, worker_id: str,
                     for r in results
                 )
                 if score_depleted and not any_success:
-                    # Escalating recovery: 60 min → 120 min → 240 min
-                    # Score depletion can persist longer than expected when
-                    # the profile is severely tainted.
+                    # Score depletion = profile state is poisoned.
+                    # Recoveries 1-2: try cookie-clear + sleep, then resume.
+                    # Recovery 3+: give up on this run; exit so loop wrapper
+                    # restarts (and gives Chrome a clean break).
                     nonlocal_recovery_count = getattr(
                         run, "_recovery_count", 0) + 1
                     setattr(run, "_recovery_count", nonlocal_recovery_count)
-                    sleep_minutes = min(60 * (2 ** (nonlocal_recovery_count - 1)),
-                                          240)
-                    logger.warning("setl %s: reCAPTCHA score depleted → "
-                                    "recovering (%d min sleep + warmup) "
-                                    "[recovery #%d in this run]",
-                                    setl_code, sleep_minutes,
-                                    nonlocal_recovery_count)
                     # Mark slices as transient so they retry post-recovery
                     for r in results:
                         sk = r.get("slice_key")
                         if sk and r.get("error"):
                             client.report_failure(sk, r.get("error"), True)
+
+                    # Bail BEFORE long sleep on 3rd recovery — the loop
+                    # wrapper restart is more effective than another sleep.
+                    if nonlocal_recovery_count >= 3:
+                        logger.error("setl %s: 3rd score depletion — exiting "
+                                      "for loop wrapper to relaunch (skipping "
+                                      "long sleep)", setl_code)
+                        return
+
+                    sleep_minutes = 60 if nonlocal_recovery_count == 1 else 120
+                    logger.warning("setl %s: reCAPTCHA score depleted → "
+                                    "recovering (%d min sleep + warmup) "
+                                    "[recovery #%d in this run]",
+                                    setl_code, sleep_minutes,
+                                    nonlocal_recovery_count)
                     try:
                         nb.recover_recaptcha_score(
                             sleep_s=sleep_minutes * 60, warmup_s=120)
@@ -366,13 +375,6 @@ def run(server_url: str, worker_id: str,
                     slice_n_deals = 0
                     n_done += 1
                     n_deals += slice_n_deals
-                    # If too many recoveries in one run, exit so loop wrapper
-                    # restarts with a fresh Chrome instance.
-                    if nonlocal_recovery_count >= 3:
-                        logger.error("3 recoveries in one run — Chrome "
-                                      "profile likely tainted, exiting for "
-                                      "loop wrapper to relaunch")
-                        return
                     logger.info("setl %s: recovery done — resuming next claim",
                                  setl_code)
                     time.sleep(per_settlement_pause_s)
