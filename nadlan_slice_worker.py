@@ -348,11 +348,11 @@ def run(server_url: str, worker_id: str,
                         except Exception as e:
                             logger.warning("tab refresh failed: %s", e)
                     # On 4 consecutive failures, force a long cooldown
-                    # (5 min) before next attempt.
+                    # (10 min) before next attempt — the IP is rate-limited.
                     elif consecutive_failed == 4:
                         logger.info("4 consecutive failed settlements — "
-                                     "cooling down 5 min")
-                        time.sleep(300)
+                                     "cooling down 10 min")
+                        time.sleep(600)
 
                 # Per-slice upload
                 slice_n_deals = 0

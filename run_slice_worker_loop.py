@@ -21,8 +21,8 @@ CHROME_EXE_CANDIDATES = [
     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
     r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
 ]
-COOLDOWN_SHORT_S = 60
-COOLDOWN_LONG_S = 300
+COOLDOWN_SHORT_S = 600   # Worker exited normally (likely circuit breaker after long run): 10 min IP cooldown
+COOLDOWN_LONG_S = 1200   # Worker exited fast (crash/blocked immediately): 20 min cooldown
 
 
 def chrome_alive() -> bool:
