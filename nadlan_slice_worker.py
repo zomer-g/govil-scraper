@@ -339,22 +339,40 @@ def run(server_url: str, worker_id: str,
                     for r in results
                 )
                 if score_depleted and not any_success:
+                    # Escalating recovery: 60 min → 120 min → 240 min
+                    # Score depletion can persist longer than expected when
+                    # the profile is severely tainted.
+                    nonlocal_recovery_count = getattr(
+                        run, "_recovery_count", 0) + 1
+                    setattr(run, "_recovery_count", nonlocal_recovery_count)
+                    sleep_minutes = min(60 * (2 ** (nonlocal_recovery_count - 1)),
+                                          240)
                     logger.warning("setl %s: reCAPTCHA score depleted → "
-                                    "recovering (30 min sleep + warmup)",
-                                    setl_code)
+                                    "recovering (%d min sleep + warmup) "
+                                    "[recovery #%d in this run]",
+                                    setl_code, sleep_minutes,
+                                    nonlocal_recovery_count)
                     # Mark slices as transient so they retry post-recovery
                     for r in results:
                         sk = r.get("slice_key")
                         if sk and r.get("error"):
                             client.report_failure(sk, r.get("error"), True)
                     try:
-                        nb.recover_recaptcha_score(sleep_s=1800, warmup_s=60)
+                        nb.recover_recaptcha_score(
+                            sleep_s=sleep_minutes * 60, warmup_s=120)
                     except Exception as e:
                         logger.error("recovery failed: %s", e)
                     consecutive_failed = 0
                     slice_n_deals = 0
                     n_done += 1
                     n_deals += slice_n_deals
+                    # If too many recoveries in one run, exit so loop wrapper
+                    # restarts with a fresh Chrome instance.
+                    if nonlocal_recovery_count >= 3:
+                        logger.error("3 recoveries in one run — Chrome "
+                                      "profile likely tainted, exiting for "
+                                      "loop wrapper to relaunch")
+                        return
                     logger.info("setl %s: recovery done — resuming next claim",
                                  setl_code)
                     time.sleep(per_settlement_pause_s)
