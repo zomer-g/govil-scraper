@@ -323,9 +323,12 @@ def run(server_url: str, worker_id: str,
                     for t in slice_tasks:
                         client.report_failure(t["slice_key"], str(e), transient)
                     consecutive_failed += 1
+                    # Browser-level crash (e.g. tab closed) — exit so the
+                    # loop wrapper relaunches with a fresh Chrome instance.
                     if consecutive_failed >= max_consecutive_failed_settlements:
-                        logger.error("too many consecutive failed settlements "
-                                      "(%d) — IP likely blocked, stopping",
+                        logger.error("%d consecutive total fetch failures — "
+                                      "Chrome likely crashed, exiting for "
+                                      "loop wrapper to relaunch",
                                       consecutive_failed)
                         return
                     continue
@@ -438,11 +441,10 @@ def run(server_url: str, worker_id: str,
                              setl_code, setl_name, len(results),
                              slice_n_deals, elapsed, n_done, n_deals)
 
-                if consecutive_failed >= max_consecutive_failed_settlements:
-                    logger.error("too many consecutive failed settlements "
-                                  "(%d) — IP likely blocked, stopping",
-                                  consecutive_failed)
-                    return
+                # Removed the legacy "5 consecutive fails = IP blocked"
+                # circuit breaker. Score-depletion detection above handles
+                # the real failure mode (recaptcha, not IP). 0-deal small
+                # settlements are valid empty results, not failures.
 
                 time.sleep(per_settlement_pause_s)
 
