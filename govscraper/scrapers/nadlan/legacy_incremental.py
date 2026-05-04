@@ -320,14 +320,40 @@ class NadlanBrowser:
         signal renewed human engagement.
 
         Strategy:
-          1. Close the tainted tab to drop bot-context state
-          2. Sleep `sleep_s` (default 30 min) — score rolling-window decay
-          3. Open fresh tab on home page
-          4. Run aggressive warmup (mouse + scroll for `warmup_s` sec)
-          5. Reset the failure counter
+          1. Clear nadlan + recaptcha cookies (drop poisoned session)
+          2. Clear localStorage/sessionStorage
+          3. Close the tainted tab
+          4. Sleep `sleep_s` (rolling-window decay)
+          5. Open fresh tab on home page (triggers fresh /token-verify)
+          6. Run aggressive warmup (mouse + scroll for `warmup_s` sec)
+          7. Reset failure counter
         """
         logger.warning("=== reCAPTCHA recovery: sleeping %ds + warmup %ds ===",
                         sleep_s, warmup_s)
+        # Clear poisoned cookies + storage BEFORE sleep — gives the recaptcha
+        # rolling window a chance to forget the bad signal.
+        try:
+            if self._page:
+                self._page.evaluate("""() => {
+                    try { localStorage.clear(); } catch (e) {}
+                    try { sessionStorage.clear(); } catch (e) {}
+                }""")
+        except Exception:
+            pass
+        try:
+            if self._ctx:
+                # Drop cookies for nadlan + google recaptcha so we look like
+                # a fresh visitor on next navigation.
+                self._ctx.clear_cookies(domain="nadlan.gov.il")
+                self._ctx.clear_cookies(domain=".nadlan.gov.il")
+                self._ctx.clear_cookies(domain="www.nadlan.gov.il")
+                self._ctx.clear_cookies(domain="api.nadlan.gov.il")
+                self._ctx.clear_cookies(domain="data.nadlan.gov.il")
+                self._ctx.clear_cookies(domain="www.google.com")
+                self._ctx.clear_cookies(domain=".google.com")
+                logger.info("cleared cookies for nadlan + google domains")
+        except Exception as e:
+            logger.warning("cookie clear partial failure: %s", e)
         try:
             if self._page:
                 self._page.close()
