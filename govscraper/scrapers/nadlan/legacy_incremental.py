@@ -162,6 +162,46 @@ def _warmup_human_signal(page) -> None:
         logger.debug("warmup gesture failed: %s", e)
 
 
+def _human_jitter_pause(page, min_ms: int = 1500, max_ms: int = 4000) -> None:
+    """Random pause + a tiny mouse movement between clicks. The clicks
+    burn recaptcha score if they happen on a perfect schedule with no
+    movement — this simulates "still reading the page". Cheap (~2-3s)."""
+    import random as _rnd
+    try:
+        x = _rnd.randint(200, 1100)
+        y = _rnd.randint(200, 700)
+        page.mouse.move(x, y, steps=_rnd.randint(3, 8))
+        page.wait_for_timeout(_rnd.randint(min_ms, max_ms))
+    except Exception:
+        pass
+
+
+def _aggressive_warmup(page, duration_s: int = 30) -> None:
+    """Long-form warmup: many mouse movements, scrolls, and pauses over
+    `duration_s` seconds. Used to recover from reCAPTCHA score depletion
+    after token-verify started returning 400. Real users spend ~30s on a
+    page reading deals before clicking filters; we simulate that."""
+    import random as _rnd
+    end = time.time() + duration_s
+    try:
+        while time.time() < end:
+            # Mouse: 3-5 movements
+            for _ in range(_rnd.randint(3, 5)):
+                x = _rnd.randint(150, 1100)
+                y = _rnd.randint(150, 700)
+                page.mouse.move(x, y, steps=_rnd.randint(8, 25))
+                page.wait_for_timeout(_rnd.randint(200, 600))
+            # Scroll
+            page.mouse.wheel(0, _rnd.randint(100, 500))
+            page.wait_for_timeout(_rnd.randint(800, 2000))
+            # Occasional reverse scroll (reading back)
+            if _rnd.random() < 0.3:
+                page.mouse.wheel(0, -_rnd.randint(80, 200))
+                page.wait_for_timeout(_rnd.randint(500, 1200))
+    except Exception as e:
+        logger.debug("aggressive warmup error: %s", e)
+
+
 # ---------------------------------------------------------------------------
 # Playwright session — single Chromium reused across settlements.
 # ---------------------------------------------------------------------------
@@ -189,6 +229,11 @@ class NadlanBrowser:
         self._browser = None
         self._ctx = None
         self._page = None
+        # reCAPTCHA score tracker: incremented by every /token-verify 400.
+        # When >0, signals score depletion → caller should call
+        # recover_recaptcha_score() before more clicks.
+        self._token_verify_failures = 0
+        self._token_verify_listener_attached = False
 
     def __enter__(self):
         from playwright.sync_api import sync_playwright
@@ -235,6 +280,7 @@ class NadlanBrowser:
             )
             self._page = self._ctx.new_page()
         self._cdp_attached = cdp_attached
+        self._attach_token_verify_listener()
         # Warm up the SPA so recaptcha boots once + a human signal so it
         # scores us above the bot threshold.
         self._page.goto("https://www.nadlan.gov.il/",
@@ -242,6 +288,70 @@ class NadlanBrowser:
                         timeout=self.nav_timeout_ms)
         _warmup_human_signal(self._page)
         return self
+
+    def _attach_token_verify_listener(self):
+        """Listen for /token-verify responses globally on the page.
+        A 400/error means our reCAPTCHA Enterprise score is too low and
+        ALL subsequent /deal-data calls will fail (inner=405). Caller
+        should call recover_recaptcha_score() to rest + re-warm."""
+        if self._token_verify_listener_attached or not self._page:
+            return
+
+        def _on_resp(resp):
+            if "token-verify" not in resp.url:
+                return
+            if resp.status >= 400:
+                self._token_verify_failures += 1
+                if self._token_verify_failures % 5 == 1:
+                    logger.warning("token-verify HTTP %d (count=%d) — "
+                                    "reCAPTCHA score depleted",
+                                    resp.status, self._token_verify_failures)
+
+        try:
+            self._page.on("response", _on_resp)
+            self._token_verify_listener_attached = True
+        except Exception as e:
+            logger.debug("could not attach token-verify listener: %s", e)
+
+    def recover_recaptcha_score(self, sleep_s: int = 1800,
+                                  warmup_s: int = 60) -> None:
+        """When /token-verify keeps failing, the ONLY fix is to let the
+        score recover naturally (Google's anti-bot rolling window) AND
+        signal renewed human engagement.
+
+        Strategy:
+          1. Close the tainted tab to drop bot-context state
+          2. Sleep `sleep_s` (default 30 min) — score rolling-window decay
+          3. Open fresh tab on home page
+          4. Run aggressive warmup (mouse + scroll for `warmup_s` sec)
+          5. Reset the failure counter
+        """
+        logger.warning("=== reCAPTCHA recovery: sleeping %ds + warmup %ds ===",
+                        sleep_s, warmup_s)
+        try:
+            if self._page:
+                self._page.close()
+        except Exception:
+            pass
+        time.sleep(sleep_s)
+        # Open fresh tab
+        try:
+            if self._cdp_attached and self._ctx:
+                self._page = self._ctx.new_page()
+            elif self._ctx:
+                self._page = self._ctx.new_page()
+            self._token_verify_listener_attached = False
+            self._attach_token_verify_listener()
+            self._page.goto("https://www.nadlan.gov.il/",
+                             wait_until="domcontentloaded",
+                             timeout=self.nav_timeout_ms)
+        except Exception as e:
+            logger.error("post-cooldown new tab failed: %s", e)
+            return
+        # Aggressive warmup
+        _aggressive_warmup(self._page, duration_s=warmup_s)
+        self._token_verify_failures = 0
+        logger.info("reCAPTCHA recovery complete")
 
     def __exit__(self, *_):
         try:
@@ -325,6 +435,8 @@ class NadlanBrowser:
 
         page = self._page
         page.on("response", on_response)
+        # Reset score tracker at settlement start. We'll detect new failures.
+        score_failures_at_start = self._token_verify_failures
         results = []
         try:
             url = (f"https://www.nadlan.gov.il/?view=settlement"
@@ -334,6 +446,9 @@ class NadlanBrowser:
                        timeout=self.nav_timeout_ms)
             page.wait_for_timeout(3500)  # SPA boot
             self._dismiss_error_modal()
+            # Brief mouse jiggle so the page sees an "engaged" user before
+            # we start machine-clicking filters.
+            _human_jitter_pause(page, 800, 1500)
 
             consecutive_no_response = 0
             for idx, sl in enumerate(slices):
@@ -342,6 +457,19 @@ class NadlanBrowser:
                 t0 = time.time()
                 err = None
                 marker = len(captures)
+
+                # CRITICAL: bail immediately if reCAPTCHA score is depleted.
+                # Each click here would just trigger more /token-verify 400s
+                # which further drops the score (death spiral).
+                if self._token_verify_failures >= 2:
+                    err = "score_depleted"
+                    results.append({**sl, "deals": [], "total_rows": 0,
+                                    "error": err})
+                    # Skip remaining slices — they'll all fail too.
+                    for sl2 in slices[idx + 1:]:
+                        results.append({**sl2, "deals": [], "total_rows": 0,
+                                         "error": err})
+                    return results
 
                 # Bail early if SPA is unresponsive: 3 consecutive no_response
                 # = the SPA's data is cached and not re-firing /deal-data.
@@ -366,7 +494,7 @@ class NadlanBrowser:
                                                           timeout_s=12):
                             err = "sort_no_response"
                         else:
-                            page.wait_for_timeout(2500)
+                            _human_jitter_pause(page, 1800, 3500)
 
                 if err:
                     if err in ("room_no_response", "sort_no_response"):

@@ -135,7 +135,14 @@ _TRANSIENT_PATTERNS = (
 _PERMANENT_PATTERNS = (
     "room_click_failed",
     "sort_click_failed",
-    "skip_spa_unresponsive",  # SPA returned no /deal-data on 3 clicks
+    # NOTE: "skip_spa_unresponsive" used to be permanent here, but it can
+    # also signal score_depleted state — leave it transient so it gets
+    # re-claimed after recovery.
+)
+# Score-depletion errors → trigger immediate recovery sleep
+_SCORE_DEPLETED_PATTERNS = (
+    "score_depleted",
+    "skip_spa_unresponsive",
 )
 
 
@@ -325,6 +332,33 @@ def run(server_url: str, worker_id: str,
 
                 # Group: did this settlement produce ANY deals?
                 any_success = any(r.get("error") is None for r in results)
+                # Detect score depletion: trigger automatic recovery sleep
+                # so we don't waste cycles hammering with bad recaptcha.
+                score_depleted = any(
+                    r.get("error") in _SCORE_DEPLETED_PATTERNS
+                    for r in results
+                )
+                if score_depleted and not any_success:
+                    logger.warning("setl %s: reCAPTCHA score depleted → "
+                                    "recovering (30 min sleep + warmup)",
+                                    setl_code)
+                    # Mark slices as transient so they retry post-recovery
+                    for r in results:
+                        sk = r.get("slice_key")
+                        if sk and r.get("error"):
+                            client.report_failure(sk, r.get("error"), True)
+                    try:
+                        nb.recover_recaptcha_score(sleep_s=1800, warmup_s=60)
+                    except Exception as e:
+                        logger.error("recovery failed: %s", e)
+                    consecutive_failed = 0
+                    slice_n_deals = 0
+                    n_done += 1
+                    n_deals += slice_n_deals
+                    logger.info("setl %s: recovery done — resuming next claim",
+                                 setl_code)
+                    time.sleep(per_settlement_pause_s)
+                    continue
                 if any_success:
                     consecutive_failed = 0
                 else:
