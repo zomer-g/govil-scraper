@@ -1264,11 +1264,15 @@ class GovILScraper:
             if key == "$$hashKey":
                 continue
 
-            # Skip file arrays — handled by _extract_attachments
+            # Skip file arrays — handled by _extract_attachments. The
+            # canonical attachment info (basename, URL) is injected into
+            # the CSV later as `attachment_filename` / `attachment_url`
+            # via _inject_attachment_columns. Don't emit a placeholder
+            # like "[1 קבצים]" here: it pretends to be data the consumer
+            # can act on, but it's a fixed string with no link to the
+            # actual file in the ZIP.
             if key.lower() in ("file", "files", "attachments", "fileattachments",
                                 "filedata", "document"):
-                if isinstance(value, list):
-                    flat[full_key] = f"[{len(value)} קבצים]"
                 continue
 
             # Handle tags.metaData (Traditional Collector) — flatten to readable values

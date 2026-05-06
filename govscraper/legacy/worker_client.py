@@ -186,14 +186,8 @@ class WorkerClient:
             os.makedirs(collector_dir, exist_ok=True)
             handler = FileHandler(session, output_dir=collector_dir)
 
-            # Export CSV + Excel
-            self.report_progress(task_id, "exporting", 0, 2, "מייצא CSV...")
-            csv_path = handler.export_csv(result)
-            self.report_progress(task_id, "exporting", 1, 2, "מייצא Excel...")
-            excel_path = handler.export_excel(result)
-            self.report_progress(task_id, "exporting", 2, 2, "הייצוא הושלם!")
-
-            # Download attachments
+            # Download attachments first so the CSV can carry the
+            # post-dedup `attachment_filename` for each row.
             if download_files and result.file_attachments:
                 def dl_progress(**kwargs):
                     now = time.time()
@@ -201,11 +195,23 @@ class WorkerClient:
                         self.report_progress(task_id, "downloading_files", **kwargs)
                         last_report[0] = now
 
-                handler.download_attachments(
+                paths = handler.download_attachments(
                     result.file_attachments,
                     progress_callback=dl_progress,
                     skip_existing=True,
                 )
+                from govscraper.io.attachments import inject_attachment_columns
+                inject_attachment_columns(
+                    result.items, result.file_attachments,
+                    paths, result.column_headers,
+                )
+
+            # Export CSV + Excel — CSV now carries attachment columns.
+            self.report_progress(task_id, "exporting", 0, 2, "מייצא CSV...")
+            csv_path = handler.export_csv(result)
+            self.report_progress(task_id, "exporting", 1, 2, "מייצא Excel...")
+            excel_path = handler.export_excel(result)
+            self.report_progress(task_id, "exporting", 2, 2, "הייצוא הושלם!")
 
             # Create ZIP for upload
             self.report_progress(task_id, "registering_files", 0, 1, "מכין להעלאה...")

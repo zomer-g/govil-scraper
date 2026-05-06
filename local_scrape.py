@@ -212,14 +212,9 @@ Examples:
 
         handler = FileHandler(session, output_dir=collector_dir)
 
-        # Export CSV + Excel
-        csv_path = handler.export_csv(result)
-        logger.info("CSV: %s", csv_path)
-
-        excel_path = handler.export_excel(result)
-        logger.info("Excel: %s", excel_path)
-
-        # Download attachments
+        # Download attachments first so the CSV can carry the
+        # post-dedup `attachment_filename` for each row (consumers join
+        # rows to PDFs by basename — no positional fallback needed).
         if not args.no_files and result.file_attachments:
             skip_existing = not args.no_skip
             logger.info("Downloading %d attachments (skip_existing=%s)...",
@@ -230,12 +225,26 @@ Examples:
                 progress_callback=progress_cb,
                 skip_existing=skip_existing,
             )
-            logger.info("Downloaded %d files to %s/attachments/",
-                         len(paths), collector_dir)
+            from govscraper.io.attachments import inject_attachment_columns
+            inject_attachment_columns(
+                result.items, result.file_attachments,
+                paths, result.column_headers,
+            )
+            successful = sum(1 for p in paths if p is not None)
+            logger.info("Downloaded %d / %d files to %s/attachments/",
+                         successful, len(paths), collector_dir)
         elif args.no_files:
             logger.info("Skipping file downloads (--no-files)")
         else:
             logger.info("No attachments found")
+
+        # Export CSV + Excel — written AFTER attachment_filename column
+        # has been injected (when there were attachments to download).
+        csv_path = handler.export_csv(result)
+        logger.info("CSV: %s", csv_path)
+
+        excel_path = handler.export_excel(result)
+        logger.info("Excel: %s", excel_path)
 
         # Summary
         logger.info("=" * 50)

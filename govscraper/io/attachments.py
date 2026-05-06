@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Callable, Iterable, Protocol
+from collections import defaultdict
+from typing import Any, Callable, Iterable, List, Optional, Protocol, Sequence
 
 from .sanitize import sanitize_filename
 
@@ -50,9 +51,15 @@ def download_all(
     *,
     progress_callback: Callable | None = None,
     skip_existing: bool = False,
-) -> list[str]:
+) -> list[Optional[str]]:
     """Download every attachment into `<output_dir>/attachments/`. Returns
-    list of local absolute paths in the same order as `attachments`.
+    list of local absolute paths in the same order as `attachments`, with
+    `None` in the position of any attachment whose download failed.
+
+    Preserving 1:1 alignment with the input is what lets callers join the
+    on-disk filename back to its source row (via `FileAttachment.item_index`)
+    — needed so the CSV can carry an `attachment_filename` column whose value
+    is the actual post-dedup basename inside the ZIP.
 
     `skip_existing=True` reuses on-disk files that already have non-zero
     size — useful when re-running a long scrape locally without redoing
@@ -66,11 +73,13 @@ def download_all(
     att_dir = os.path.join(output_dir, "attachments")
     os.makedirs(att_dir, exist_ok=True)
 
-    paths: list[str] = []
+    paths: list[Optional[str]] = []
     used_names: set[str] = set()
     skipped = 0
+    failed = 0
 
     for idx, att in enumerate(attachments):
+        result_path: Optional[str] = None
         try:
             url = getattr(att, "url", "") or ""
             filename = _resolve_filename(att, fallback_url=url)
@@ -81,7 +90,7 @@ def download_all(
                 and os.path.exists(dest_path)
                 and os.path.getsize(dest_path) > 0
             ):
-                paths.append(dest_path)
+                result_path = dest_path
                 used_names.add(filename.lower())
                 skipped += 1
             else:
@@ -92,10 +101,13 @@ def download_all(
                 final_path = os.path.join(att_dir, final_name)
                 with open(final_path, "wb") as f:
                     f.write(resp.content)
-                paths.append(final_path)
+                result_path = final_path
                 logger.debug("Downloaded: %s (%d bytes)", final_path, len(resp.content))
         except Exception as e:
             logger.warning("Failed to download %s: %s", getattr(att, "url", "?"), e)
+            failed += 1
+
+        paths.append(result_path)
 
         if progress_callback:
             progress_callback(
@@ -106,8 +118,47 @@ def download_all(
 
     if skipped:
         logger.info("Skipped %d existing files", skipped)
+    successful = len(attachments) - failed
     logger.info(
-        "Downloaded %d / %d attachments (%d skipped)",
-        len(paths) - skipped, len(attachments), skipped,
+        "Downloaded %d / %d attachments (%d skipped, %d failed)",
+        successful - skipped, len(attachments), skipped, failed,
     )
     return paths
+
+
+def inject_attachment_columns(
+    items: List[dict],
+    file_attachments: Sequence[Any],
+    paths: Sequence[Optional[str]],
+    column_headers: List[str],
+) -> None:
+    """Write the post-dedup PDF basename + source URL back into each CSV row.
+
+    `file_attachments[i]` carries `item_index` (the row it belongs to) and
+    `paths[i]` is the local file path the downloader wrote (or None on
+    failure). The basename of that path is exactly what ends up inside
+    the ZIP, so it is the deterministic key for joining a CSV row to its
+    PDF — no positional fallback needed on the consumer side.
+
+    Multiple attachments per row are joined with "; ". Rows with no
+    attachment get an empty string. The two new columns are appended to
+    `column_headers` if not already present, preserving original order.
+
+    Mutates `items` and `column_headers` in place.
+    """
+    row_atts: dict[int, list[tuple[str, str]]] = defaultdict(list)
+    for att, path in zip(file_attachments, paths):
+        if path is None:
+            continue
+        row_atts[getattr(att, "item_index", 0)].append(
+            (os.path.basename(path), getattr(att, "url", "") or "")
+        )
+
+    for idx, item in enumerate(items):
+        atts = row_atts.get(idx, [])
+        item["attachment_filename"] = "; ".join(b for b, _ in atts)
+        item["attachment_url"] = "; ".join(u for _, u in atts)
+
+    for col in ("attachment_filename", "attachment_url"):
+        if col not in column_headers:
+            column_headers.append(col)

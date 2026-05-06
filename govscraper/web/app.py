@@ -206,7 +206,24 @@ def _run_scrape_job(job_id: str, url: str, download_files: bool):
         os.makedirs(job_dir, exist_ok=True)
         handler = FileHandler(session, output_dir=job_dir)
 
-        # Export CSV + Excel (+ GeoJSON for GovMap)
+        # Download attachments first so the CSV can carry the
+        # post-dedup `attachment_filename` for each row.
+        attachment_paths: list = []
+        if download_files and result.file_attachments:
+            def dl_progress(**kwargs):
+                _update_progress(job_id, Phase.DOWNLOADING_FILES, **kwargs)
+
+            attachment_paths = handler.download_attachments(
+                result.file_attachments, progress_callback=dl_progress
+            )
+            from govscraper.io.attachments import inject_attachment_columns
+            inject_attachment_columns(
+                result.items, result.file_attachments,
+                attachment_paths, result.column_headers,
+            )
+
+        # Export CSV + Excel (+ GeoJSON for GovMap) — CSV now reflects
+        # the injected attachment columns when applicable.
         _update_progress(job_id, Phase.EXPORTING, 0, 3, "מייצא CSV...")
         csv_path = handler.export_csv(result)
         _update_progress(job_id, Phase.EXPORTING, 1, 3, "מייצא Excel...")
@@ -222,16 +239,6 @@ def _run_scrape_job(job_id: str, url: str, download_files: bool):
                 "csv": csv_path, "excel": excel_path, "geojson": geojson_path,
             })
         _update_progress(job_id, Phase.EXPORTING, 3, 3, "הייצוא הושלם!")
-
-        # Download attachments
-        attachment_paths = []
-        if download_files and result.file_attachments:
-            def dl_progress(**kwargs):
-                _update_progress(job_id, Phase.DOWNLOADING_FILES, **kwargs)
-
-            attachment_paths = handler.download_attachments(
-                result.file_attachments, progress_callback=dl_progress
-            )
 
         # Register individual files in the database (no ZIP creation)
         _update_progress(job_id, Phase.REGISTERING_FILES, 0, 1, "רושם קבצים...")
@@ -253,7 +260,9 @@ def _run_scrape_job(job_id: str, url: str, download_files: bool):
                     "rows": result.items[:50],
                     "total": result.total_count,
                     "attachments_count": len(result.file_attachments),
-                    "downloaded_count": len(attachment_paths),
+                    "downloaded_count": sum(
+                        1 for p in attachment_paths if p is not None
+                    ),
                     "collector_name": result.collector_name,
                     "warning": result.warning,
                 }

@@ -996,10 +996,15 @@ class OverWorkerClient:
                     tmp_dir = tempfile.mkdtemp(prefix="govil_worker_")
                     handler = FileHandler(session, output_dir=tmp_dir)
 
-                    # Export CSV for the ZIP
-                    csv_path = handler.export_csv(result)
-
-                    # Download attachments
+                    # Download attachments FIRST. Two reasons:
+                    #  1. The on-disk basename after `_dedup` is the
+                    #     authoritative ZIP-internal name; `att.filename`
+                    #     before download isn't.
+                    #  2. We need that authoritative name to land in the
+                    #     CSV (column `attachment_filename`) so consumers
+                    #     can join CSV rows to PDFs deterministically by
+                    #     basename, instead of falling back to positional
+                    #     ordering which silently drifts.
                     def dl_progress(**kw):
                         last_state.update({
                             "phase": "downloading",
@@ -1017,15 +1022,27 @@ class OverWorkerClient:
                         progress_callback=dl_progress,
                     )
 
-                    if att_paths:
+                    from govscraper.io.attachments import inject_attachment_columns
+                    inject_attachment_columns(
+                        result.items, result.file_attachments,
+                        att_paths, result.column_headers,
+                    )
+
+                    # Export CSV for the ZIP — now includes the new
+                    # `attachment_filename` / `attachment_url` columns.
+                    csv_path = handler.export_csv(result)
+
+                    successful_paths = [p for p in att_paths if p is not None]
+                    if successful_paths:
                         # Pack into ≤80MB ZIPs (first contains the CSV too)
                         zip_paths = split_attachments_into_zips(
-                            att_paths, csv_path, tmp_dir,
+                            successful_paths, csv_path, tmp_dir,
                             base_name=result.collector_name or "attachments",
                         )
                         total_parts = len(zip_paths)
-                        logger.info("Created %d ZIP part(s) for %d attachments",
-                                    total_parts, len(att_paths))
+                        logger.info("Created %d ZIP part(s) for %d attachments (%d failed)",
+                                    total_parts, len(successful_paths),
+                                    len(att_paths) - len(successful_paths))
 
                         # Upload each part via multipart
                         for i, zp in enumerate(zip_paths, 1):

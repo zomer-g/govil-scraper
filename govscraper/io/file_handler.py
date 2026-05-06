@@ -20,6 +20,9 @@ import os
 import tempfile
 from typing import Callable, List, Optional
 
+# Re-exported for callers that want to type-check `download_attachments`
+# results — entries are `None` for attachments whose download failed.
+
 from govscraper.scrapers.govil.legacy_engine import GovILSession, ScrapeResult, FileAttachment
 
 from . import attachments as _attachments
@@ -61,7 +64,7 @@ class FileHandler:
         attachments: List[FileAttachment],
         progress_callback: Optional[Callable] = None,
         skip_existing: bool = False,
-    ) -> List[str]:
+    ) -> List[Optional[str]]:
         return _attachments.download_all(
             self.session,
             self.output_dir,
