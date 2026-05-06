@@ -963,23 +963,12 @@ class OverWorkerClient:
             logger.info("Scraped %d records, %d attachments",
                         result.total_count, len(result.file_attachments))
 
-            # Convert ScrapeResult → push-version format
-            records = result.items  # already flat dicts
-            fields = [
-                {"id": col, "type": "text"}
-                for col in (result.column_headers or [])
-            ]
-            # If no column_headers, derive from first record
-            if not fields and records:
-                fields = [{"id": k, "type": "text"} for k in records[0].keys()]
-
-            attachments = [
-                {
-                    "name": f.filename,
-                    "url": f.url,
-                }
-                for f in result.file_attachments
-            ]
+            # NOTE: `records`, `fields`, and `attachments` are built AFTER
+            # the download+inject block below — otherwise `fields` would
+            # be frozen against pre-injection column_headers and the new
+            # `attachment_filename` / `attachment_url` columns would be
+            # dropped by CKAN datastore on upload (the table schema
+            # follows `fields`, not the record dicts' keys).
 
             # Download files, create ZIPs (split into ≤80MB parts to fit under
             # Cloudflare's 100MB edge limit), and upload each part via multipart.
@@ -1071,6 +1060,24 @@ class OverWorkerClient:
                     if tmp_dir:
                         import shutil
                         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+            # Build push-version payload AFTER inject_attachment_columns has
+            # had a chance to extend column_headers. `fields` defines the
+            # CKAN datastore table schema; if we built it earlier, the new
+            # `attachment_filename` / `attachment_url` columns would be
+            # absent from the schema and the values would be silently
+            # dropped on upsert.
+            records = result.items  # already flat dicts (mutated in place by inject)
+            fields = [
+                {"id": col, "type": "text"}
+                for col in (result.column_headers or [])
+            ]
+            if not fields and records:
+                fields = [{"id": k, "type": "text"} for k in records[0].keys()]
+            attachments = [
+                {"name": f.filename, "url": f.url}
+                for f in result.file_attachments
+            ]
 
             # If the records JSON would exceed Cloudflare's 100MB body limit,
             # upload the CSV separately via multipart and skip inline records.
