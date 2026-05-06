@@ -974,6 +974,10 @@ class OverWorkerClient:
             # Cloudflare's 100MB edge limit), and upload each part via multipart.
             zip_resource_ids: list[str] = []
             tmp_dir = None
+            # `att_paths` is exposed here so the post-dedup basenames are
+            # available when we build `attachments[]` below — keeping that
+            # field in sync with `attachment_filename` per the API contract.
+            att_paths: list = []
             if result.file_attachments:
                 import tempfile
                 from govscraper.io.file_handler import FileHandler
@@ -1074,10 +1078,17 @@ class OverWorkerClient:
             ]
             if not fields and records:
                 fields = [{"id": k, "type": "text"} for k in records[0].keys()]
-            attachments = [
-                {"name": f.filename, "url": f.url}
-                for f in result.file_attachments
-            ]
+            # `name` must equal the post-dedup basename inside the ZIP
+            # (== the value of `attachment_filename` in the CSV row), per
+            # WORKER_API.md "Linking CSV rows to PDF attachments". For
+            # failed downloads (path is None) we fall back to f.filename
+            # for traceability — those entries have empty
+            # attachment_filename in the CSV anyway.
+            attachments = []
+            for idx, f in enumerate(result.file_attachments):
+                p = att_paths[idx] if idx < len(att_paths) else None
+                name = os.path.basename(p) if p else f.filename
+                attachments.append({"name": name, "url": f.url})
 
             # If the records JSON would exceed Cloudflare's 100MB body limit,
             # upload the CSV separately via multipart and skip inline records.
