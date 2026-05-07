@@ -44,6 +44,38 @@ SERVER = "https://www.over.org.il"
 STATUS_FILE = os.environ.get("OVER_WORKER_STATUS_FILE", "worker_status.txt")
 
 
+def _detect_worker_version() -> str:
+    """Best-effort: report the git SHA of the worker checkout to the server.
+
+    Server uses this to refuse dispatch when the worker is on a stale
+    commit (older than the upstream repo's tracked branch). On a non-git
+    deploy (pip install, copied tarball, container without .git), fall
+    back to the WORKER_VERSION env var or 'unknown'. The server fails
+    open when it can't determine 'expected', and treats 'unknown' from
+    the worker as missing (also fails open) — so reporting 'unknown' is
+    safe; it just disables the gate for this worker.
+    """
+    env = os.environ.get("WORKER_VERSION", "").strip()
+    if env:
+        return env
+    try:
+        import subprocess
+        here = os.path.dirname(os.path.abspath(__file__))
+        out = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=here, stderr=subprocess.DEVNULL, text=True, timeout=3,
+        )
+        sha = out.strip()
+        if len(sha) == 40 and all(c in "0123456789abcdef" for c in sha):
+            return sha
+    except Exception:
+        pass
+    return "unknown"
+
+
+WORKER_VERSION = _detect_worker_version()
+
+
 def _archive_root() -> str:
     """Resolve where to write `over_archives/<dataset_id>/...`.
 
@@ -140,6 +172,10 @@ class OverWorkerClient:
         self._session.headers.update({
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
+            # Server uses this to gate task dispatch when the worker is
+            # on a stale commit. See _detect_worker_version() for the
+            # fallback path on non-git deploys.
+            "X-Worker-Version": WORKER_VERSION,
         })
 
     def _url(self, path: str) -> str:
@@ -150,13 +186,33 @@ class OverWorkerClient:
     # ------------------------------------------------------------------
 
     def poll(self) -> dict | None:
-        """Poll for the next pending scrape task. Returns task dict or None."""
+        """Poll for the next pending scrape task. Returns task dict or None.
+
+        The server may also return a 200 OK with `{"outdated": true, ...}`
+        when this worker's git SHA doesn't match the upstream repo. We log
+        loudly and return None so the worker idles instead of looping fast
+        and spamming the server — the operator needs to git pull + restart.
+        """
         try:
             resp = self._session.get(self._url("/api/worker/poll"), timeout=15)
             if resp.status_code == 204:
                 return None
             if resp.status_code == 200:
-                return resp.json()
+                payload = resp.json()
+                if isinstance(payload, dict) and payload.get("outdated"):
+                    expected = (payload.get("expected_version") or "?")[:12]
+                    got = (payload.get("worker_version") or WORKER_VERSION)[:12]
+                    logger.error(
+                        "Server refused task: worker outdated (running %s, expected %s). "
+                        "git pull && restart this worker.",
+                        got, expected,
+                    )
+                    _write_status(
+                        f"OUTDATED: running {got}, expected {expected} — "
+                        f"git pull && restart"
+                    )
+                    return None
+                return payload
             logger.warning("Poll returned %d: %s", resp.status_code, resp.text[:200])
         except Exception as e:
             logger.warning("Poll failed: %s", e)
@@ -1222,6 +1278,7 @@ class OverWorkerClient:
         logger.info("  Server:        %s", SERVER)
         logger.info("  Poll interval: %ds", self.poll_interval)
         logger.info("  Status file:   %s", os.path.abspath(STATUS_FILE))
+        logger.info("  Worker version: %s", WORKER_VERSION[:12] if WORKER_VERSION != "unknown" else WORKER_VERSION)
         logger.info("=" * 70)
         _write_status("idle (just started)")
 
