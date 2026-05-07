@@ -910,7 +910,29 @@ class GovILScraper:
                     })
                     _what = f"DynamicCollector API (template={config.template_id}, skip={skip})"
 
-                data = _safe_json(resp, what=_what)
+                try:
+                    data = _safe_json(resp, what=_what)
+                except APIEndpointError as _api_err:
+                    # CF block on a DynamicCollector page mid-scrape: warm
+                    # Playwright once (sets stealth UA + CF cookies on
+                    # cloudscraper) and retry the same skip without losing
+                    # progress. If we've already warmed and still hit it,
+                    # re-raise — a stealthier strategy would have to be added.
+                    if (
+                        "blocked by Cloudflare" in str(_api_err)
+                        and not self.session._playwright_active
+                    ):
+                        logger.info(
+                            "DynamicCollector CF-blocked at skip=%d; "
+                            "warming Playwright and retrying",
+                            skip,
+                        )
+                        try:
+                            self.session._init_playwright()
+                        except Exception:
+                            raise _api_err
+                        continue
+                    raise
                 items = _extract_items(data)
 
                 if skip == 0:
@@ -998,7 +1020,29 @@ class GovILScraper:
 
                 url = f"{TRADITIONAL_ENDPOINT}?{'&'.join(query_parts)}"
                 resp = self.session.get(url)
-                data = _safe_json(resp, what=f"Traditional collector {url}")
+                try:
+                    data = _safe_json(resp, what=f"Traditional collector {url}")
+                except APIEndpointError as _api_err:
+                    # Same CF-recovery as DynamicCollector: warm Playwright
+                    # once, retry the same skip. Some traditional collectors
+                    # (gov decisions, FOI publications) get CF-blocked
+                    # specifically on this endpoint while their HTML page
+                    # loads fine in a real browser.
+                    if (
+                        "blocked by Cloudflare" in str(_api_err)
+                        and not self.session._playwright_active
+                    ):
+                        logger.info(
+                            "Traditional collector CF-blocked at skip=%d; "
+                            "warming Playwright and retrying",
+                            skip,
+                        )
+                        try:
+                            self.session._init_playwright()
+                        except Exception:
+                            raise _api_err
+                        continue
+                    raise
                 # Response: { total: N, results: [...] } (lowercase)
                 items = _extract_items(data)
 
