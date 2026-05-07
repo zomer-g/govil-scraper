@@ -1080,7 +1080,25 @@ class GovILScraper:
         # Fetch the default view first to learn the tab structure
         first_url = f"{api_base}/{name}?culture=he"
         first_resp = self.session.get(first_url)
-        first = _safe_json(first_resp, what=f"ContentPage API {first_url}")
+        try:
+            first = _safe_json(first_resp, what=f"ContentPage API {first_url}")
+        except APIEndpointError as api_err:
+            # Some /he/pages/X URLs aren't backed by the JSON Content Page API
+            # (legacy DOJ static pages, retired slugs, etc.). The API serves
+            # the SPA shell as HTML. Don't give up — fetch the real page URL
+            # and try to extract document links straight from its HTML. If we
+            # find any, the dataset is salvageable; if not, surface the
+            # original API error so the operator knows what to fix.
+            html_result = self._scrape_content_page_html_fallback(parsed, name)
+            if html_result is not None:
+                logger.info(
+                    "ContentPage %s: API returned non-JSON; HTML fallback "
+                    "found %d items / %d attachments",
+                    name, len(html_result.items),
+                    len(html_result.file_attachments),
+                )
+                return html_result
+            raise api_err
 
         tabs = ((first.get("contentMain") or {}).get("sideNav") or {}).get("tagItems") or []
 
@@ -1229,6 +1247,93 @@ class GovILScraper:
             items=all_items,
             total_count=len(all_items),
             file_attachments=all_attachments,
+            collector_name=name,
+            page_type=PageType.CONTENT_PAGE,
+            column_headers=["chapter", "category", "title", "url"],
+        )
+
+    def _scrape_content_page_html_fallback(
+        self, parsed: ParsedURL, name: str
+    ) -> Optional[ScrapeResult]:
+        """Fallback for /he/pages/{name} URLs whose JSON API serves the SPA
+        shell instead of structured data. Fetches the page URL itself and
+        extracts gov.il document links (PDF/DOC/XLS/PPT) from the HTML.
+
+        Returns the ScrapeResult on success, or None when the HTML carries
+        no document links (so the caller can re-raise the original
+        non-JSON-body error and the operator gets a clear "page is empty
+        or wrong slug" diagnosis).
+
+        Conservative on what it picks up: only gov.il-hosted document
+        attachments. Random nav/footer/social links would otherwise
+        pollute every "scrape" with hundreds of irrelevant rows.
+        """
+        from bs4 import BeautifulSoup
+        from urllib.parse import urljoin, unquote
+
+        page_url = parsed.original_url
+        try:
+            resp = self.session.get(page_url)
+        except Exception as e:
+            logger.warning("HTML fallback fetch failed for %s: %s", page_url, e)
+            return None
+
+        text = resp.text or ""
+        if not text.strip():
+            return None
+
+        soup = BeautifulSoup(text, "html.parser")
+        doc_exts = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx")
+
+        items: List[dict] = []
+        attachments: List[FileAttachment] = []
+
+        page_title = name
+        title_tag = soup.find("title")
+        if title_tag and title_tag.get_text(strip=True):
+            page_title = title_tag.get_text(strip=True)
+
+        seen: set[str] = set()
+        for a in soup.find_all("a", href=True):
+            href = (a["href"] or "").strip()
+            if not href or href.startswith(("mailto:", "javascript:", "#")):
+                continue
+            absolute = urljoin(BASE_URL + "/", href)
+            low = absolute.lower()
+            if "gov.il" not in low or not low.endswith(doc_exts):
+                continue
+            if absolute in seen:
+                continue
+            seen.add(absolute)
+
+            link_title = a.get_text(strip=True) or absolute
+            row_idx = len(items)
+            items.append({
+                "chapter": page_title,
+                "category": "",
+                "title": link_title,
+                "url": absolute,
+            })
+            filename = href.split("/")[-1].split("?")[0] or f"file_{row_idx}"
+            try:
+                filename = unquote(filename)
+            except Exception:
+                pass
+            ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+            attachments.append(FileAttachment(
+                url=absolute,
+                filename=filename,
+                item_index=row_idx,
+                file_type=ext,
+            ))
+
+        if not items:
+            return None
+
+        return ScrapeResult(
+            items=items,
+            total_count=len(items),
+            file_attachments=attachments,
             collector_name=name,
             page_type=PageType.CONTENT_PAGE,
             column_headers=["chapter", "category", "title", "url"],
