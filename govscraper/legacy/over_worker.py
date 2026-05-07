@@ -76,31 +76,30 @@ def _detect_worker_version() -> str:
 def _detect_engine_hash() -> str:
     """SHA-256 of the worker's loaded legacy_engine.py file content.
 
-    The server compares this against the same file fetched from the
-    upstream repo; mismatch means "the bytes that determine scrape
-    behaviour aren't what upstream has", and dispatch is refused. This
-    catches the failure modes that a git-SHA report can miss:
-      - WORKER_VERSION env var spoofed to the upstream SHA
-      - operator pulled but didn't restart, so the running process
-        still has the old module in memory while the file on disk
-        and `git rev-parse HEAD` advanced
-    Reads the file from disk (not via __file__ of the imported module)
-    so that "imported in memory != file on disk" gets caught — the
-    server compares against the file, so the worker should too.
+    Hash is computed over LF-normalized bytes (CRLF -> LF, lone CR -> LF)
+    so a Windows checkout with autocrlf=true matches a Linux checkout
+    with autocrlf=input — they differ on disk but the server hashes the
+    GitHub raw file the same way, so logical equality wins.
+
+    Server compares against this; mismatch means the bytes determining
+    scrape behaviour aren't what upstream has. Catches what a git-SHA
+    report misses:
+      - WORKER_VERSION env spoofed to the upstream SHA
+      - operator pulled but didn't restart (HEAD advanced on disk; in-
+        memory module didn't)
+
     Returns 'unknown' if the file can't be read; server treats unknown
     as failing open, so this is safe on edge deploys.
     """
     try:
         import hashlib
-        # Resolve the engine file relative to this module's location:
-        # over_worker.py lives at govscraper/legacy/, engine at
-        # govscraper/scrapers/govil/.
         here = os.path.dirname(os.path.abspath(__file__))
         engine_path = os.path.normpath(
             os.path.join(here, "..", "scrapers", "govil", "legacy_engine.py")
         )
         with open(engine_path, "rb") as fp:
-            return hashlib.sha256(fp.read()).hexdigest()
+            data = fp.read().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        return hashlib.sha256(data).hexdigest()
     except Exception:
         return "unknown"
 
