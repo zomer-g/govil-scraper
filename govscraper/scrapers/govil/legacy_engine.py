@@ -86,6 +86,39 @@ class APIEndpointError(GovILScraperError):
     pass
 
 
+def _safe_json(resp, *, what: str):
+    """Parse a response body as JSON, raising APIEndpointError with context
+    on failure instead of a bare `JSONDecodeError: Expecting value: line 1
+    column 1 (char 0)`.
+
+    gov.il occasionally returns 200 OK with an empty body or an HTML error
+    page (Cloudflare warm-ups, momentary backend hiccups, redirects to
+    preview.newgov.gov.il). The bare json.JSONDecodeError that propagated
+    out of `.json()` reached the worker as an opaque error with no URL or
+    status — useless for debugging. Wrapping every API decode here turns
+    those failures into actionable APIEndpointError messages, which the
+    worker's existing GovILScraperError handler reports verbatim to the
+    server's failure log.
+    """
+    import json
+    text = resp.text or ""
+    if not text.strip():
+        raise APIEndpointError(
+            f"{what} returned empty body (status={resp.status_code}, "
+            f"content-type={resp.headers.get('content-type', '?')})"
+        )
+    try:
+        return resp.json()
+    except (ValueError, json.JSONDecodeError) as e:
+        sample = text[:160].replace("\n", " ").replace("\r", " ")
+        raise APIEndpointError(
+            f"{what} returned non-JSON body "
+            f"(status={resp.status_code}, "
+            f"content-type={resp.headers.get('content-type', '?')}, "
+            f"len={len(text)}, sample={sample!r}): {e}"
+        ) from e
+
+
 # ---------------------------------------------------------------------------
 # Session management
 # ---------------------------------------------------------------------------
@@ -709,6 +742,7 @@ class GovILScraper:
                         body.setdefault(k, v)
                     resp = self.session.post(api_url, json_data=body,
                                              extra_headers=extra_headers)
+                    _what = f"DynamicCollector custom API {api_url} (skip={skip})"
                 else:
                     # Standard DynamicCollector API — each filter goes in
                     # QueryFilters as {"<name>": {"Query": <value>}}. Without
@@ -728,8 +762,9 @@ class GovILScraper:
                         "QueryFilters": query_filters,
                         "From": skip,
                     })
+                    _what = f"DynamicCollector API (template={config.template_id}, skip={skip})"
 
-                data = resp.json()
+                data = _safe_json(resp, what=_what)
                 items = _extract_items(data)
 
                 if skip == 0:
@@ -817,7 +852,7 @@ class GovILScraper:
 
                 url = f"{TRADITIONAL_ENDPOINT}?{'&'.join(query_parts)}"
                 resp = self.session.get(url)
-                data = resp.json()
+                data = _safe_json(resp, what=f"Traditional collector {url}")
                 # Response: { total: N, results: [...] } (lowercase)
                 items = _extract_items(data)
 
@@ -880,7 +915,7 @@ class GovILScraper:
 
         api_url = f"{TRADITIONAL_ENDPOINT}?{'&'.join(query_parts)}"
         resp = self.session.get(api_url)
-        data = resp.json()
+        data = _safe_json(resp, what=f"Traditional page {api_url}")
         total = _extract_total(data) or 0
         items = _extract_items(data)
         return total, items
@@ -1025,8 +1060,9 @@ class GovILScraper:
         name = parsed.collector_name
 
         # Fetch the default view first to learn the tab structure
-        first_resp = self.session.get(f"{api_base}/{name}?culture=he")
-        first = first_resp.json()
+        first_url = f"{api_base}/{name}?culture=he"
+        first_resp = self.session.get(first_url)
+        first = _safe_json(first_resp, what=f"ContentPage API {first_url}")
 
         tabs = ((first.get("contentMain") or {}).get("sideNav") or {}).get("tagItems") or []
 
@@ -1097,10 +1133,9 @@ class GovILScraper:
             if i == 0 and ch == 1:
                 data = first
             else:
-                resp = self.session.get(
-                    f"{api_base}/{name}?culture=he&chapterIndex={ch}",
-                )
-                data = resp.json()
+                chapter_url = f"{api_base}/{name}?culture=he&chapterIndex={ch}"
+                resp = self.session.get(chapter_url)
+                data = _safe_json(resp, what=f"ContentPage chapter API {chapter_url}")
 
             main = data.get("contentMain") or {}
             chapter_title = chapter_titles[i] or f"Chapter {ch}"
