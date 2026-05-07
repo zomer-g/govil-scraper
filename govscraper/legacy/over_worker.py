@@ -73,7 +73,40 @@ def _detect_worker_version() -> str:
     return "unknown"
 
 
+def _detect_engine_hash() -> str:
+    """SHA-256 of the worker's loaded legacy_engine.py file content.
+
+    The server compares this against the same file fetched from the
+    upstream repo; mismatch means "the bytes that determine scrape
+    behaviour aren't what upstream has", and dispatch is refused. This
+    catches the failure modes that a git-SHA report can miss:
+      - WORKER_VERSION env var spoofed to the upstream SHA
+      - operator pulled but didn't restart, so the running process
+        still has the old module in memory while the file on disk
+        and `git rev-parse HEAD` advanced
+    Reads the file from disk (not via __file__ of the imported module)
+    so that "imported in memory != file on disk" gets caught — the
+    server compares against the file, so the worker should too.
+    Returns 'unknown' if the file can't be read; server treats unknown
+    as failing open, so this is safe on edge deploys.
+    """
+    try:
+        import hashlib
+        # Resolve the engine file relative to this module's location:
+        # over_worker.py lives at govscraper/legacy/, engine at
+        # govscraper/scrapers/govil/.
+        here = os.path.dirname(os.path.abspath(__file__))
+        engine_path = os.path.normpath(
+            os.path.join(here, "..", "scrapers", "govil", "legacy_engine.py")
+        )
+        with open(engine_path, "rb") as fp:
+            return hashlib.sha256(fp.read()).hexdigest()
+    except Exception:
+        return "unknown"
+
+
 WORKER_VERSION = _detect_worker_version()
+WORKER_ENGINE_HASH = _detect_engine_hash()
 
 
 def _archive_root() -> str:
@@ -172,10 +205,13 @@ class OverWorkerClient:
         self._session.headers.update({
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
-            # Server uses this to gate task dispatch when the worker is
-            # on a stale commit. See _detect_worker_version() for the
-            # fallback path on non-git deploys.
+            # Two-axis identity. Server gates dispatch on BOTH:
+            #   X-Worker-Version    — git SHA at startup. Cheap, spoofable.
+            #   X-Worker-Engine-Hash — SHA-256 of legacy_engine.py on disk.
+            #     Catches fakey WORKER_VERSION env vars AND the
+            #     "pulled but didn't restart" case.
             "X-Worker-Version": WORKER_VERSION,
+            "X-Worker-Engine-Hash": WORKER_ENGINE_HASH,
         })
 
     def _url(self, path: str) -> str:
@@ -200,15 +236,19 @@ class OverWorkerClient:
             if resp.status_code == 200:
                 payload = resp.json()
                 if isinstance(payload, dict) and payload.get("outdated"):
-                    expected = (payload.get("expected_version") or "?")[:12]
-                    got = (payload.get("worker_version") or WORKER_VERSION)[:12]
+                    expected_sha = (payload.get("expected_version") or "?")[:12]
+                    got_sha = (payload.get("worker_version") or WORKER_VERSION)[:12]
+                    expected_hash = (payload.get("expected_engine_hash") or "?")[:12]
+                    got_hash = (payload.get("worker_engine_hash") or WORKER_ENGINE_HASH)[:12]
+                    msg = payload.get("message") or "outdated"
+                    logger.error("Server refused task: %s", msg)
                     logger.error(
-                        "Server refused task: worker outdated (running %s, expected %s). "
-                        "git pull && restart this worker.",
-                        got, expected,
+                        "  worker SHA=%s expected=%s | engine_hash=%s expected=%s",
+                        got_sha, expected_sha, got_hash, expected_hash,
                     )
                     _write_status(
-                        f"OUTDATED: running {got}, expected {expected} — "
+                        f"OUTDATED sha={got_sha}/{expected_sha} "
+                        f"engine={got_hash}/{expected_hash} — "
                         f"git pull && restart"
                     )
                     return None
@@ -1293,6 +1333,7 @@ class OverWorkerClient:
         logger.info("  Poll interval: %ds", self.poll_interval)
         logger.info("  Status file:   %s", os.path.abspath(STATUS_FILE))
         logger.info("  Worker version: %s", WORKER_VERSION[:12] if WORKER_VERSION != "unknown" else WORKER_VERSION)
+        logger.info("  Engine hash:    %s", WORKER_ENGINE_HASH[:12] if WORKER_ENGINE_HASH != "unknown" else WORKER_ENGINE_HASH)
         logger.info("=" * 70)
         _write_status("idle (just started)")
 
