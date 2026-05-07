@@ -86,6 +86,21 @@ class APIEndpointError(GovILScraperError):
     pass
 
 
+def _looks_like_cf_block(html: str) -> bool:
+    """gov.il occasionally returns a Cloudflare 'you have been blocked' page
+    with status 200, which makes every downstream check (json.loads, HTML
+    anchor count, title parsing) report a misleading diagnosis. The block
+    page consistently carries either an "Attention Required!" title with
+    "you have been blocked" body, or the cf-error-details block."""
+    lower = html.lower()
+    return (
+        ("attention required" in lower
+         and "cloudflare" in lower
+         and "you have been blocked" in lower)
+        or "cf-error-details" in lower
+    )
+
+
 def _safe_json(resp, *, what: str):
     """Parse a response body as JSON, raising APIEndpointError with context
     on failure instead of a bare `JSONDecodeError: Expecting value: line 1
@@ -117,7 +132,15 @@ def _safe_json(resp, *, what: str):
         )
 
     if "text/html" in content_type or text.lstrip().lower().startswith(("<!doctype html", "<html")):
-        sample = text[:120].replace("\n", " ").replace("\r", " ")
+        sample = text[:160].replace("\n", " ").replace("\r", " ")
+        if _looks_like_cf_block(text):
+            raise APIEndpointError(
+                f"{what} blocked by Cloudflare (200 OK with block page). "
+                f"The page is fine for a real browser; the scraper's "
+                f"fingerprint is being flagged. Try again later, or this "
+                f"URL may need a stealthier Playwright config. "
+                f"(status={resp.status_code}, len={len(text)})"
+            )
         raise APIEndpointError(
             f"{what} returned HTML instead of JSON — this URL is likely not "
             f"backed by the Content Page / collector API (wrong slug, removed "
@@ -180,19 +203,69 @@ class GovILSession:
     # ---- Playwright fallback ------------------------------------------------
 
     def _init_playwright(self):
-        """Lazy-init Playwright and extract cookies into the requests session."""
+        """Lazy-init Playwright and extract cookies into the requests session.
+
+        Stealth measures (in roughly increasing impact):
+          - launch flags that disable the AutomationControlled blink
+            feature, which Cloudflare's bot detection probes via
+            navigator.webdriver
+          - explicit User-Agent so we're not the default
+            HeadlessChrome/<ver> string CF blocks on sight
+          - realistic viewport so the page's CSS doesn't trip layout
+            heuristics
+          - init script that overrides navigator.webdriver to false and
+            patches chrome runtime + permissions in the same shapes a
+            real Chrome exposes
+
+        These won't beat a serious anti-bot deployment but they're the
+        cheapest changes that turn most "Attention Required" 200s into
+        real responses on gov.il.
+        """
         if self._playwright_active:
             return
         try:
             from playwright.sync_api import sync_playwright
             self._pw = sync_playwright().start()
-            self._browser = self._pw.chromium.launch(headless=True)
+            self._browser = self._pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                    "--no-sandbox",
+                ],
+            )
+            real_ua = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0.0.0 Safari/537.36"
+            )
             self._pw_context = self._browser.new_context(
                 locale="he-IL",
+                user_agent=real_ua,
+                viewport={"width": 1920, "height": 1080},
                 extra_http_headers=COMMON_HEADERS,
             )
+            # Patch obvious headless tells before any page script runs.
+            self._pw_context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'languages', { get: () => ['he-IL', 'he', 'en-US', 'en'] });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                window.chrome = { runtime: {} };
+                const origQuery = window.navigator.permissions && window.navigator.permissions.query;
+                if (origQuery) {
+                    window.navigator.permissions.query = (p) =>
+                        p.name === 'notifications'
+                            ? Promise.resolve({ state: Notification.permission })
+                            : origQuery(p);
+                }
+            """)
             page = self._pw_context.new_page()
-            page.goto(f"{BASE_URL}/he", wait_until="networkidle", timeout=30000)
+            # `domcontentloaded` rather than `networkidle`: with a realistic
+            # UA gov.il pulls many third-party trackers (analytics, fonts,
+            # tag managers) that never quiet down enough to satisfy
+            # networkidle within 30s. We only need cookies + a parsed
+            # document for the warm-up.
+            page.goto(f"{BASE_URL}/he", wait_until="domcontentloaded", timeout=30000)
             # Extract cookies and inject into cloudscraper session
             for cookie in self._pw_context.cookies():
                 self._session.cookies.set(
@@ -200,10 +273,14 @@ class GovILSession:
                     domain=cookie.get("domain", ".gov.il"),
                     path=cookie.get("path", "/"),
                 )
+            # Bring cloudscraper's UA in line with the Playwright UA so the
+            # subsequent .get() calls don't immediately re-trigger CF on a
+            # UA-vs-cookie mismatch.
+            self._session.headers["User-Agent"] = real_ua
             page.close()
             self._playwright_active = True
             self._warmed = True
-            logger.info("Playwright fallback session established")
+            logger.info("Playwright fallback session established (stealth-tuned)")
         except Exception as e:
             logger.error("Playwright fallback failed: %s", e)
             raise CloudflareBlockError(
@@ -377,7 +454,24 @@ class GovILSession:
         try:
             page = self._pw_context.new_page()
             try:
-                page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+                # First try networkidle for a fully-rendered SPA (most JS-
+                # heavy pages have it within ~10s). If trackers keep the
+                # network warm past the budget, fall back to domcontentloaded
+                # — that gives us the post-JS DOM after the page's own load
+                # event without waiting for tag-manager noise.
+                try:
+                    page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+                except Exception as e:
+                    logger.info(
+                        "Playwright networkidle timeout for %s (%s); "
+                        "retrying with domcontentloaded", url, e,
+                    )
+                    page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                    # Give late-loading content a moment after DCL.
+                    try:
+                        page.wait_for_load_state("load", timeout=10000)
+                    except Exception:
+                        pass
                 return page.content()
             finally:
                 page.close()
@@ -1113,28 +1207,65 @@ class GovILScraper:
 
         # Fetch the default view first to learn the tab structure
         first_url = f"{api_base}/{name}?culture=he"
-        first_resp = self.session.get(first_url)
+
+        first = None
+        api_err: Optional[APIEndpointError] = None
         try:
+            first_resp = self.session.get(first_url)
             first = _safe_json(first_resp, what=f"ContentPage API {first_url}")
-        except APIEndpointError as api_err:
-            # Some /he/pages/X URLs aren't backed by the JSON Content Page API
-            # (legacy DOJ static pages, retired slugs, etc.). The API serves
-            # the SPA shell as HTML. Don't give up — fetch the real page URL
-            # and try to extract document links straight from its HTML.
+        except APIEndpointError as e:
+            api_err = e
+
+        # CF block recovery: when the JSON API is being Cloudflare-blocked
+        # (200 OK + "Attention Required" body), warming Playwright once is
+        # usually enough to unstick cloudscraper for the rest of the run —
+        # _init_playwright() injects cookies + a realistic Chrome UA into
+        # the cloudscraper session. Retry the same JSON URL once; if it
+        # comes back as proper JSON, the entire normal scrape path works
+        # from here, no HTML extraction needed.
+        if api_err is not None and "blocked by Cloudflare" in str(api_err):
+            logger.info(
+                "ContentPage %s: CF block on JSON API — warming Playwright "
+                "and retrying", name,
+            )
+            try:
+                self.session._init_playwright()
+            except Exception as e:
+                logger.warning("Playwright warm for CF retry failed: %s", e)
+            else:
+                try:
+                    first_resp = self.session.get(first_url)
+                    first = _safe_json(
+                        first_resp,
+                        what=f"ContentPage API {first_url} (post-stealth warm)",
+                    )
+                    logger.info(
+                        "ContentPage %s: post-warm JSON API succeeded", name,
+                    )
+                    api_err = None
+                except APIEndpointError as e2:
+                    api_err = e2
+                    logger.info(
+                        "ContentPage %s: post-warm retry still failing", name,
+                    )
+
+        # Last resort: render the actual page URL and pull doc links from
+        # the HTML. Helps for /he/pages/X that genuinely isn't a Content
+        # Page (rare) and as a safety net for anything stealth warm-up
+        # couldn't unblock.
+        if first is None:
+            assert api_err is not None
             html_result, fallback_diag = self._scrape_content_page_html_fallback(
                 parsed, name,
             )
             if html_result is not None:
                 logger.info(
-                    "ContentPage %s: API returned non-JSON; HTML fallback "
-                    "found %d items / %d attachments",
+                    "ContentPage %s: API failed; HTML fallback found "
+                    "%d items / %d attachments",
                     name, len(html_result.items),
                     len(html_result.file_attachments),
                 )
                 return html_result
-            # Surface BOTH failure modes in the same error so the operator
-            # doesn't have to dig into worker logs to learn the fallback
-            # also turned up nothing.
             raise APIEndpointError(
                 f"{api_err} | HTML fallback ({parsed.original_url}): "
                 f"{fallback_diag}"
@@ -1378,18 +1509,21 @@ class GovILScraper:
         if not text.strip():
             return None, f"empty body (status={resp.status_code})"
 
+        static_cf_blocked = _looks_like_cf_block(text)
         items, attachments, anchor_count, page_title = _extract(text)
         static_len = len(text)
 
         if not items:
             # Stage 2: render in Playwright to capture JS-appended links
             logger.info(
-                "HTML fallback for %s: 0 docs in %d bytes / %d anchors — "
+                "HTML fallback for %s: 0 docs in %d bytes / %d anchors%s — "
                 "trying Playwright render",
                 page_url, static_len, anchor_count,
+                " (Cloudflare block)" if static_cf_blocked else "",
             )
             rendered = self.session.render_page_html(page_url)
             if rendered:
+                rendered_cf_blocked = _looks_like_cf_block(rendered)
                 items, attachments, rendered_anchors, page_title = _extract(rendered)
                 if items:
                     diag = (
@@ -1407,17 +1541,27 @@ class GovILScraper:
                         page_type=PageType.CONTENT_PAGE,
                         column_headers=["chapter", "category", "title", "url"],
                     ), diag
-                diag = (
-                    f"static HTML: 0 docs in {static_len} bytes / "
-                    f"{anchor_count} anchors. Playwright render: 0 docs in "
-                    f"{len(rendered)} bytes / {rendered_anchors} anchors. "
-                    f"Page truly has no gov.il document links."
-                )
+                if rendered_cf_blocked:
+                    diag = (
+                        f"BLOCKED BY CLOUDFLARE on both stages — "
+                        f"static HTML ({static_len} bytes) and Playwright "
+                        f"render ({len(rendered)} bytes) both served the "
+                        f"'Attention Required' block page. The URL works "
+                        f"in a real browser; the scraper fingerprint is "
+                        f"being flagged."
+                    )
+                else:
+                    diag = (
+                        f"static HTML: 0 docs in {static_len} bytes / "
+                        f"{anchor_count} anchors. Playwright render: 0 docs in "
+                        f"{len(rendered)} bytes / {rendered_anchors} anchors. "
+                        f"Page truly has no gov.il document links."
+                    )
             else:
                 diag = (
                     f"static HTML: 0 docs in {static_len} bytes / "
-                    f"{anchor_count} anchors. Playwright render unavailable "
-                    f"or failed."
+                    f"{anchor_count} anchors{' (Cloudflare block)' if static_cf_blocked else ''}. "
+                    f"Playwright render unavailable or failed."
                 )
             logger.info("HTML fallback for %s: %s", page_url, diag)
             return None, diag
