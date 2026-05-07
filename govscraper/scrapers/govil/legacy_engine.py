@@ -99,22 +99,40 @@ def _safe_json(resp, *, what: str):
     those failures into actionable APIEndpointError messages, which the
     worker's existing GovILScraperError handler reports verbatim to the
     server's failure log.
+
+    HTML body deserves its own message: cloudscraper warm-up handles real
+    Cloudflare 403s, so a 200 + text/html here usually means the URL slug
+    isn't actually backed by this JSON endpoint (page is static or the
+    slug is wrong / page was removed) — the operator's fix is to update
+    or untrack the dataset, not to retry.
     """
     import json
     text = resp.text or ""
+    content_type = (resp.headers.get("content-type") or "").lower()
+
     if not text.strip():
         raise APIEndpointError(
             f"{what} returned empty body (status={resp.status_code}, "
             f"content-type={resp.headers.get('content-type', '?')})"
         )
+
+    if "text/html" in content_type or text.lstrip().lower().startswith(("<!doctype html", "<html")):
+        sample = text[:120].replace("\n", " ").replace("\r", " ")
+        raise APIEndpointError(
+            f"{what} returned HTML instead of JSON — this URL is likely not "
+            f"backed by the Content Page / collector API (wrong slug, removed "
+            f"page, or page is static). Reconfigure the dataset's source URL "
+            f"or untrack it. (status={resp.status_code}, len={len(text)}, "
+            f"sample={sample!r})"
+        )
+
     try:
         return resp.json()
     except (ValueError, json.JSONDecodeError) as e:
         sample = text[:160].replace("\n", " ").replace("\r", " ")
         raise APIEndpointError(
             f"{what} returned non-JSON body "
-            f"(status={resp.status_code}, "
-            f"content-type={resp.headers.get('content-type', '?')}, "
+            f"(status={resp.status_code}, content-type={content_type or '?'}, "
             f"len={len(text)}, sample={sample!r}): {e}"
         ) from e
 
