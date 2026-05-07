@@ -351,6 +351,40 @@ class GovILSession:
             f"כל הניסיונות נכשלו עבור {url}: {last_error}"
         )
 
+    def render_page_html(self, url: str, *, timeout_ms: int = 30000) -> Optional[str]:
+        """Render `url` in Playwright and return post-JS HTML, or None.
+
+        Cloudscraper hands back the pre-render SPA shell for /he/pages/X
+        URLs that aren't backed by the Content Page JSON API; the actual
+        document links land in the DOM only after the page's JS runs.
+        This method gives the HTML-fallback path a way to read those
+        links by literally rendering the page in headless chromium.
+
+        Returns None on any failure — Playwright init issues, navigation
+        timeouts, etc. — so the caller treats absence uniformly as "we
+        couldn't render this".
+        """
+        if not self._use_playwright_fallback:
+            return None
+        try:
+            if not self._playwright_active:
+                self._init_playwright()
+        except Exception as e:
+            logger.warning("Playwright init failed for render of %s: %s", url, e)
+            return None
+        if not self._pw_context:
+            return None
+        try:
+            page = self._pw_context.new_page()
+            try:
+                page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+                return page.content()
+            finally:
+                page.close()
+        except Exception as e:
+            logger.warning("Playwright render failed for %s: %s", url, e)
+            return None
+
     def close(self):
         if self._browser:
             self._browser.close()
@@ -1265,11 +1299,16 @@ class GovILScraper:
         shell instead of structured data. Fetches the page URL itself and
         extracts gov.il document links (PDF/DOC/XLS/PPT) from the HTML.
 
+        Two-stage:
+          1. cloudscraper GET the page URL → parse static HTML.
+          2. If 0 docs found, render the page via Playwright (post-JS) and
+             re-parse the rendered DOM. Some /he/pages/X URLs are pure SPA
+             where every document link is appended by client-side JS.
+
         Returns (ScrapeResult, diag) on success and (None, diag) when no
         documents were found. The diag string is propagated into the
         operator-facing error message so a failed fallback is immediately
-        debuggable from the dashboard ("HTML loaded N bytes, found 0
-        gov.il document links — page is JS-rendered or has none").
+        debuggable from the dashboard.
 
         Conservative on what it picks up: only gov.il-hosted document
         attachments. Random nav/footer/social links would otherwise
@@ -1279,6 +1318,56 @@ class GovILScraper:
         from urllib.parse import urljoin, unquote
 
         page_url = parsed.original_url
+        doc_exts = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx")
+
+        def _extract(html: str) -> tuple[List[dict], List[FileAttachment], int, str]:
+            """Pull doc links from HTML; return (items, attachments,
+            anchor_count, page_title)."""
+            soup = BeautifulSoup(html, "html.parser")
+            anchors = soup.find_all("a", href=True)
+            ttl_tag = soup.find("title")
+            page_title = (
+                ttl_tag.get_text(strip=True) if ttl_tag and ttl_tag.get_text(strip=True)
+                else name
+            )
+            local_items: List[dict] = []
+            local_atts: List[FileAttachment] = []
+            seen: set[str] = set()
+            for a in anchors:
+                href = (a["href"] or "").strip()
+                if not href or href.startswith(("mailto:", "javascript:", "#")):
+                    continue
+                absolute = urljoin(BASE_URL + "/", href)
+                low = absolute.lower()
+                if "gov.il" not in low or not low.endswith(doc_exts):
+                    continue
+                if absolute in seen:
+                    continue
+                seen.add(absolute)
+
+                link_title = a.get_text(strip=True) or absolute
+                row_idx = len(local_items)
+                local_items.append({
+                    "chapter": page_title,
+                    "category": "",
+                    "title": link_title,
+                    "url": absolute,
+                })
+                filename = href.split("/")[-1].split("?")[0] or f"file_{row_idx}"
+                try:
+                    filename = unquote(filename)
+                except Exception:
+                    pass
+                ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+                local_atts.append(FileAttachment(
+                    url=absolute,
+                    filename=filename,
+                    item_index=row_idx,
+                    file_type=ext,
+                ))
+            return local_items, local_atts, len(anchors), page_title
+
+        # Stage 1: cloudscraper static HTML
         try:
             resp = self.session.get(page_url)
         except Exception as e:
@@ -1286,71 +1375,57 @@ class GovILScraper:
             return None, f"fetch failed: {type(e).__name__}: {e}"
 
         text = resp.text or ""
-        text_len = len(text)
         if not text.strip():
             return None, f"empty body (status={resp.status_code})"
 
-        soup = BeautifulSoup(text, "html.parser")
-        doc_exts = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx")
-
-        items: List[dict] = []
-        attachments: List[FileAttachment] = []
-
-        page_title = name
-        title_tag = soup.find("title")
-        if title_tag and title_tag.get_text(strip=True):
-            page_title = title_tag.get_text(strip=True)
-
-        # Total <a> count is reported in the diag so the operator can tell
-        # "thin SPA shell with no links at all" from "real HTML page that
-        # just happens to have no doc links".
-        all_anchors = soup.find_all("a", href=True)
-
-        seen: set[str] = set()
-        for a in all_anchors:
-            href = (a["href"] or "").strip()
-            if not href or href.startswith(("mailto:", "javascript:", "#")):
-                continue
-            absolute = urljoin(BASE_URL + "/", href)
-            low = absolute.lower()
-            if "gov.il" not in low or not low.endswith(doc_exts):
-                continue
-            if absolute in seen:
-                continue
-            seen.add(absolute)
-
-            link_title = a.get_text(strip=True) or absolute
-            row_idx = len(items)
-            items.append({
-                "chapter": page_title,
-                "category": "",
-                "title": link_title,
-                "url": absolute,
-            })
-            filename = href.split("/")[-1].split("?")[0] or f"file_{row_idx}"
-            try:
-                filename = unquote(filename)
-            except Exception:
-                pass
-            ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-            attachments.append(FileAttachment(
-                url=absolute,
-                filename=filename,
-                item_index=row_idx,
-                file_type=ext,
-            ))
+        items, attachments, anchor_count, page_title = _extract(text)
+        static_len = len(text)
 
         if not items:
-            diag = (
-                f"loaded {text_len} bytes, "
-                f"{len(all_anchors)} anchors, found 0 gov.il document links "
-                f"(page is JS-rendered, has no downloadable files, or the "
-                f"slug is wrong)"
+            # Stage 2: render in Playwright to capture JS-appended links
+            logger.info(
+                "HTML fallback for %s: 0 docs in %d bytes / %d anchors — "
+                "trying Playwright render",
+                page_url, static_len, anchor_count,
             )
+            rendered = self.session.render_page_html(page_url)
+            if rendered:
+                items, attachments, rendered_anchors, page_title = _extract(rendered)
+                if items:
+                    diag = (
+                        f"static HTML had 0 docs in {static_len} bytes / "
+                        f"{anchor_count} anchors; Playwright render found "
+                        f"{len(items)} doc(s) in {len(rendered)} bytes / "
+                        f"{rendered_anchors} anchors"
+                    )
+                    logger.info("HTML fallback for %s: %s", page_url, diag)
+                    return ScrapeResult(
+                        items=items,
+                        total_count=len(items),
+                        file_attachments=attachments,
+                        collector_name=name,
+                        page_type=PageType.CONTENT_PAGE,
+                        column_headers=["chapter", "category", "title", "url"],
+                    ), diag
+                diag = (
+                    f"static HTML: 0 docs in {static_len} bytes / "
+                    f"{anchor_count} anchors. Playwright render: 0 docs in "
+                    f"{len(rendered)} bytes / {rendered_anchors} anchors. "
+                    f"Page truly has no gov.il document links."
+                )
+            else:
+                diag = (
+                    f"static HTML: 0 docs in {static_len} bytes / "
+                    f"{anchor_count} anchors. Playwright render unavailable "
+                    f"or failed."
+                )
             logger.info("HTML fallback for %s: %s", page_url, diag)
             return None, diag
 
-        diag = f"found {len(items)} gov.il document(s) in {text_len} bytes"
+        diag = (
+            f"static HTML found {len(items)} gov.il document(s) in "
+            f"{static_len} bytes / {anchor_count} anchors"
+        )
         return ScrapeResult(
             items=items,
             total_count=len(items),
