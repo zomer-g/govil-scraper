@@ -668,7 +668,14 @@ class OverWorkerClient:
 
         try:
             self.report_progress(task_id, "initializing", 0, 1, "מתחבר לאתר gov.il...")
-            session = GovILSession(use_playwright_fallback=False)
+            # Playwright fallback is required for /he/pages/X URLs whose
+            # JSON Content Page API is Cloudflare-blocked or returns the
+            # SPA shell — the engine warms a stealth-tuned headless
+            # chromium, injects its cookies into cloudscraper, and either
+            # retries the JSON API post-warm or extracts doc links from
+            # the post-JS DOM. Cheap when not needed (only initialised on
+            # the API-fails path).
+            session = GovILSession(use_playwright_fallback=True)
             session.warm()
 
             if need_bootstrap:
@@ -1005,7 +1012,14 @@ class OverWorkerClient:
 
         try:
             self.report_progress(task_id, "initializing", 0, 1, "מתחבר לאתר gov.il...")
-            session = GovILSession(use_playwright_fallback=False)
+            # Playwright fallback is required for /he/pages/X URLs whose
+            # JSON Content Page API is Cloudflare-blocked or returns the
+            # SPA shell — the engine warms a stealth-tuned headless
+            # chromium, injects its cookies into cloudscraper, and either
+            # retries the JSON API post-warm or extracts doc links from
+            # the post-JS DOM. Cheap when not needed (only initialised on
+            # the API-fails path).
+            session = GovILSession(use_playwright_fallback=True)
             session.warm()
 
             self.report_progress(task_id, "scraping", 0, 1, "מזהה סוג דף...")
