@@ -1086,10 +1086,10 @@ class GovILScraper:
             # Some /he/pages/X URLs aren't backed by the JSON Content Page API
             # (legacy DOJ static pages, retired slugs, etc.). The API serves
             # the SPA shell as HTML. Don't give up — fetch the real page URL
-            # and try to extract document links straight from its HTML. If we
-            # find any, the dataset is salvageable; if not, surface the
-            # original API error so the operator knows what to fix.
-            html_result = self._scrape_content_page_html_fallback(parsed, name)
+            # and try to extract document links straight from its HTML.
+            html_result, fallback_diag = self._scrape_content_page_html_fallback(
+                parsed, name,
+            )
             if html_result is not None:
                 logger.info(
                     "ContentPage %s: API returned non-JSON; HTML fallback "
@@ -1098,7 +1098,13 @@ class GovILScraper:
                     len(html_result.file_attachments),
                 )
                 return html_result
-            raise api_err
+            # Surface BOTH failure modes in the same error so the operator
+            # doesn't have to dig into worker logs to learn the fallback
+            # also turned up nothing.
+            raise APIEndpointError(
+                f"{api_err} | HTML fallback ({parsed.original_url}): "
+                f"{fallback_diag}"
+            ) from api_err
 
         tabs = ((first.get("contentMain") or {}).get("sideNav") or {}).get("tagItems") or []
 
@@ -1254,15 +1260,16 @@ class GovILScraper:
 
     def _scrape_content_page_html_fallback(
         self, parsed: ParsedURL, name: str
-    ) -> Optional[ScrapeResult]:
+    ) -> tuple[Optional[ScrapeResult], str]:
         """Fallback for /he/pages/{name} URLs whose JSON API serves the SPA
         shell instead of structured data. Fetches the page URL itself and
         extracts gov.il document links (PDF/DOC/XLS/PPT) from the HTML.
 
-        Returns the ScrapeResult on success, or None when the HTML carries
-        no document links (so the caller can re-raise the original
-        non-JSON-body error and the operator gets a clear "page is empty
-        or wrong slug" diagnosis).
+        Returns (ScrapeResult, diag) on success and (None, diag) when no
+        documents were found. The diag string is propagated into the
+        operator-facing error message so a failed fallback is immediately
+        debuggable from the dashboard ("HTML loaded N bytes, found 0
+        gov.il document links — page is JS-rendered or has none").
 
         Conservative on what it picks up: only gov.il-hosted document
         attachments. Random nav/footer/social links would otherwise
@@ -1276,11 +1283,12 @@ class GovILScraper:
             resp = self.session.get(page_url)
         except Exception as e:
             logger.warning("HTML fallback fetch failed for %s: %s", page_url, e)
-            return None
+            return None, f"fetch failed: {type(e).__name__}: {e}"
 
         text = resp.text or ""
+        text_len = len(text)
         if not text.strip():
-            return None
+            return None, f"empty body (status={resp.status_code})"
 
         soup = BeautifulSoup(text, "html.parser")
         doc_exts = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx")
@@ -1293,8 +1301,13 @@ class GovILScraper:
         if title_tag and title_tag.get_text(strip=True):
             page_title = title_tag.get_text(strip=True)
 
+        # Total <a> count is reported in the diag so the operator can tell
+        # "thin SPA shell with no links at all" from "real HTML page that
+        # just happens to have no doc links".
+        all_anchors = soup.find_all("a", href=True)
+
         seen: set[str] = set()
-        for a in soup.find_all("a", href=True):
+        for a in all_anchors:
             href = (a["href"] or "").strip()
             if not href or href.startswith(("mailto:", "javascript:", "#")):
                 continue
@@ -1328,8 +1341,16 @@ class GovILScraper:
             ))
 
         if not items:
-            return None
+            diag = (
+                f"loaded {text_len} bytes, "
+                f"{len(all_anchors)} anchors, found 0 gov.il document links "
+                f"(page is JS-rendered, has no downloadable files, or the "
+                f"slug is wrong)"
+            )
+            logger.info("HTML fallback for %s: %s", page_url, diag)
+            return None, diag
 
+        diag = f"found {len(items)} gov.il document(s) in {text_len} bytes"
         return ScrapeResult(
             items=items,
             total_count=len(items),
@@ -1337,7 +1358,7 @@ class GovILScraper:
             collector_name=name,
             page_type=PageType.CONTENT_PAGE,
             column_headers=["chapter", "category", "title", "url"],
-        )
+        ), diag
 
     # ---- Traditional: content page file extraction -------------------------
 
