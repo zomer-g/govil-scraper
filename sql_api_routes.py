@@ -36,9 +36,78 @@ _LEADING_COMMENT_RE = re.compile(
     re.DOTALL,
 )
 _ALLOWED_FIRST_KW = re.compile(r"^(select|explain|show|with)\b", re.IGNORECASE)
-# Reject anything that looks like statement chaining: a `;` followed by a
-# non-empty token. Trailing single `;` is fine.
-_CHAINING_RE = re.compile(r";\s*\S")
+
+
+def _strip_sql_comments(sql: str) -> str:
+    """Remove SQL `-- ...` and `/* ... */` comments. Preserves string literals
+    so a `;` inside `'a;b'` is kept verbatim. Used as a preprocessor before
+    chaining detection."""
+    out = []
+    i, n = 0, len(sql)
+    in_squote = False
+    while i < n:
+        c = sql[i]
+        if in_squote:
+            out.append(c)
+            if c == "'":
+                if i + 1 < n and sql[i + 1] == "'":
+                    out.append("'")
+                    i += 2
+                    continue
+                in_squote = False
+            i += 1
+            continue
+        if c == "'":
+            in_squote = True
+            out.append(c)
+            i += 1
+            continue
+        # Line comment: -- ...\n
+        if c == "-" and i + 1 < n and sql[i + 1] == "-":
+            nl = sql.find("\n", i + 2)
+            if nl < 0:
+                break  # rest of input is comment
+            i = nl + 1
+            out.append("\n")  # keep the newline so line layout is preserved
+            continue
+        # Block comment: /* ... */
+        if c == "/" and i + 1 < n and sql[i + 1] == "*":
+            end = sql.find("*/", i + 2)
+            if end < 0:
+                break  # unclosed block comment — treat as trailing comment
+            i = end + 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _has_extra_statement(sql: str) -> bool:
+    """Returns True iff `sql` contains a semicolon that splits it into more
+    than one non-empty statement.
+
+    Tolerates `;` inside string literals and trailing comments after a final
+    `;`. This is only a UX safety net — the real protection is the READ ONLY
+    transaction + statement_timeout in `pg_store.run_readonly_query`.
+    """
+    cleaned = _strip_sql_comments(sql).strip()
+    # Strip ONE trailing `;` (a single trailing semicolon is conventional)
+    if cleaned.endswith(";"):
+        cleaned = cleaned[:-1].rstrip()
+    # Now scan: any remaining `;` outside a string is a chaining attempt.
+    in_squote = False
+    i, n = 0, len(cleaned)
+    while i < n:
+        c = cleaned[i]
+        if c == "'":
+            if i + 1 < n and cleaned[i + 1] == "'":
+                i += 2
+                continue
+            in_squote = not in_squote
+        elif c == ";" and not in_squote:
+            return True
+        i += 1
+    return False
 
 
 @sql_api_bp.route("/tables", methods=["GET"])
@@ -77,9 +146,9 @@ def run_query():
         return jsonify({
             "error": "only SELECT/EXPLAIN/SHOW/WITH queries are allowed",
         }), 400
-    if _CHAINING_RE.search(sql):
+    if _has_extra_statement(sql):
         return jsonify({
-            "error": "statement chaining (multiple ;-separated statements) is not allowed",
+            "error": "multiple ;-separated statements are not allowed (a single trailing ; is fine)",
         }), 400
 
     pg, err = _require_pg()
