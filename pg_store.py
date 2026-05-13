@@ -819,6 +819,22 @@ class PgStore:
             conn.commit()
             return n
 
+    def slice_reset_failed(self) -> int:
+        """Reset all failed slices back to pending with attempts=0 so the
+        worker re-tries them. Used after a full run when some slices failed
+        due to transient blocks rather than genuine emptiness."""
+        with self._lock, self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """UPDATE nadlan_settlement_slices
+                   SET state = 'pending', worker_id = '',
+                       claimed_at = NULL, completed_at = NULL,
+                       attempts = 0, error = NULL
+                   WHERE state = 'failed'"""
+            )
+            n = cur.rowcount
+            conn.commit()
+            return n
+
     def slice_delete_room_null(self) -> int:
         """Remove all 'all rooms' slices — they can't be UI-clicked because
         'כל החדרים' is the dropdown toggle, not a selectable option."""

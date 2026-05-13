@@ -862,3 +862,16 @@ def slice_delete_room_null():
     if err: return err
     n = pg.slice_delete_room_null()
     return jsonify({"deleted": n})
+
+
+@nadlan_api_bp.route("/slice-reset-failed", methods=["POST"])
+def slice_reset_failed():
+    """Admin: reset all failed slices back to pending with attempts=0.
+    Useful when a worker has finished a full run and some slices failed
+    transiently — give them a second pass."""
+    if not _admin_or_worker():
+        return jsonify({"error": "admin or worker key required"}), 403
+    pg, err = _require_pg()
+    if err: return err
+    n = pg.slice_reset_failed()
+    return jsonify({"reset": n})
