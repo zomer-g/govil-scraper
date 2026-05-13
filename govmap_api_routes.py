@@ -61,6 +61,9 @@ def list_layers():
 def preview_bbox():
     """Cheap count probe before a full scrape.
 
+    Admin-only — probes GovMap WFS for a hit count. Issues outbound traffic
+    and could be abused for reconnaissance, so we gate by admin/worker key.
+
     Body: {layer, bbox, srs}
       - layer: layer id ("FIRE_AREAS_ORDERS") or numeric (220826)
       - bbox: [xmin, ymin, xmax, ymax]
@@ -68,6 +71,10 @@ def preview_bbox():
 
     Returns: {layer, bbox, srs, count}
     """
+    from auth import is_admin, _check_worker_key
+    if not (is_admin() or _check_worker_key()):
+        return jsonify({"error": "admin or worker key required"}), 403
+
     from govmap_engine import resolve_layer
     from wfs_client import WFSClient, WFSError
     from scraper_engine import GovILSession

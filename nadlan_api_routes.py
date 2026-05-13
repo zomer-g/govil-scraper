@@ -228,9 +228,12 @@ def settlements():
 def notify_trigger():
     """Webhook for an external scheduler. Records the trigger event.
 
-    Public + rate-limited (60/hour/IP). The handler is idempotent — it only
-    appends to a 100-entry in-memory log. Abuse is harmless.
+    Requires admin session OR worker key (X-Worker-Key). Still rate-limited
+    per IP as a backstop. The handler is idempotent — it only appends to a
+    100-entry in-memory log.
     """
+    if not _admin_or_worker():
+        return jsonify({"error": "admin or worker key required"}), 403
     ip = _client_ip()
     if not _rate_check(ip):
         return jsonify({"error": "rate limit exceeded"}), 429
@@ -646,6 +649,8 @@ def settlement_seed():
 @nadlan_api_bp.route("/settlement-claim", methods=["POST"])
 def settlement_claim():
     """Worker: atomically claim up to N settlements ordered by population desc."""
+    if not _admin_or_worker():
+        return jsonify({"error": "admin or worker key required"}), 403
     body = request.get_json(silent=True) or {}
     worker_id = str(body.get("worker_id") or "").strip()
     count = int(body.get("count") or 1)
@@ -664,6 +669,8 @@ def settlement_result(setl_code):
 
     Form fields: worker_id, deals_count, total_fetch (informational).
     """
+    if not _admin_or_worker():
+        return jsonify({"error": "admin or worker key required"}), 403
     worker_id = (request.form.get("worker_id") or "").strip()
     if not worker_id:
         return jsonify({"error": "worker_id required"}), 400
@@ -685,6 +692,8 @@ def settlement_result(setl_code):
 
 @nadlan_api_bp.route("/settlement-fail/<setl_code>", methods=["POST"])
 def settlement_fail(setl_code):
+    if not _admin_or_worker():
+        return jsonify({"error": "admin or worker key required"}), 403
     worker_id = (request.form.get("worker_id") or "").strip()
     error = (request.form.get("error") or "")[:500]
     transient_flag = (request.form.get("transient") or "true").lower() != "false"
@@ -781,6 +790,8 @@ def slice_seed():
 
 @nadlan_api_bp.route("/slice-claim", methods=["POST"])
 def slice_claim():
+    if not _admin_or_worker():
+        return jsonify({"error": "admin or worker key required"}), 403
     """Worker: atomically claim N slices, sorted by population DESC and
     grouped by setl_code so a single worker tends to get consecutive
     slices of the same settlement."""
@@ -798,6 +809,8 @@ def slice_claim():
 
 @nadlan_api_bp.route("/slice-result/<path:slice_key>", methods=["POST"])
 def slice_result(slice_key):
+    if not _admin_or_worker():
+        return jsonify({"error": "admin or worker key required"}), 403
     """Worker: upload deals for one slice. Multipart CSV.
 
     Form fields: worker_id, deals_count (optional override),
@@ -824,6 +837,8 @@ def slice_result(slice_key):
 
 @nadlan_api_bp.route("/slice-fail/<path:slice_key>", methods=["POST"])
 def slice_fail(slice_key):
+    if not _admin_or_worker():
+        return jsonify({"error": "admin or worker key required"}), 403
     worker_id = (request.form.get("worker_id") or "").strip()
     error = (request.form.get("error") or "")[:500]
     transient_flag = (request.form.get("transient") or "true").lower() != "false"
