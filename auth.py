@@ -74,6 +74,20 @@ def admin_required(f):
     return decorated
 
 
+def login_required(f):
+    """Decorator: require any logged-in user (admin or not).
+
+    Use for endpoints visible to all SSO users — the global before_request
+    hook already enforces this site-wide, but the decorator stays useful for
+    explicit per-endpoint clarity."""
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        if not get_current_user():
+            return jsonify({"error": "Authentication required"}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+
 def _check_worker_key() -> bool:
     """Check if the request has a valid worker API key."""
     expected = os.environ.get("WORKER_API_KEY", "")
@@ -149,12 +163,10 @@ def callback():
     }
 
     admin_emails = _get_admin_emails()
-    if email not in admin_emails:
-        logger.warning("Non-admin login attempt: %s", email)
-        session.pop("user", None)
-        return redirect("/?auth_error=not_admin")
-
-    logger.info("Admin logged in: %s", email)
+    if email in admin_emails:
+        logger.info("Admin logged in: %s", email)
+    else:
+        logger.info("Non-admin user logged in (read-only): %s", email)
     return redirect("/")
 
 

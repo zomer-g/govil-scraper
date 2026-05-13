@@ -847,6 +847,149 @@ class PgStore:
             conn.commit()
             return n
 
+    # -----------------------------------------------------------------
+    # Read-only SQL exploration (admin SQL console)
+    # -----------------------------------------------------------------
+
+    def list_tables(self) -> list[dict]:
+        """List all tables in the 'public' schema with a quick row estimate."""
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """SELECT relname AS name,
+                          n_live_tup AS row_estimate
+                   FROM pg_stat_user_tables
+                   WHERE schemaname = 'public'
+                   ORDER BY relname"""
+            )
+            return list(cur.fetchall())
+
+    def describe_table(self, name: str) -> list[dict]:
+        """Return columns for a table (anti-injection: regex-validated name)."""
+        import re
+        if not re.match(r"^[a-z_][a-z0-9_]*$", name):
+            raise ValueError("invalid table name")
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """SELECT column_name AS column,
+                          data_type AS type,
+                          is_nullable AS nullable
+                   FROM information_schema.columns
+                   WHERE table_schema = 'public' AND table_name = %s
+                   ORDER BY ordinal_position""",
+                (name,),
+            )
+            return list(cur.fetchall())
+
+    def run_readonly_query(self, sql: str, *, timeout_ms: int = 30000,
+                            max_rows: int = 1000) -> dict:
+        """Run a read-only query (SELECT/EXPLAIN/SHOW/WITH) and return rows.
+
+        Enforces READ ONLY transaction + statement_timeout server-side, so even
+        if upstream validation slips, no data modification is possible.
+
+        Returns: {columns, rows, row_count, truncated, elapsed_ms, error?}.
+        Non-fatal errors (syntax, missing table, timeout) are returned in
+        the response dict so the UI can render them cleanly.
+        """
+        import time
+        import datetime
+        import decimal
+        import uuid
+
+        def _to_json_safe(v):
+            if v is None or isinstance(v, (bool, int, float, str)):
+                return v
+            if isinstance(v, (datetime.datetime, datetime.date, datetime.time)):
+                return v.isoformat()
+            if isinstance(v, (datetime.timedelta,)):
+                return str(v)
+            if isinstance(v, decimal.Decimal):
+                # Render small Decimals as int/float for nicer UI
+                try:
+                    f = float(v)
+                    return int(f) if f.is_integer() else f
+                except Exception:
+                    return str(v)
+                return str(v)
+            if isinstance(v, uuid.UUID):
+                return str(v)
+            if isinstance(v, (bytes, bytearray, memoryview)):
+                return f"<bytes:{len(bytes(v))}>"
+            if isinstance(v, (list, tuple)):
+                return [_to_json_safe(x) for x in v]
+            if isinstance(v, dict):
+                return {str(k): _to_json_safe(x) for k, x in v.items()}
+            return str(v)
+
+        t0 = time.time()
+        try:
+            with self._conn() as conn:
+                # Force read-only at the transaction level
+                conn.autocommit = False
+                with conn.cursor() as cur:
+                    cur.execute("SET TRANSACTION READ ONLY")
+                    cur.execute(
+                        f"SET LOCAL statement_timeout = {int(timeout_ms)}"
+                    )
+                    cur.execute(sql)
+                    elapsed_ms = int((time.time() - t0) * 1000)
+                    if cur.description is None:
+                        # No rowset (rare for SELECT, common for SHOW with no
+                        # output) — return empty result successfully
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+                        return {
+                            "columns": [], "rows": [], "row_count": 0,
+                            "truncated": False, "elapsed_ms": elapsed_ms,
+                        }
+                    cols = [d.name for d in cur.description]
+                    fetched = cur.fetchmany(max_rows + 1)
+                    truncated = len(fetched) > max_rows
+                    if truncated:
+                        fetched = fetched[:max_rows]
+                    # psycopg3 with dict_row returns dicts; normalize to a list
+                    # of lists in column order so the UI is predictable
+                    rows = []
+                    for r in fetched:
+                        if isinstance(r, dict):
+                            rows.append([_to_json_safe(r.get(c)) for c in cols])
+                        else:
+                            rows.append([_to_json_safe(v) for v in r])
+                    try:
+                        conn.rollback()  # always rollback read-only txn
+                    except Exception:
+                        pass
+                    return {
+                        "columns": cols, "rows": rows, "row_count": len(rows),
+                        "truncated": truncated, "elapsed_ms": elapsed_ms,
+                    }
+        except Exception as exc:
+            elapsed_ms = int((time.time() - t0) * 1000)
+            msg = str(exc)
+            # Try to classify common psycopg errors for nicer UI messages
+            code = getattr(getattr(exc, "diag", None), "sqlstate", None)
+            kind = "error"
+            if code == "57014":
+                kind = "timeout"
+                msg = f"query exceeded {timeout_ms}ms — try LIMIT or add a filter"
+            elif code == "42P01":
+                kind = "undefined_table"
+            elif code == "42703":
+                kind = "undefined_column"
+            elif code == "42601":
+                kind = "syntax_error"
+            elif code == "25006":
+                kind = "read_only_violation"
+                msg = "write operations are blocked (read-only transaction)"
+            return {
+                "columns": [], "rows": [], "row_count": 0,
+                "truncated": False, "elapsed_ms": elapsed_ms,
+                "error": msg, "error_kind": kind,
+                "error_code": code,
+            }
+
 
 # Module-level singleton (lazy)
 _pg_store: Optional[PgStore] = None

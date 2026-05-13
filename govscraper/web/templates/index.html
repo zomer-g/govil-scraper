@@ -70,6 +70,11 @@
             </span>
             <div class="d-flex align-items-center gap-2">
                 {% if user %}
+                    {% if is_admin %}
+                    <a href="/sql" class="btn btn-outline-light btn-sm">
+                        <i class="bi bi-terminal"></i> SQL
+                    </a>
+                    {% endif %}
                     <img src="{{ user.picture }}" alt="" class="rounded-circle" width="28" height="28"
                          style="border: 2px solid rgba(255,255,255,0.5);"
                          onerror="this.style.display='none'">
@@ -79,7 +84,7 @@
                     </a>
                 {% else %}
                     <a href="/auth/login" class="btn btn-outline-light btn-sm">
-                        <i class="bi bi-google"></i> התחבר (מנהל)
+                        <i class="bi bi-google"></i> התחבר
                     </a>
                 {% endif %}
             </div>

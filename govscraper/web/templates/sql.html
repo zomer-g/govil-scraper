@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SQL Console — Gov.il Scraper</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.rtl.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Arial, sans-serif;
+            background: #f5f7fa;
+        }
+        .navbar { background: linear-gradient(135deg, #1a56db, #0e3fa3) !important; }
+        .card { border: none; box-shadow: 0 1px 3px rgba(0,0,0,0.1); border-radius: 12px; }
+        .card-header { background: transparent; border-bottom: 1px solid #eee; font-weight: 600; }
+        #sqlInput {
+            direction: ltr;
+            text-align: left;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 0.9rem;
+            min-height: 180px;
+            resize: vertical;
+        }
+        .table-results {
+            font-size: 0.82rem;
+            direction: ltr;
+            unicode-bidi: embed;
+        }
+        .table-results th {
+            background: #f8f9fa;
+            white-space: nowrap;
+            position: sticky;
+            top: 0;
+            z-index: 1;
+        }
+        .table-results td {
+            max-width: 350px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .table-results td:hover {
+            overflow: visible;
+            white-space: normal;
+            word-break: break-word;
+            background: #fff8e1;
+        }
+        .scroll-area {
+            max-height: 65vh;
+            overflow: auto;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            background: #fff;
+        }
+        .table-list, .sample-list { list-style: none; padding: 0; margin: 0; }
+        .table-list li, .sample-list li {
+            padding: 6px 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            display: flex;
+            justify-content: space-between;
+            gap: 6px;
+        }
+        .table-list li:hover, .sample-list li:hover { background: #eef4ff; }
+        .table-list .row-est { color: #999; font-size: 0.75rem; }
+        .table-list .table-name {
+            direction: ltr;
+            font-family: monospace;
+            font-size: 0.85rem;
+        }
+        .error-pane {
+            background: #fee2e2;
+            color: #991b1b;
+            padding: 12px 16px;
+            border-radius: 8px;
+            font-family: monospace;
+            font-size: 0.85rem;
+            direction: ltr;
+            text-align: left;
+            white-space: pre-wrap;
+        }
+        .stat-pill {
+            display: inline-block;
+            padding: 3px 10px;
+            background: #e0e7ff;
+            color: #3730a3;
+            border-radius: 999px;
+            font-size: 0.78rem;
+            margin-left: 6px;
+        }
+        .stat-pill.warn { background: #fef3c7; color: #92400e; }
+        .stat-pill.danger { background: #fee2e2; color: #991b1b; }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-dark mb-3">
+        <div class="container-fluid d-flex justify-content-between align-items-center px-4">
+            <a class="navbar-brand d-flex align-items-center gap-2 text-white text-decoration-none" href="/">
+                <i class="bi bi-database-fill-gear fs-4"></i>
+                SQL Console
+            </a>
+            <div class="d-flex align-items-center gap-2">
+                {% if user %}
+                    <img src="{{ user.picture }}" alt="" class="rounded-circle" width="28" height="28"
+                         style="border: 2px solid rgba(255,255,255,0.5);"
+                         onerror="this.style.display='none'">
+                    <span class="text-white-50 small">{{ user.name }}</span>
+                    <a href="/" class="btn btn-outline-light btn-sm">
+                        <i class="bi bi-house"></i> דף הבית
+                    </a>
+                    <a href="/auth/logout" class="btn btn-outline-light btn-sm">
+                        <i class="bi bi-box-arrow-right"></i> התנתק
+                    </a>
+                {% endif %}
+            </div>
+        </div>
+    </nav>
+
+    <div class="container-fluid px-4">
+        <div class="row g-3">
+            <!-- Sidebar -->
+            <div class="col-md-3">
+                <div class="card mb-3">
+                    <div class="card-header">
+                        <i class="bi bi-table"></i> טבלאות
+                    </div>
+                    <div class="card-body p-2">
+                        <ul id="tableList" class="table-list">
+                            <li class="text-muted text-center small p-2">טוען...</li>
+                        </ul>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <i class="bi bi-bookmark-star"></i> דוגמאות
+                    </div>
+                    <div class="card-body p-2">
+                        <ul class="sample-list" id="sampleList"></ul>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Main -->
+            <div class="col-md-9">
+                <div class="card mb-3">
+                    <div class="card-body">
+                        <textarea id="sqlInput" class="form-control" spellcheck="false"
+                                  placeholder="SELECT * FROM nadlan_deals LIMIT 10"></textarea>
+                        <div class="d-flex justify-content-between align-items-center mt-2">
+                            <div class="text-muted small">
+                                רק SELECT/EXPLAIN/SHOW/WITH. timeout 30s, max 1000 שורות.
+                                <kbd>Ctrl+Enter</kbd> להרצה.
+                            </div>
+                            <button id="runBtn" class="btn btn-primary">
+                                <i class="bi bi-play-fill"></i> הרץ
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="statusBar" class="mb-2" style="display: none;"></div>
+                <div id="errorPane" class="error-pane mb-3" style="display: none;"></div>
+                <div class="scroll-area" id="scrollArea" style="display: none;">
+                    <table class="table table-sm table-bordered table-results mb-0" id="resultTable">
+                        <thead><tr></tr></thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+const SAMPLES = [
+    {label: "Top 20 settlements by deal count", sql:
+`SELECT meta_setl_name AS settlement,
+       COUNT(*) AS deals
+FROM nadlan_deals
+WHERE meta_setl_name IS NOT NULL AND meta_setl_name <> ''
+GROUP BY 1
+ORDER BY deals DESC
+LIMIT 20;`},
+    {label: "Slice queue status", sql:
+`SELECT state, COUNT(*) AS slices
+FROM nadlan_settlement_slices
+GROUP BY 1 ORDER BY 2 DESC;`},
+    {label: "Most active months (deal count)", sql:
+`SELECT SUBSTR(deal_date, 1, 7) AS year_month,
+       COUNT(*) AS deals
+FROM nadlan_deals
+WHERE deal_date ~ '^[0-9]{4}-[0-9]{2}'
+GROUP BY 1
+ORDER BY 1 DESC
+LIMIT 24;`},
+    {label: "Avg price/sqm by settlement (top 20)", sql:
+`SELECT meta_setl_name AS settlement,
+       COUNT(*) AS deals,
+       ROUND(AVG(NULLIF(price_sm,'')::numeric))::int AS avg_price_per_sqm
+FROM nadlan_deals
+WHERE NULLIF(price_sm,'') IS NOT NULL
+GROUP BY 1
+HAVING COUNT(*) > 100
+ORDER BY avg_price_per_sqm DESC
+LIMIT 20;`},
+    {label: "High-value deals 2024+", sql:
+`SELECT meta_setl_name, deal_date, deal_amount, address, room_num
+FROM nadlan_deals
+WHERE NULLIF(deal_amount,'')::numeric > 10000000
+  AND deal_date >= '2024-01-01'
+ORDER BY deal_amount::numeric DESC
+LIMIT 50;`},
+    {label: "Failed slices breakdown", sql:
+`SELECT error, COUNT(*) AS slices
+FROM nadlan_settlement_slices
+WHERE state = 'failed'
+GROUP BY 1
+ORDER BY 2 DESC
+LIMIT 30;`},
+];
+
+function $(id) { return document.getElementById(id); }
+function fmtNum(n) { return Number(n).toLocaleString('en-US'); }
+
+async function loadTables() {
+    const ul = $("tableList");
+    try {
+        const r = await fetch("/api/sql/tables", {credentials: "same-origin"});
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const j = await r.json();
+        ul.innerHTML = "";
+        for (const t of (j.tables || [])) {
+            const li = document.createElement("li");
+            li.innerHTML = `<span class="table-name">${t.name}</span>` +
+                           `<span class="row-est">${fmtNum(t.row_estimate || 0)}</span>`;
+            li.title = "Click to load preview query";
+            li.onclick = () => {
+                $("sqlInput").value = `SELECT * FROM ${t.name} LIMIT 100;`;
+                $("sqlInput").focus();
+            };
+            ul.appendChild(li);
+        }
+        if (!ul.children.length) {
+            ul.innerHTML = '<li class="text-muted small p-2">אין טבלאות</li>';
+        }
+    } catch (e) {
+        ul.innerHTML = `<li class="text-danger small p-2">שגיאה: ${e.message}</li>`;
+    }
+}
+
+function loadSamples() {
+    const ul = $("sampleList");
+    ul.innerHTML = "";
+    for (const s of SAMPLES) {
+        const li = document.createElement("li");
+        li.textContent = s.label;
+        li.onclick = () => { $("sqlInput").value = s.sql; $("sqlInput").focus(); };
+        ul.appendChild(li);
+    }
+}
+
+function showError(msg) {
+    $("errorPane").textContent = msg;
+    $("errorPane").style.display = "block";
+    $("scrollArea").style.display = "none";
+    $("statusBar").style.display = "none";
+}
+
+function showStatus(html) {
+    $("statusBar").innerHTML = html;
+    $("statusBar").style.display = "block";
+}
+
+function renderResults(result) {
+    const tbl = $("resultTable");
+    const thead = tbl.querySelector("thead tr");
+    const tbody = tbl.querySelector("tbody");
+    thead.innerHTML = "";
+    tbody.innerHTML = "";
+
+    const cols = result.columns || [];
+    for (const c of cols) {
+        const th = document.createElement("th");
+        th.textContent = c;
+        thead.appendChild(th);
+    }
+    for (const row of (result.rows || [])) {
+        const tr = document.createElement("tr");
+        for (const v of row) {
+            const td = document.createElement("td");
+            if (v === null || v === undefined) {
+                td.innerHTML = '<span class="text-muted">NULL</span>';
+            } else if (typeof v === "object") {
+                td.textContent = JSON.stringify(v);
+            } else {
+                td.textContent = String(v);
+            }
+            tr.appendChild(td);
+        }
+        tbody.appendChild(tr);
+    }
+
+    $("scrollArea").style.display = "block";
+    $("errorPane").style.display = "none";
+
+    let pills = `<span class="stat-pill">${fmtNum(result.row_count)} שורות</span>`;
+    pills += `<span class="stat-pill">${result.elapsed_ms} ms</span>`;
+    pills += `<span class="stat-pill">${cols.length} עמודות</span>`;
+    if (result.truncated) {
+        pills += `<span class="stat-pill warn">קוצץ (יש עוד)</span>`;
+    }
+    showStatus(pills);
+}
+
+async function runQuery() {
+    const sql = $("sqlInput").value.trim();
+    if (!sql) return;
+    const btn = $("runBtn");
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> מריץ...';
+    showStatus('<span class="stat-pill">מריץ...</span>');
+    $("errorPane").style.display = "none";
+    $("scrollArea").style.display = "none";
+    try {
+        const r = await fetch("/api/sql/query", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            credentials: "same-origin",
+            body: JSON.stringify({sql}),
+        });
+        const j = await r.json();
+        if (!r.ok) {
+            showError(`HTTP ${r.status}: ${j.error || JSON.stringify(j)}`);
+            return;
+        }
+        if (j.error) {
+            showError(`[${j.error_kind || 'error'}] ${j.error}` +
+                      (j.error_code ? ` (SQLSTATE ${j.error_code})` : ''));
+            showStatus(`<span class="stat-pill danger">שגיאה</span><span class="stat-pill">${j.elapsed_ms || 0} ms</span>`);
+            return;
+        }
+        renderResults(j);
+    } catch (e) {
+        showError("Network error: " + e.message);
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="bi bi-play-fill"></i> הרץ';
+    }
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+    loadTables();
+    loadSamples();
+    $("runBtn").onclick = runQuery;
+    $("sqlInput").addEventListener("keydown", (ev) => {
+        if (ev.ctrlKey && ev.key === "Enter") {
+            ev.preventDefault();
+            runQuery();
+        }
+    });
+    // Preset
+    $("sqlInput").value = SAMPLES[0].sql;
+});
+    </script>
+</body>
+</html>

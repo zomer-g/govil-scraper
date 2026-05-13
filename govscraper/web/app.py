@@ -26,7 +26,10 @@ from queue import Queue, Empty
 from datetime import datetime
 from enum import Enum
 
-from flask import Flask, request, jsonify, Response, send_file, render_template
+from flask import (
+    Flask, request, jsonify, Response, send_file, render_template, redirect,
+    session,
+)
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -40,6 +43,7 @@ from storage import CollectionStore  # storage.py at repo root, unmoved
 from auth import (                    # auth.py at repo root, unmoved
     auth_bp, init_oauth, admin_required, admin_or_worker,
     worker_auth_required, get_current_user, is_admin,
+    _check_worker_key,
 )
 from govscraper.io.archive_engine import (
     run_bootstrap as _archive_bootstrap,
@@ -91,6 +95,10 @@ app.register_blueprint(nadlan_api_bp)
 
 from govmap_api_routes import govmap_api_bp
 app.register_blueprint(govmap_api_bp)
+
+# --- Read-only SQL exploration (admin SQL console) ---
+from sql_api_routes import sql_api_bp
+app.register_blueprint(sql_api_bp)
 
 # --- Rate limiting ---
 limiter = Limiter(
@@ -324,13 +332,67 @@ def _run_scrape_job(job_id: str, url: str, download_files: bool):
 
 
 # ---------------------------------------------------------------------------
+# Global SSO gate
+# ---------------------------------------------------------------------------
+# Every request must satisfy one of:
+#   1. path is in the whitelist below (auth flow / static / health)
+#   2. has a valid X-Worker-Key header (local worker uses this)
+#   3. session has a logged-in user (any Google account)
+# Otherwise: 401 JSON for /api/* paths, redirect to /auth/login for HTML pages.
+
+_UNAUTH_PREFIXES = ("/auth/", "/static/")
+_UNAUTH_EXACT = {"/favicon.ico", "/healthcheck"}
+
+
+@app.before_request
+def _require_sso():
+    path = request.path or "/"
+    # Whitelist
+    if path in _UNAUTH_EXACT:
+        return None
+    for p in _UNAUTH_PREFIXES:
+        if path.startswith(p):
+            return None
+    # Worker key bypass — local scrapers must keep working
+    if _check_worker_key():
+        return None
+    # Logged-in user (admin or not) passes through; per-endpoint decorators
+    # still enforce admin-only access where needed.
+    if get_current_user():
+        return None
+    # Not authenticated
+    accept = (request.headers.get("Accept") or "").lower()
+    if path.startswith("/api/") or "application/json" in accept:
+        return jsonify({
+            "error": "authentication required",
+            "login_url": "/auth/login",
+        }), 401
+    # HTML page → bounce to login
+    return redirect("/auth/login")
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
+@app.route("/healthcheck")
+def healthcheck():
+    """Unprotected liveness probe for Render."""
+    return jsonify({"ok": True})
+
 
 @app.route("/")
 def index():
     user = get_current_user()
     return render_template("index.html", user=user, is_admin=is_admin())
+
+
+@app.route("/sql")
+@admin_required
+def sql_console():
+    """Admin-only read-only SQL exploration UI."""
+    user = get_current_user()
+    return render_template("sql.html", user=user, is_admin=True)
 
 
 @app.route("/api/scrape", methods=["POST"])
