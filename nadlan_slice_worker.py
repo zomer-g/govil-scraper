@@ -167,6 +167,27 @@ class NadlanSliceClient:
         self.worker_id = worker_id
         self.timeout = timeout
         self.session = requests.Session()
+        # Auth — every request to the server's /api/nadlan/slice-* endpoints
+        # now requires either an admin OAuth session or a worker key. Load
+        # the key from env (also try a .env file alongside the worker so
+        # operators don't need to export it manually in every shell).
+        key = os.environ.get("WORKER_API_KEY") or os.environ.get("NADLAN_WORKER_KEY") or ""
+        if not key:
+            # Fallback: parse repo-local .env without taking a hard dependency
+            # on python-dotenv (worker may run from a thin runtime).
+            try:
+                env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+                if os.path.exists(env_path):
+                    with open(env_path, encoding="utf-8") as fh:
+                        for line in fh:
+                            line = line.strip()
+                            if line.startswith("WORKER_API_KEY="):
+                                key = line.split("=", 1)[1].strip().strip('"').strip("'")
+                                break
+            except Exception:
+                pass
+        if key:
+            self.session.headers["X-Worker-Key"] = key
 
     def _url(self, path: str) -> str:
         return f"{self.server_url}{path}"
