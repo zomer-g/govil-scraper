@@ -819,6 +819,52 @@ class PgStore:
             conn.commit()
             return n
 
+    def slice_seed_amount_sorts_for_capped(self) -> int:
+        """For every settlement whose existing slices hit the API cap
+        (total_rows > 500), generate two new `dealAmount`-sorted slices per
+        existing (setl, room) combo so the worker can capture a different
+        subset of the 137K-deal pool that's invisible with only date sorts.
+
+        Doubles the per-settlement coverage from ~6,000 to ~12,000 deals.
+        Idempotent — uses ON CONFLICT DO NOTHING on slice_key.
+
+        Returns: number of new slices inserted.
+        """
+        with self._lock, self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """WITH capped AS (
+                       SELECT DISTINCT setl_code, room_filter,
+                              FIRST_VALUE(setl_name) OVER w AS setl_name,
+                              FIRST_VALUE(population) OVER w AS population
+                       FROM nadlan_settlement_slices
+                       WHERE state = 'done'
+                         AND total_rows > 500
+                         AND room_filter IS NOT NULL
+                       WINDOW w AS (
+                           PARTITION BY setl_code
+                           ORDER BY population DESC
+                       )
+                   ),
+                   new_slices AS (
+                       SELECT setl_code, room_filter, setl_name, population,
+                              s.sort_order
+                       FROM capped
+                       CROSS JOIN (VALUES ('dealAmount_down'), ('dealAmount_up'))
+                              AS s(sort_order)
+                   )
+                   INSERT INTO nadlan_settlement_slices
+                       (slice_key, setl_code, setl_name, population,
+                        room_filter, sort_order)
+                   SELECT
+                       setl_code || ':' || COALESCE(room_filter, '_') || ':' || sort_order,
+                       setl_code, setl_name, population, room_filter, sort_order
+                   FROM new_slices
+                   ON CONFLICT (slice_key) DO NOTHING"""
+            )
+            inserted = cur.rowcount
+            conn.commit()
+            return inserted
+
     def slice_reset_failed(self) -> int:
         """Reset all failed slices back to pending with attempts=0 so the
         worker re-tries them. Used after a full run when some slices failed

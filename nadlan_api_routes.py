@@ -879,6 +879,19 @@ def slice_delete_room_null():
     return jsonify({"deleted": n})
 
 
+@nadlan_api_bp.route("/slice-amount-split", methods=["POST"])
+def slice_amount_split():
+    """Admin: for every capped settlement (slices with total_rows > 500),
+    generate dealAmount_up and dealAmount_down slices per (setl, room) combo.
+    Doubles coverage from ~6K to ~12K deals per settlement."""
+    if not _admin_or_worker():
+        return jsonify({"error": "admin or worker key required"}), 403
+    pg, err = _require_pg()
+    if err: return err
+    n = pg.slice_seed_amount_sorts_for_capped()
+    return jsonify({"inserted": n})
+
+
 @nadlan_api_bp.route("/slice-reset-failed", methods=["POST"])
 def slice_reset_failed():
     """Admin: reset all failed slices back to pending with attempts=0.
