@@ -4,6 +4,7 @@ Handles session management (cloudscraper + Playwright fallback),
 URL parsing, API discovery, pagination, and data extraction.
 """
 
+import json
 import re
 import time
 import logging
@@ -173,6 +174,93 @@ COMMON_HEADERS = {
     "Origin": "https://www.gov.il",
 }
 
+# Header name gov.il uses to gate the openapi-gc.digital.gov.il APIs.
+CLIENT_ID_HEADER = "x-client-id"
+
+
+@dataclass
+class GovILRuntimeConfig:
+    """Endpoints + auth published by gov.il's client-config.js shims.
+
+    In mid-2026 gov.il moved CollectorsWebApi + ContentPageWebApi from
+    ``www.gov.il`` to ``openapi-gc.digital.gov.il`` and gated both behind
+    an ``x-client-id`` header. The legacy ``/CollectorsWebApi/`` and
+    ``/ContentpageWebApi/`` paths now serve only a tiny ``client-config.js``
+    shim that publishes the new base URL plus the shared client-id, so a
+    client can learn them at runtime instead of hard-coding values gov.il
+    can rotate. DynamicCollector (``/he/api/DynamicCollector``) was NOT
+    migrated — it still lives at www.gov.il and takes no client-id.
+
+    Defaults point at the pre-migration paths so the scraper degrades to
+    its old behaviour (returning the new ``Global Error Message`` JSON
+    surfaced as a 500) when the shim can't be fetched, rather than
+    silently doing nothing.
+    """
+    collector_api_base: str = f"{BASE_URL}/CollectorsWebApi/api"
+    contentpage_api_base: str = f"{BASE_URL}/ContentPageWebApi/api"
+    client_id: str = ""
+
+    @property
+    def traditional_get_results(self) -> str:
+        return f"{self.collector_api_base}/DataCollector/GetResults"
+
+    @property
+    def traditional_layout(self) -> str:
+        return f"{self.collector_api_base}/DataCollector/GetLayoutCollectorModel"
+
+    @property
+    def content_pages(self) -> str:
+        return f"{self.contentpage_api_base}/content-pages"
+
+
+_RUNTIME_CONFIG_JS_RE = re.compile(
+    r"""window\[\s*['"]govilRunConfig['"]\s*\]\s*=\s*(\{[^;]+?\})\s*;""",
+    re.DOTALL,
+)
+
+
+def _fetch_govil_runtime_config(http) -> GovILRuntimeConfig:
+    """Pull the current collector/contentpage API hosts + client-id from
+    the two ``client-config.js`` shims at www.gov.il.
+
+    ``http`` is anything with a ``.get(url, timeout=…)`` method that
+    returns a response with a ``.text`` attribute — both cloudscraper and
+    requests.Session work. We deliberately avoid going through
+    ``GovILSession._request`` here because that path itself triggers
+    ``warm()`` which calls us back; this helper has to run with a flat,
+    no-retry GET on plain static JS files.
+    """
+    cfg = GovILRuntimeConfig()
+
+    for kind, path, base_key in (
+        ("collector", "/CollectorsWebApi/client-config.js", "dataCollectorWebApi"),
+        ("contentpage", "/ContentpageWebApi/client-config.js", "contentPageWebApi"),
+    ):
+        try:
+            resp = http.get(f"{BASE_URL}{path}", timeout=15)
+            text = getattr(resp, "text", "") or ""
+            m = _RUNTIME_CONFIG_JS_RE.search(text)
+            if not m:
+                logger.debug("govil %s config: no govilRunConfig in %s", kind, path)
+                continue
+            data = json.loads(m.group(1))
+        except Exception as e:
+            logger.warning("Failed to fetch govil %s config: %s", kind, e)
+            continue
+
+        client_id = (data.get("clientId") or "").strip()
+        if client_id and not cfg.client_id:
+            cfg.client_id = client_id
+
+        base = (data.get(base_key) or "").rstrip("/")
+        if base:
+            if kind == "collector":
+                cfg.collector_api_base = f"{base}/api"
+            else:
+                cfg.contentpage_api_base = f"{base}/api"
+
+    return cfg
+
 
 class GovILSession:
     """HTTP session that handles Cloudflare challenges via cloudscraper,
@@ -185,6 +273,12 @@ class GovILSession:
         self._pw_context = None
         self._session = self._init_cloudscraper()
         self._warmed = False
+        # Runtime config (collector/contentpage base URLs + x-client-id).
+        # Populated lazily after the first successful warm. Defaults to the
+        # legacy www.gov.il paths so unconfigured code paths still build a
+        # valid URL.
+        self.runtime_config = GovILRuntimeConfig()
+        self._runtime_config_loaded = False
 
     # Browser configs to rotate on retry — different fingerprints
     _BROWSER_CONFIGS = [
@@ -287,6 +381,40 @@ class GovILSession:
                 "לא ניתן להתחבר לאתר gov.il — גם cloudscraper וגם Playwright נכשלו."
             ) from e
 
+    # ---- Runtime config (collector/contentpage API base + x-client-id) -----
+
+    def _load_runtime_config(self) -> None:
+        """Fetch gov.il's client-config.js shims once and inject the
+        ``x-client-id`` header into the cloudscraper session.
+
+        Called after the first successful warm so the static JS files are
+        served (they live behind the same Cloudflare as everything else on
+        www.gov.il). Failure is non-fatal — we keep the default config and
+        let the actual API call surface a real error downstream.
+        """
+        if self._runtime_config_loaded:
+            return
+        self._runtime_config_loaded = True  # don't keep retrying on failure
+        try:
+            cfg = _fetch_govil_runtime_config(self._session)
+        except Exception as e:
+            logger.warning("govil runtime config load failed: %s", e)
+            return
+        self.runtime_config = cfg
+        if cfg.client_id:
+            # Make every subsequent request to the new openapi-gc host
+            # carry the auth header without each call-site having to know.
+            # The header is harmless on www.gov.il endpoints, so we don't
+            # bother scoping it per-host here. download_file() strips it
+            # back out for non-gov.il downloads.
+            self._session.headers[CLIENT_ID_HEADER] = cfg.client_id
+        logger.info(
+            "govil runtime config: collector_api=%s contentpage_api=%s client_id=%s",
+            cfg.collector_api_base,
+            cfg.contentpage_api_base,
+            (cfg.client_id[:8] + "…") if cfg.client_id else "<none>",
+        )
+
     # ---- Session warm-up ----------------------------------------------------
 
     def warm(self, max_retries: int = 5) -> bool:
@@ -306,6 +434,7 @@ class GovILSession:
                 if resp.status_code == 200 and len(resp.text) > 1000:
                     self._warmed = True
                     logger.info("cloudscraper session warmed (attempt %d)", attempt + 1)
+                    self._load_runtime_config()
                     return True
                 logger.warning("Warm-up attempt %d: status=%d len=%d",
                                attempt + 1, resp.status_code, len(resp.text))
@@ -322,6 +451,7 @@ class GovILSession:
             logger.info("Switching to Playwright fallback")
             try:
                 self._init_playwright()
+                self._load_runtime_config()
                 return True
             except CloudflareBlockError:
                 raise
@@ -358,9 +488,11 @@ class GovILSession:
         is_external = host != "www.gov.il"
 
         if is_external:
-            # Save and temporarily remove API-specific headers
+            # Save and temporarily remove API-specific headers. Includes
+            # x-client-id, which is meaningful only to openapi-gc.digital.gov.il
+            # and confuses some third-party CDNs that 4xx on unknown headers.
             saved = {}
-            for h in ("Accept", "Origin", "Referer"):
+            for h in ("Accept", "Origin", "Referer", CLIENT_ID_HEADER):
                 if h in self._session.headers:
                     saved[h] = self._session.headers.pop(h)
             try:
@@ -585,7 +717,13 @@ def parse_gov_url(url: str) -> ParsedURL:
 # DynamicCollector API endpoint (always POST)
 DYNAMIC_API_URL = f"{BASE_URL}/he/api/DynamicCollector"
 
-# Traditional collector API (GET)
+# Traditional collector API (GET).
+#
+# These constants are pre-2026 paths kept only so existing imports from
+# scraper_engine.py keep resolving. The live values are read at request
+# time from ``session.runtime_config`` (which is populated from gov.il's
+# client-config.js shim after warm-up) — hard-coding them here would mean
+# every host rotation requires a code change.
 TRADITIONAL_ENDPOINT = f"{BASE_URL}/CollectorsWebApi/api/DataCollector/GetResults"
 TRADITIONAL_LAYOUT_ENDPOINT = f"{BASE_URL}/CollectorsWebApi/api/DataCollector/GetLayoutCollectorModel"
 
@@ -968,7 +1106,13 @@ class GovILScraper:
     # ---- Traditional Collector ----------------------------------------------
 
     def _scrape_traditional(self, parsed: ParsedURL) -> ScrapeResult:
-        parsed.api_endpoint = TRADITIONAL_ENDPOINT
+        # Make sure runtime config (new openapi-gc host + x-client-id) is
+        # loaded before we even build URLs — the warmed-on-first-request
+        # path can otherwise leave us computing endpoints from the old
+        # default base.
+        self.session.warm()
+        endpoint = self.session.runtime_config.traditional_get_results
+        parsed.api_endpoint = endpoint
 
         # Dynamically discover CollectorType values from the layout model API.
         # Must use the original URL slug for the API call.
@@ -1018,7 +1162,7 @@ class GovILScraper:
                 for k, v in extra_filters.items():
                     query_parts.append(f"{k}={quote(str(v), safe='')}")
 
-                url = f"{TRADITIONAL_ENDPOINT}?{'&'.join(query_parts)}"
+                url = f"{endpoint}?{'&'.join(query_parts)}"
                 resp = self.session.get(url)
                 try:
                     data = _safe_json(resp, what=f"Traditional collector {url}")
@@ -1103,7 +1247,11 @@ class GovILScraper:
         for k, v in extra_filters.items():
             query_parts.append(f"{k}={quote(str(v), safe='')}")
 
-        api_url = f"{TRADITIONAL_ENDPOINT}?{'&'.join(query_parts)}"
+        self.session.warm()
+        api_url = (
+            f"{self.session.runtime_config.traditional_get_results}"
+            f"?{'&'.join(query_parts)}"
+        )
         resp = self.session.get(api_url)
         data = _safe_json(resp, what=f"Traditional page {api_url}")
         total = _extract_total(data) or 0
@@ -1120,7 +1268,11 @@ class GovILScraper:
         to the CollectorType values needed for GetResults.
         """
         try:
-            url = f"{TRADITIONAL_LAYOUT_ENDPOINT}?collectorId={collector_name}&culture=he"
+            self.session.warm()
+            url = (
+                f"{self.session.runtime_config.traditional_layout}"
+                f"?collectorId={collector_name}&culture=he"
+            )
             resp = self.session.get(url)
             text = resp.text
             # Extract collectionTypes values from the JSON text
@@ -1246,7 +1398,8 @@ class GovILScraper:
         from urllib.parse import urljoin
         import re as _re
 
-        api_base = f"{BASE_URL}/ContentPageWebApi/api/content-pages"
+        self.session.warm()
+        api_base = self.session.runtime_config.content_pages
         name = parsed.collector_name
 
         # Fetch the default view first to learn the tab structure
@@ -1624,8 +1777,11 @@ class GovILScraper:
         ), diag
 
     # ---- Traditional: content page file extraction -------------------------
-
-    CONTENT_PAGE_API = f"{BASE_URL}/ContentPageWebApi/api/content-pages"
+    #
+    # The base URL is pulled at request time from
+    # ``self.session.runtime_config.content_pages`` rather than a class
+    # attribute, because the legacy ``/ContentPageWebApi/`` host was retired
+    # in mid-2026 in favour of openapi-gc.digital.gov.il.
 
     def _fetch_content_page_files(
         self, item: dict, item_index: int
@@ -1648,8 +1804,9 @@ class GovILScraper:
             return []
 
         try:
+            self.session.warm()
             resp = self.session.get(
-                f"{self.CONTENT_PAGE_API}/{page_name}",
+                f"{self.session.runtime_config.content_pages}/{page_name}",
                 params={"culture": "he"},
                 retries=2,
             )

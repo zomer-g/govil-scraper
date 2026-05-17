@@ -3,7 +3,15 @@ preserved verbatim. Internal Python uses snake_case (`offset`, `office_id`).
 """
 from __future__ import annotations
 
-# Endpoints (from scraper_engine.py constants)
+# Endpoints (from scraper_engine.py constants).
+#
+# DynamicCollector still lives at www.gov.il and is stable. The
+# Traditional collector + Layout endpoints below are the PRE-MIGRATION
+# paths kept here for historical reference — gov.il moved both to
+# openapi-gc.digital.gov.il in mid-2026 and now gates them behind an
+# x-client-id header. The live URLs are read at runtime from
+# ``GovILRuntimeConfig`` in ``legacy_engine.py``; do not hard-code these
+# strings in new code.
 DYNAMIC_API_URL = "https://www.gov.il/he/api/DynamicCollector"
 TRADITIONAL_API_URL = "https://www.gov.il/CollectorsWebApi/api/DataCollector/GetResults"
 LAYOUT_API_URL = "https://www.gov.il/CollectorsWebApi/api/DataCollector/GetLayoutCollectorModel"
