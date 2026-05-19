@@ -11,7 +11,21 @@ import re
 
 from flask import Blueprint, jsonify, request
 
-from auth import admin_required
+from auth import admin_required, is_admin, _check_worker_key
+import functools
+
+
+def _admin_or_worker_sql(f):
+    """SQL endpoints accept admin session OR worker key. The READ ONLY
+    transaction + statement_timeout in pg_store enforces safety; worker key
+    access is convenient for CLI analysis tooling."""
+    @functools.wraps(f)
+    def decorated(*args, **kwargs):
+        from flask import jsonify
+        if is_admin() or _check_worker_key():
+            return f(*args, **kwargs)
+        return jsonify({"error": "admin or worker key required"}), 403
+    return decorated
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +125,7 @@ def _has_extra_statement(sql: str) -> bool:
 
 
 @sql_api_bp.route("/tables", methods=["GET"])
-@admin_required
+@_admin_or_worker_sql
 def list_tables():
     pg, err = _require_pg()
     if err: return err
@@ -119,7 +133,7 @@ def list_tables():
 
 
 @sql_api_bp.route("/schema/<table>", methods=["GET"])
-@admin_required
+@_admin_or_worker_sql
 def describe_table(table):
     pg, err = _require_pg()
     if err: return err
@@ -131,7 +145,7 @@ def describe_table(table):
 
 
 @sql_api_bp.route("/query", methods=["POST"])
-@admin_required
+@_admin_or_worker_sql
 def run_query():
     body = request.get_json(silent=True) or {}
     sql = (body.get("sql") or "").strip()
